@@ -4,7 +4,7 @@ Real-time log display with color-coded messages.
 """
 
 import customtkinter as ctk
-from typing import Optional
+from typing import Callable, Optional
 
 
 class ConsolePanel(ctk.CTkFrame):
@@ -28,7 +28,12 @@ class ConsolePanel(ctk.CTkFrame):
         "DEBUG": "🔍",
     }
 
-    def __init__(self, master, **kwargs):
+    def __init__(
+        self,
+        master,
+        on_open_diagnostics: Optional[Callable[[], None]] = None,
+        **kwargs,
+    ):
         super().__init__(
             master,
             fg_color="#FFFFFF",
@@ -38,6 +43,7 @@ class ConsolePanel(ctk.CTkFrame):
             **kwargs,
         )
 
+        self._on_open_diagnostics = on_open_diagnostics
         self._setup_ui()
         self._line_count = 0
         self._max_lines = 500
@@ -81,6 +87,19 @@ class ConsolePanel(ctk.CTkFrame):
             corner_radius=6,
             command=self._copy_log,
         ).pack(side="right")
+
+        ctk.CTkButton(
+            header_frame,
+            text="Diagnostics",
+            width=96,
+            height=28,
+            font=ctk.CTkFont(size=12),
+            fg_color="#F1F5F9",
+            text_color="#64748B",
+            hover_color="#E2E8F0",
+            corner_radius=6,
+            command=self._open_diagnostics,
+        ).pack(side="right", padx=(0, 4))
 
         # Log text area
         self._textbox = ctk.CTkTextbox(
@@ -143,6 +162,11 @@ class ConsolePanel(ctk.CTkFrame):
         if text:
             self.clipboard_clear()
             self.clipboard_append(text)
+
+    def _open_diagnostics(self) -> None:
+        """Open diagnostics reports from the host app."""
+        if self._on_open_diagnostics:
+            self._on_open_diagnostics()
 
     def get_log_text(self) -> str:
         """Get all log text as a string."""

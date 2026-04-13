@@ -5,6 +5,7 @@ Launches the application.
 
 import sys
 import os
+import threading
 
 # Ensure the project root is in the Python path
 if getattr(sys, 'frozen', False):
@@ -33,12 +34,23 @@ def main():
         error_msg = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
         print(f"[FATAL ERROR]\n{error_msg}", file=sys.stderr)
         try:
-            from utils import logger
+            from utils import diagnostics, logger
+            report_path = diagnostics.capture_exception(
+                "Unhandled application exception",
+                exc_value,
+                exc_tb=exc_tb,
+            )
             logger.error(f"Fatal error: {exc_value}")
+            logger.error(f"Diagnostic report saved: {report_path}")
         except Exception:
             pass
 
     sys.excepthook = handle_exception
+
+    def handle_thread_exception(args):
+        handle_exception(args.exc_type, args.exc_value, args.exc_traceback)
+
+    threading.excepthook = handle_thread_exception
 
     # Launch the app
     from gui.app import MainApp

@@ -17,6 +17,7 @@ _DOWNLOAD/
 _temp_uploads/
 debug_html/
 debug_screenshots/
+diagnostics/
 ghost_sessions/
 history.json
 config.json

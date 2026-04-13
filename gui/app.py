@@ -19,7 +19,7 @@ from gui.scrape_tab import ScrapeTab
 from gui.dashboard_tab import DashboardTab
 from gui.social_post_tab import SocialPostTab
 from core.downloader import DownloadOrchestrator, DownloadStats
-from utils import config, logger
+from utils import config, diagnostics, logger
 from utils.history import HistoryEntry, add_entry
 
 
@@ -88,6 +88,17 @@ class MainApp(ctk.CTk):
 
         # V15: Check for missed posts 2s after startup (non-blocking)
         self.after(2000, self._check_missed_posts)
+
+    def report_callback_exception(self, exc_type, exc_value, exc_tb) -> None:
+        """Capture uncaught Tkinter callback exceptions."""
+        report_path = diagnostics.capture_exception(
+            "Tkinter callback exception",
+            exc_value,
+            exc_tb=exc_tb,
+            widget=self,
+        )
+        logger.error(f"GUI callback error: {exc_value}")
+        logger.error(f"Diagnostic report saved: {report_path}")
 
     def _setup_ui(self) -> None:
         """Build the main application layout with tabs."""
@@ -199,7 +210,10 @@ class MainApp(ctk.CTk):
         self._progress_panel.pack(fill="x", padx=4, pady=(0, 8))
 
         # Console Panel (takes remaining space)
-        self._console_panel = ConsolePanel(parent)
+        self._console_panel = ConsolePanel(
+            parent,
+            on_open_diagnostics=self._on_open_diagnostics,
+        )
         self._console_panel.pack(fill="both", expand=True, padx=4, pady=(0, 4))
 
     def _setup_scrape_tab(self, parent) -> None:
@@ -234,7 +248,12 @@ class MainApp(ctk.CTk):
             self._input_panel._url_textbox.insert("1.0", "\n".join(urls))
             logger.info(f"📥 Đã gửi {len(urls)} URL sang tab Tải Media")
         except Exception as e:
-            logger.error(f"Lỗi gửi URLs: {str(e)[:100]}")
+            logger.exception(
+                "Could not send URLs to download tab",
+                e,
+                extra={"url_count": len(urls), "urls": urls[:10]},
+                widget=self,
+            )
 
     # --- Download Tab: Action Handlers ---
 
@@ -318,8 +337,13 @@ class MainApp(ctk.CTk):
         if output_dir and os.path.exists(output_dir):
             try:
                 os.startfile(output_dir)
-            except Exception:
-                logger.error("Không thể mở thư mục")
+            except Exception as e:
+                logger.exception(
+                    "Could not open output folder",
+                    e,
+                    extra={"output_dir": output_dir},
+                    widget=self,
+                )
         else:
             logger.warning("Thư mục lưu chưa tồn tại")
 
@@ -371,6 +395,22 @@ class MainApp(ctk.CTk):
         has_failures = stats.failed_posts > 0
         self._progress_panel.set_complete(success=not has_failures)
 
+        if has_failures:
+            report_path = diagnostics.capture_message(
+                "Download completed with failures",
+                "One or more posts failed during the download run.",
+                extra={
+                    "success_posts": stats.success_posts,
+                    "failed_posts": stats.failed_posts,
+                    "total_posts": stats.total_posts,
+                    "urls": getattr(self, "_current_urls", []),
+                    "output_dir": self._input_panel.get_output_dir(),
+                    "completion_message": message,
+                },
+                widget=self,
+            )
+            logger.error(f"Diagnostic report saved: {report_path}")
+
         # Save to history
         urls = getattr(self, '_current_urls', [])
         entry = HistoryEntry.create(
@@ -388,8 +428,13 @@ class MainApp(ctk.CTk):
                 try:
                     if sys.platform == "win32":
                         os.startfile(output_dir)
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.exception(
+                        "Auto-open output folder failed",
+                        e,
+                        extra={"output_dir": output_dir},
+                        widget=self,
+                    )
 
     # --- Utilities ---
 
@@ -408,7 +453,11 @@ class MainApp(ctk.CTk):
                     on_execute_now=self._execute_missed_posts,
                 )
         except Exception as e:
-            logger.debug(f"_check_missed_posts error: {str(e)[:100]}")
+            logger.exception(
+                "Missed-post startup check failed",
+                e,
+                widget=self,
+            )
 
     def _execute_missed_posts(self, records: list) -> None:
         """V15: Hand missed records to the Social Post tab's execute handler."""
@@ -416,7 +465,41 @@ class MainApp(ctk.CTk):
             self._tabview.set("  📤  Social Post  ")
             self._social_post_tab._execute_records_from_calendar(records)
         except Exception as e:
-            logger.error(f"_execute_missed_posts error: {str(e)[:100]}")
+            logger.exception(
+                "Execute missed posts failed",
+                e,
+                extra={"record_count": len(records)},
+                widget=self,
+            )
+
+    def _on_open_diagnostics(self) -> None:
+        """Create a diagnostic snapshot, then open the diagnostics folder."""
+        diag_dir = diagnostics.get_diagnostics_dir()
+        report_path = diagnostics.capture_message(
+            "Manual GUI diagnostic snapshot",
+            "Manual diagnostic snapshot requested from the Console panel.",
+            extra={
+                "active_tab": self._tabview.get() if hasattr(self, "_tabview") else "",
+                "output_dir": self._input_panel.get_output_dir() if hasattr(self, "_input_panel") else "",
+                "console_log": self._console_panel.get_log_text()[-5000:] if hasattr(self, "_console_panel") else "",
+            },
+            widget=self,
+        )
+        logger.info(f"Diagnostic snapshot saved: {report_path}")
+
+        try:
+            if sys.platform == "win32":
+                os.startfile(diag_dir)
+            else:
+                opener = "open" if sys.platform == "darwin" else "xdg-open"
+                subprocess.Popen([opener, str(diag_dir)])
+        except Exception as e:
+            logger.exception(
+                "Could not open diagnostics folder",
+                e,
+                extra={"diagnostics_dir": str(diag_dir)},
+                widget=self,
+            )
 
     def _on_close(self) -> None:
         """Handle window close."""

@@ -8,7 +8,7 @@ import os
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Any, Callable, Dict, Optional
 
 
 class GUIHandler(logging.Handler):
@@ -120,6 +120,43 @@ def warning(message: str) -> None:
 def error(message: str) -> None:
     """Log an error message."""
     get_logger().error(message)
+
+
+def exception(
+    message: str,
+    exc: Optional[BaseException] = None,
+    *,
+    context: Optional[str] = None,
+    extra: Optional[Dict[str, Any]] = None,
+    widget: Any = None,
+) -> Optional[Path]:
+    """Log an exception with traceback and write a diagnostic report."""
+    import traceback
+
+    report_path: Optional[Path] = None
+    if exc is not None:
+        try:
+            from utils import diagnostics
+
+            report_path = diagnostics.capture_exception(
+                context or message,
+                exc,
+                extra=extra,
+                widget=widget,
+            )
+        except Exception:
+            report_path = None
+
+    log = get_logger()
+    if exc is None:
+        log.exception(message)
+    else:
+        tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)).rstrip()
+        log.error(f"{message}\n{tb}")
+
+    if report_path:
+        log.error(f"Diagnostic report saved: {report_path}")
+    return report_path
 
 
 def debug(message: str) -> None:
