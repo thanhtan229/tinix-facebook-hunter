@@ -463,6 +463,11 @@ class PageScraper:
     def _get_profile_dir(self) -> str:
         """Get per-account Chrome profile directory."""
         base = Path(__file__).parent.parent
+        custom_profile = self._account.get("profile_dir", "")
+        if custom_profile:
+            profile_dir = Path(custom_profile)
+            profile_dir.mkdir(parents=True, exist_ok=True)
+            return str(profile_dir)
         acct_id = self._account.get("id", 0)
         if acct_id:
             profile_name = f"chrome_profile_acc_{acct_id}"

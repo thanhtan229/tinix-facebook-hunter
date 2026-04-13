@@ -227,6 +227,95 @@ def _get_conn(db_path: str) -> sqlite3.Connection:
             UNIQUE(username)
         )
     """)
+    try:
+        ac_cols = [row[1] for row in conn.execute("PRAGMA table_info(fb_accounts)").fetchall()]
+        if "business_id" not in ac_cols:
+            conn.execute("ALTER TABLE fb_accounts ADD COLUMN business_id TEXT NOT NULL DEFAULT ''")
+            conn.commit()
+    except Exception:
+        pass
+
+    # --- Multi-platform social accounts ---
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS social_accounts (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            platform      TEXT    NOT NULL DEFAULT 'facebook',
+            label         TEXT    NOT NULL DEFAULT '',
+            username      TEXT    NOT NULL DEFAULT '',
+            password      TEXT    NOT NULL DEFAULT '',
+            secret_2fa    TEXT    NOT NULL DEFAULT '',
+            email         TEXT    NOT NULL DEFAULT '',
+            email_pass    TEXT    NOT NULL DEFAULT '',
+            cookie        TEXT    NOT NULL DEFAULT '',
+            profile_dir   TEXT    NOT NULL DEFAULT '',
+            proxy_id      INTEGER DEFAULT NULL,
+            is_active     INTEGER NOT NULL DEFAULT 0,
+            sync_status   TEXT    NOT NULL DEFAULT 'Chưa đồng bộ',
+            status_reason TEXT    NOT NULL DEFAULT '',
+            uid           TEXT    NOT NULL DEFAULT '',
+            avatar_path   TEXT    NOT NULL DEFAULT '',
+            last_checked  TEXT    NOT NULL DEFAULT '',
+            last_synced   TEXT    NOT NULL DEFAULT '',
+            created_at    TEXT    NOT NULL DEFAULT '',
+            updated_at    TEXT    NOT NULL DEFAULT '',
+            notes         TEXT    NOT NULL DEFAULT '',
+            legacy_fb_id  INTEGER DEFAULT NULL,
+            UNIQUE(platform, username)
+        )
+    """)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS social_targets (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            account_id    INTEGER NOT NULL,
+            platform      TEXT    NOT NULL DEFAULT '',
+            target_type   TEXT    NOT NULL DEFAULT '',
+            target_name   TEXT    NOT NULL DEFAULT '',
+            target_uid    TEXT    NOT NULL DEFAULT '',
+            target_url    TEXT    NOT NULL DEFAULT '',
+            avatar_path   TEXT    NOT NULL DEFAULT '',
+            group_name    TEXT    NOT NULL DEFAULT '',
+            last_synced   TEXT    NOT NULL DEFAULT '',
+            created_at    TEXT    NOT NULL DEFAULT '',
+            UNIQUE(account_id, platform, target_uid)
+        )
+    """)
+
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_social_accounts_platform ON social_accounts(platform)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_social_accounts_status ON social_accounts(sync_status)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_social_targets_account ON social_targets(account_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_social_targets_platform ON social_targets(platform)")
+
+    # Migration: copy existing Facebook accounts into the new multi-platform table.
+    try:
+        rows = conn.execute("""
+            SELECT id, label, username, password, secret_2fa, email, email_pass,
+                   cookie, proxy_id, is_active, last_login, created_at, business_id
+            FROM fb_accounts
+        """).fetchall()
+        for r in rows:
+            exists = conn.execute(
+                "SELECT id FROM social_accounts WHERE platform = 'facebook' AND legacy_fb_id = ?",
+                (r[0],),
+            ).fetchone()
+            if exists:
+                continue
+            status = "Live" if r[9] else "Chưa đồng bộ"
+            conn.execute("""
+                INSERT OR IGNORE INTO social_accounts
+                    (platform, label, username, password, secret_2fa, email, email_pass,
+                     cookie, proxy_id, is_active, sync_status, status_reason, uid,
+                     last_checked, last_synced, created_at, updated_at, legacy_fb_id)
+                VALUES ('facebook', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9],
+                status, "Migrated from fb_accounts", r[2], r[10] or "",
+                r[10] or "", r[11] or datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S"), r[0],
+            ))
+        conn.commit()
+    except Exception as e:
+        logger.debug(f"social account migration skipped: {str(e)[:100]}")
 
     # --- Proxies ---
     conn.execute("""
@@ -903,6 +992,291 @@ def get_random_active_account(db_path: str) -> Optional[dict]:
     import random
     accounts = [a for a in get_all_accounts(db_path) if a["is_active"]]
     return random.choice(accounts) if accounts else None
+
+
+def _social_account_from_row(r) -> dict:
+    return {
+        "id": r[0],
+        "platform": r[1] or "facebook",
+        "label": r[2] or "",
+        "username": r[3] or "",
+        "password": r[4] or "",
+        "secret_2fa": r[5] or "",
+        "email": r[6] or "",
+        "email_pass": r[7] or "",
+        "cookie": r[8] or "",
+        "profile_dir": r[9] or "",
+        "proxy_id": r[10],
+        "is_active": r[11],
+        "sync_status": r[12] or "Chưa đồng bộ",
+        "status_reason": r[13] or "",
+        "uid": r[14] or "",
+        "avatar_path": r[15] or "",
+        "last_checked": r[16] or "",
+        "last_synced": r[17] or "",
+        "created_at": r[18] or "",
+        "updated_at": r[19] or "",
+        "notes": r[20] or "",
+        "legacy_fb_id": r[21],
+        "proxy_label": r[22] or "",
+        "proxy_protocol": r[23] or "",
+        "proxy_host": r[24] or "",
+        "proxy_port": r[25] or 0,
+        "proxy_auth_user": r[26] or "",
+        "proxy_auth_pass": r[27] or "",
+    }
+
+
+def get_social_accounts(
+    db_path: str,
+    platform: str = "",
+    status: str = "",
+    query: str = "",
+) -> List[dict]:
+    """Get multi-platform social accounts with optional filters."""
+    try:
+        conn = _get_conn(db_path)
+        sql = """
+            SELECT a.id, a.platform, a.label, a.username, a.password, a.secret_2fa,
+                   a.email, a.email_pass, a.cookie, a.profile_dir, a.proxy_id,
+                   a.is_active, a.sync_status, a.status_reason, a.uid, a.avatar_path,
+                   a.last_checked, a.last_synced, a.created_at, a.updated_at,
+                   a.notes, a.legacy_fb_id,
+                   p.label as proxy_label, p.protocol, p.host, p.port,
+                   p.auth_user, p.auth_pass
+            FROM social_accounts a
+            LEFT JOIN proxies p ON a.proxy_id = p.id
+            WHERE 1=1
+        """
+        params = []
+        if platform:
+            sql += " AND a.platform = ?"
+            params.append(platform)
+        if status:
+            sql += " AND a.sync_status = ?"
+            params.append(status)
+        if query:
+            like = f"%{query.lower()}%"
+            sql += """ AND (
+                lower(a.label) LIKE ? OR lower(a.username) LIKE ? OR
+                lower(a.email) LIKE ? OR lower(a.uid) LIKE ?
+            )"""
+            params.extend([like, like, like, like])
+        sql += " ORDER BY a.id"
+        rows = conn.execute(sql, params).fetchall()
+        conn.close()
+        return [_social_account_from_row(r) for r in rows]
+    except Exception as e:
+        logger.error(f"get_social_accounts error: {str(e)[:100]}")
+        return []
+
+
+def get_social_account(db_path: str, account_id: int) -> Optional[dict]:
+    accounts = get_social_accounts(db_path)
+    for account in accounts:
+        if account["id"] == account_id:
+            return account
+    return None
+
+
+def add_social_account(db_path: str, **kwargs) -> int:
+    """Add a multi-platform social account."""
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        conn = _get_conn(db_path)
+        cur = conn.execute("""
+            INSERT INTO social_accounts
+                (platform, label, username, password, secret_2fa, email, email_pass,
+                 cookie, profile_dir, proxy_id, is_active, sync_status, status_reason,
+                 uid, avatar_path, last_checked, last_synced, created_at, updated_at,
+                 notes, legacy_fb_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            kwargs.get("platform", "facebook"),
+            kwargs.get("label", ""),
+            kwargs.get("username", ""),
+            kwargs.get("password", ""),
+            kwargs.get("secret_2fa", ""),
+            kwargs.get("email", ""),
+            kwargs.get("email_pass", ""),
+            kwargs.get("cookie", ""),
+            kwargs.get("profile_dir", ""),
+            kwargs.get("proxy_id"),
+            kwargs.get("is_active", 0),
+            kwargs.get("sync_status", "Chưa đồng bộ"),
+            kwargs.get("status_reason", ""),
+            kwargs.get("uid", ""),
+            kwargs.get("avatar_path", ""),
+            kwargs.get("last_checked", ""),
+            kwargs.get("last_synced", ""),
+            now,
+            now,
+            kwargs.get("notes", ""),
+            kwargs.get("legacy_fb_id"),
+        ))
+        conn.commit()
+        new_id = cur.lastrowid
+        conn.close()
+        return new_id
+    except Exception as e:
+        logger.error(f"add_social_account error: {str(e)[:100]}")
+        return -1
+
+
+def update_social_account(db_path: str, account_id: int, **kwargs) -> bool:
+    fields = []
+    values = []
+    allowed = (
+        "platform", "label", "username", "password", "secret_2fa", "email",
+        "email_pass", "cookie", "profile_dir", "proxy_id", "is_active",
+        "sync_status", "status_reason", "uid", "avatar_path", "last_checked",
+        "last_synced", "notes", "legacy_fb_id",
+    )
+    for key in allowed:
+        if key in kwargs:
+            fields.append(f"{key} = ?")
+            values.append(kwargs[key])
+    if not fields:
+        return False
+    fields.append("updated_at = ?")
+    values.append(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    values.append(account_id)
+    try:
+        conn = _get_conn(db_path)
+        conn.execute(f"UPDATE social_accounts SET {', '.join(fields)} WHERE id = ?", values)
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as e:
+        logger.error(f"update_social_account error: {str(e)[:100]}")
+        return False
+
+
+def delete_social_account(db_path: str, account_id: int) -> bool:
+    try:
+        conn = _get_conn(db_path)
+        row = conn.execute(
+            "SELECT platform, legacy_fb_id FROM social_accounts WHERE id = ?",
+            (account_id,),
+        ).fetchone()
+        conn.execute("DELETE FROM social_targets WHERE account_id = ?", (account_id,))
+        conn.execute("DELETE FROM social_accounts WHERE id = ?", (account_id,))
+        if row and row[0] == "facebook" and row[1]:
+            conn.execute("DELETE FROM managed_pages WHERE account_id = ?", (row[1],))
+            conn.execute("DELETE FROM fb_accounts WHERE id = ?", (row[1],))
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as e:
+        logger.error(f"delete_social_account error: {str(e)[:100]}")
+        return False
+
+
+def sync_social_account_to_fb_account(db_path: str, account_id: int) -> int:
+    """
+    Mirror a Facebook social account into fb_accounts for legacy posting flows.
+    Returns fb_accounts.id, or -1 if not applicable/error.
+    """
+    account = get_social_account(db_path, account_id)
+    if not account or account.get("platform") != "facebook":
+        return -1
+    data = {
+        "label": account.get("label", ""),
+        "username": account.get("username") or account.get("uid") or f"facebook_{account_id}",
+        "password": account.get("password", ""),
+        "secret_2fa": account.get("secret_2fa", ""),
+        "email": account.get("email", ""),
+        "email_pass": account.get("email_pass", ""),
+        "cookie": account.get("cookie", ""),
+        "proxy_id": account.get("proxy_id"),
+        "is_active": account.get("is_active", 0),
+    }
+    legacy_id = account.get("legacy_fb_id")
+    if legacy_id:
+        ok = update_account(db_path, legacy_id, **data)
+        return legacy_id if ok else -1
+    new_id = add_account(db_path, **data)
+    if new_id > 0:
+        update_social_account(db_path, account_id, legacy_fb_id=new_id)
+    return new_id
+
+
+def save_social_targets(db_path: str, account_id: int, targets: List[dict]) -> int:
+    """Replace social targets for one account."""
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        conn = _get_conn(db_path)
+        account = get_social_account(db_path, account_id)
+        platform = account.get("platform", "") if account else ""
+        conn.execute("DELETE FROM social_targets WHERE account_id = ?", (account_id,))
+        saved = 0
+        for target in targets:
+            uid = target.get("target_uid") or target.get("page_id") or target.get("uid") or ""
+            name = target.get("target_name") or target.get("page_name") or target.get("name") or ""
+            url = target.get("target_url") or target.get("page_url") or target.get("url") or ""
+            if not uid and not name:
+                continue
+            conn.execute("""
+                INSERT OR REPLACE INTO social_targets
+                    (account_id, platform, target_type, target_name, target_uid,
+                     target_url, avatar_path, group_name, last_synced, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                account_id,
+                target.get("platform", platform),
+                target.get("target_type", "channel" if platform != "facebook" else "fanpage"),
+                name,
+                uid,
+                url,
+                target.get("avatar_path", ""),
+                target.get("group_name", ""),
+                now,
+                now,
+            ))
+            saved += 1
+        conn.commit()
+        conn.close()
+        return saved
+    except Exception as e:
+        logger.error(f"save_social_targets error: {str(e)[:100]}")
+        return 0
+
+
+def get_social_targets(
+    db_path: str,
+    account_id: Optional[int] = None,
+    platform: str = "",
+) -> List[dict]:
+    try:
+        conn = _get_conn(db_path)
+        sql = """
+            SELECT id, account_id, platform, target_type, target_name, target_uid,
+                   target_url, avatar_path, group_name, last_synced, created_at
+            FROM social_targets
+            WHERE 1=1
+        """
+        params = []
+        if account_id is not None:
+            sql += " AND account_id = ?"
+            params.append(account_id)
+        if platform:
+            sql += " AND platform = ?"
+            params.append(platform)
+        sql += " ORDER BY platform, target_name"
+        rows = conn.execute(sql, params).fetchall()
+        conn.close()
+        return [
+            {
+                "id": r[0], "account_id": r[1], "platform": r[2],
+                "target_type": r[3], "target_name": r[4], "target_uid": r[5],
+                "target_url": r[6], "avatar_path": r[7], "group_name": r[8],
+                "last_synced": r[9], "created_at": r[10],
+            }
+            for r in rows
+        ]
+    except Exception as e:
+        logger.error(f"get_social_targets error: {str(e)[:100]}")
+        return []
 
 
 # ─── Managed Pages CRUD ──────────────────────────────────────────────────────

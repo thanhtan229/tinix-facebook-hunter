@@ -4,8 +4,13 @@ CRUD + Bulk Import + Check Live for Facebook accounts.
 Page & Group Management with avatar support (Tab 2).
 """
 
+import os
+import shutil
+import subprocess
+import sys
 import threading
 import webbrowser
+from datetime import datetime
 from pathlib import Path
 from tkinter import messagebox, ttk
 from typing import Callable, List, Optional
@@ -13,12 +18,15 @@ from typing import Callable, List, Optional
 import customtkinter as ctk
 
 from core.db_storage import (
-    get_db_path, get_all_accounts, get_all_proxies,
+    get_db_path, get_all_accounts, get_account, get_all_proxies,
     add_account, update_account, delete_account,
     save_managed_pages, delete_managed_pages, delete_managed_page,
     get_page_groups, add_page_group, delete_page_group,
     move_pages_to_group, update_page_avatar,
     get_all_managed_pages, save_business_id,
+    get_social_accounts, get_social_account, add_social_account,
+    update_social_account, delete_social_account, sync_social_account_to_fb_account,
+    save_social_targets,
 )
 from utils import config, logger
 
@@ -139,6 +147,68 @@ def parse_account_lines(text: str) -> list:
     return results
 
 
+PLATFORM_LABELS = {
+    "facebook": "Facebook",
+    "tiktok": "TikTok",
+    "zalo_video": "Zalo Video",
+    "instagram": "Instagram",
+    "youtube": "YouTube",
+}
+
+PLATFORM_ICONS = {
+    "facebook": "f",
+    "tiktok": "♪",
+    "zalo_video": "▶",
+    "instagram": "◎",
+    "youtube": "▶",
+}
+
+PLATFORM_HOME_URLS = {
+    "facebook": "https://business.facebook.com/latest/home",
+    "tiktok": "https://www.tiktok.com/upload",
+    "zalo_video": "https://video.zalo.me/",
+    "instagram": "https://www.instagram.com/",
+    "youtube": "https://studio.youtube.com/",
+}
+
+STATUS_COLORS = {
+    "Chưa đồng bộ": "#64748B",
+    "Live": "#16A34A",
+    "Hết session": "#D97706",
+    "Checkpoint": "#F59E0B",
+    "Cần xác minh": "#F59E0B",
+    "Không có quyền đăng": "#D97706",
+    "Die": "#DC2626",
+    "Lỗi proxy": "#DC2626",
+    "Lỗi không xác định": "#DC2626",
+}
+
+
+def _project_root() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).parent
+    return Path(__file__).parent.parent
+
+
+def _default_profile_dir(platform: str, account_id: int) -> str:
+    safe_platform = platform.replace(" ", "_").lower()
+    base = _project_root() / "chrome_profiles"
+    base.mkdir(parents=True, exist_ok=True)
+    return str(base / f"{safe_platform}_{account_id}")
+
+
+def _find_chrome_path() -> str:
+    candidates = [
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+        os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
+    ]
+    for path in candidates:
+        if path and os.path.exists(path):
+            return path
+    return "chrome"
+
+
 # ─── BulkImportDialog ────────────────────────────────────────────────────────
 
 class BulkImportDialog(ctk.CTkToplevel):
@@ -216,6 +286,153 @@ class BulkImportDialog(ctk.CTkToplevel):
 
 # ─── AccountManagerDialog ────────────────────────────────────────────────────
 
+class SocialAccountEditor(ctk.CTkToplevel):
+    """Add/edit one multi-platform account."""
+
+    def __init__(self, master, account: Optional[dict], proxies: List[dict],
+                 on_save: Callable[[dict], bool], **kwargs):
+        super().__init__(master, **kwargs)
+        self._account = account or {}
+        self._proxies = proxies
+        self._on_save = on_save
+        self.title("Thêm tài khoản" if not account else "Sửa tài khoản")
+        self.geometry("620x640")
+        self.resizable(False, False)
+        self.transient(master)
+        self.grab_set()
+
+        self.update_idletasks()
+        x = master.winfo_x() + (master.winfo_width() - 620) // 2
+        y = master.winfo_y() + (master.winfo_height() - 640) // 2
+        self.geometry(f"+{max(0, x)}+{max(0, y)}")
+
+        self._entries = {}
+        self._build_ui()
+
+    def _build_ui(self):
+        main = ctk.CTkFrame(self, fg_color="#F5F5F7", corner_radius=0)
+        main.pack(fill="both", expand=True)
+
+        ctk.CTkLabel(
+            main, text="Tài khoản đa nền tảng",
+            font=ctk.CTkFont(size=18, weight="bold"),
+            text_color="#1E293B",
+        ).pack(anchor="w", padx=18, pady=(16, 8))
+
+        form = ctk.CTkScrollableFrame(main, fg_color="#FFFFFF", corner_radius=10)
+        form.pack(fill="both", expand=True, padx=16, pady=(0, 10))
+
+        self._platform_var = ctk.StringVar(
+            value=PLATFORM_LABELS.get(self._account.get("platform", "facebook"), "Facebook"))
+        self._add_combo(form, "Nền tảng", self._platform_var, list(PLATFORM_LABELS.values()))
+
+        for key, label, is_pass, hint in [
+            ("label", "Tên hiển thị", False, "VD: Acc chính / Kênh shop"),
+            ("username", "Username / UID", False, "Email, SĐT, username hoặc channel id"),
+            ("password", "Password", True, "Tùy chọn"),
+            ("secret_2fa", "2FA Secret", False, "Tùy chọn"),
+            ("email", "Email", False, "Email đăng nhập hoặc khôi phục"),
+            ("email_pass", "Email Pass", True, "Tùy chọn"),
+            ("uid", "UID / Channel ID", False, "Tự điền sau đồng bộ nếu có"),
+            ("profile_dir", "Browser profile", False, "Tự tạo sau khi lưu nếu để trống"),
+            ("cookie", "Session / Cookie", False, "Advanced: app tự cập nhật khi đồng bộ"),
+            ("notes", "Ghi chú", False, ""),
+        ]:
+            self._add_entry(form, key, label, is_pass, hint)
+
+        self._proxy_var = ctk.StringVar(value="Không có proxy")
+        if self._account.get("proxy_id"):
+            for p in self._proxies:
+                if p["id"] == self._account["proxy_id"]:
+                    self._proxy_var.set(f"[{p['id']}] {p['label'] or p['host']}:{p['port']}")
+                    break
+        proxy_values = ["Không có proxy"] + [
+            f"[{p['id']}] {p['label'] or p['host']}:{p['port']}" for p in self._proxies
+        ]
+        self._add_combo(form, "Proxy", self._proxy_var, proxy_values)
+
+        self._status = ctk.CTkLabel(
+            main, text="", font=ctk.CTkFont(size=11), text_color="#64748B")
+        self._status.pack(anchor="w", padx=18)
+
+        actions = ctk.CTkFrame(main, fg_color="transparent")
+        actions.pack(fill="x", padx=16, pady=(6, 14))
+        ctk.CTkButton(
+            actions, text="Hủy", width=90, height=34,
+            fg_color="#E2E8F0", text_color="#334155",
+            hover_color="#CBD5E1", corner_radius=6,
+            command=self.destroy,
+        ).pack(side="right", padx=(8, 0))
+        ctk.CTkButton(
+            actions, text="Lưu", width=110, height=34,
+            fg_color="#2563EB", hover_color="#1D4ED8",
+            corner_radius=6, command=self._save,
+        ).pack(side="right")
+
+    def _add_entry(self, parent, key, label, is_pass, hint):
+        row = ctk.CTkFrame(parent, fg_color="transparent")
+        row.pack(fill="x", padx=10, pady=4)
+        ctk.CTkLabel(row, text=label, width=130, anchor="w",
+                     text_color="#64748B", font=ctk.CTkFont(size=11)).pack(side="left")
+        entry = ctk.CTkEntry(
+            row, height=30, fg_color="#F8FAFC", text_color="#1E293B",
+            border_color="#CBD5E1", corner_radius=6,
+            placeholder_text=hint, show="*" if is_pass else "")
+        entry.pack(side="left", fill="x", expand=True)
+        val = self._account.get(key, "")
+        if val:
+            entry.insert(0, str(val))
+        self._entries[key] = entry
+
+    def _add_combo(self, parent, label, var, values):
+        row = ctk.CTkFrame(parent, fg_color="transparent")
+        row.pack(fill="x", padx=10, pady=4)
+        ctk.CTkLabel(row, text=label, width=130, anchor="w",
+                     text_color="#64748B", font=ctk.CTkFont(size=11)).pack(side="left")
+        combo = ctk.CTkComboBox(
+            row, variable=var, values=values, state="readonly",
+            height=30, fg_color="#F8FAFC", text_color="#1E293B",
+            border_color="#CBD5E1", corner_radius=6)
+        combo.pack(side="left", fill="x", expand=True)
+
+    def _save(self):
+        platform_label = self._platform_var.get()
+        platform = next((k for k, v in PLATFORM_LABELS.items() if v == platform_label), "facebook")
+        username = self._entries["username"].get().strip()
+        email = self._entries["email"].get().strip()
+        label = self._entries["label"].get().strip()
+        if not username and not email and not label:
+            self._status.configure(text="Cần tên, username hoặc email.", text_color="#DC2626")
+            return
+
+        proxy_id = None
+        pv = self._proxy_var.get()
+        if pv.startswith("["):
+            try:
+                proxy_id = int(pv.split("]")[0][1:])
+            except (ValueError, IndexError):
+                proxy_id = None
+
+        data = {
+            "platform": platform,
+            "label": label,
+            "username": username or email or label,
+            "password": self._entries["password"].get().strip(),
+            "secret_2fa": self._entries["secret_2fa"].get().strip(),
+            "email": email,
+            "email_pass": self._entries["email_pass"].get().strip(),
+            "uid": self._entries["uid"].get().strip(),
+            "profile_dir": self._entries["profile_dir"].get().strip(),
+            "cookie": self._entries["cookie"].get().strip(),
+            "notes": self._entries["notes"].get().strip(),
+            "proxy_id": proxy_id,
+        }
+        if self._on_save(data):
+            self.destroy()
+        else:
+            self._status.configure(text="Không lưu được tài khoản.", text_color="#DC2626")
+
+
 class AccountManagerDialog(ctk.CTkToplevel):
     """Dual-tab dialog: Account CRUD (Tab 1) + Page & Group Management (Tab 2)."""
 
@@ -235,6 +452,8 @@ class AccountManagerDialog(ctk.CTkToplevel):
 
         # Account tab state
         self._selected_id: Optional[int] = None
+        self._selected_social_id: Optional[int] = None
+        self._social_accounts: List[dict] = []
         self._accounts: List[dict] = []
         self._proxies: List[dict] = []
 
@@ -245,15 +464,15 @@ class AccountManagerDialog(ctk.CTkToplevel):
         self._tree_images: List = []
         self._group_btn_refs: List = []
 
-        self.title("👤 Quản lý tài khoản & Fanpage")
-        self.geometry("960x740")
+        self.title("Quản lý tài khoản")
+        self.geometry("1180x760")
         self.resizable(True, True)
         self.transient(master)
         self.grab_set()
 
         self.update_idletasks()
-        x = master.winfo_x() + (master.winfo_width() - 960) // 2
-        y = master.winfo_y() + (master.winfo_height() - 740) // 2
+        x = master.winfo_x() + (master.winfo_width() - 1180) // 2
+        y = master.winfo_y() + (master.winfo_height() - 760) // 2
         self.geometry(f"+{max(0, x)}+{max(0, y)}")
 
         _ensure_default_avatar()
@@ -272,10 +491,19 @@ class AccountManagerDialog(ctk.CTkToplevel):
         main = ctk.CTkFrame(self, fg_color=self._BG, corner_radius=0)
         main.pack(fill="both", expand=True)
 
+        header = ctk.CTkFrame(main, fg_color="transparent")
+        header.pack(fill="x", padx=18, pady=(12, 6))
         ctk.CTkLabel(
-            main, text="👤 Quản lý tài khoản & Fanpage",
-            font=ctk.CTkFont(size=18, weight="bold"), text_color=self._TEXT,
-        ).pack(padx=20, pady=(12, 4))
+            header, text="Quản lý tài khoản",
+            font=ctk.CTkFont(size=20, weight="bold"), text_color=self._TEXT,
+        ).pack(side="left")
+        ctk.CTkButton(
+            header, text="Cập nhật Browser", width=150, height=34,
+            font=ctk.CTkFont(size=12), fg_color="#F8FAFC",
+            text_color="#4338CA", hover_color="#EEF2FF",
+            border_width=1, border_color=self._BORDER,
+            corner_radius=6, command=self._update_browser,
+        ).pack(side="right")
 
         tabs = ctk.CTkTabview(
             main, fg_color=self._CARD,
@@ -288,8 +516,8 @@ class AccountManagerDialog(ctk.CTkToplevel):
         )
         tabs.pack(fill="both", expand=True, padx=16, pady=(0, 4))
 
-        self._build_account_tab(tabs.add("👤 Tài khoản"))
-        self._build_pages_tab(tabs.add("📄 Fanpage & Nhóm"))
+        self._build_account_tab(tabs.add("Tài khoản"))
+        self._build_pages_tab(tabs.add("Fanpage & Nhóm"))
 
         ctk.CTkButton(
             main, text="Đóng", width=80, height=30,
@@ -303,6 +531,103 @@ class AccountManagerDialog(ctk.CTkToplevel):
     # ═══════════════════════════════════════════════════════════════════════
 
     def _build_account_tab(self, parent):
+        main = ctk.CTkFrame(parent, fg_color="transparent")
+        main.pack(fill="both", expand=True, padx=4, pady=4)
+
+        toolbar = ctk.CTkFrame(main, fg_color=self._CARD, corner_radius=8,
+                               border_width=1, border_color=self._BORDER)
+        toolbar.pack(fill="x", pady=(0, 6))
+
+        row1 = ctk.CTkFrame(toolbar, fg_color="transparent")
+        row1.pack(fill="x", padx=10, pady=(8, 4))
+        for text, color, cmd, width in [
+            ("+ Thêm tài khoản", "#E43F5A", self._new_account, 140),
+            ("Đồng bộ", "#0F766E", self._sync_selected, 90),
+            ("Check Live", "#7C3AED", self._check_live, 95),
+            ("Lưu DS Full", "#334155", self._export_accounts, 105),
+            ("Xóa tài khoản", "#DC2626", self._delete_account, 120),
+            ("Xóa profile", "#B91C1C", self._delete_profile, 105),
+        ]:
+            ctk.CTkButton(
+                row1, text=text, width=width, height=32,
+                font=ctk.CTkFont(size=11, weight="bold"),
+                fg_color=color, hover_color="#1F2937", corner_radius=6,
+                command=cmd,
+            ).pack(side="left", padx=(0, 6))
+
+        row2 = ctk.CTkFrame(toolbar, fg_color="transparent")
+        row2.pack(fill="x", padx=10, pady=(2, 8))
+        self._platform_filter = ctk.StringVar(value="Tất cả nền tảng")
+        ctk.CTkOptionMenu(
+            row2, variable=self._platform_filter,
+            values=["Tất cả nền tảng"] + list(PLATFORM_LABELS.values()),
+            width=150, height=30, command=lambda _=None: self._render_social_accounts(),
+        ).pack(side="left", padx=(0, 6))
+        self._status_filter = ctk.StringVar(value="Tất cả trạng thái")
+        ctk.CTkOptionMenu(
+            row2, variable=self._status_filter,
+            values=["Tất cả trạng thái"] + list(STATUS_COLORS.keys()),
+            width=160, height=30, command=lambda _=None: self._render_social_accounts(),
+        ).pack(side="left", padx=(0, 6))
+        self._search_var_accounts = ctk.StringVar()
+        self._search_var_accounts.trace_add("write", lambda *_: self._render_social_accounts())
+        ctk.CTkEntry(
+            row2, textvariable=self._search_var_accounts,
+            placeholder_text="Tìm kiếm theo tên, uid, email...",
+            height=30, width=360,
+            fg_color="#F8FAFC", text_color="#1E293B",
+            border_color=self._BORDER, corner_radius=6,
+        ).pack(side="left", fill="x", expand=True)
+
+        table_card = ctk.CTkFrame(main, fg_color=self._CARD, corner_radius=8,
+                                  border_width=1, border_color=self._BORDER)
+        table_card.pack(fill="both", expand=True)
+        import tkinter as tk
+        outer = tk.Frame(table_card, bg=self._CARD)
+        outer.pack(fill="both", expand=True, padx=4, pady=4)
+        style = ttk.Style()
+        try:
+            style.theme_use("clam")
+        except Exception:
+            pass
+        style.configure("MultiAccounts.Treeview", background="#FFFFFF",
+                        fieldbackground="#FFFFFF", foreground="#334155",
+                        rowheight=34, borderwidth=0, font=("Segoe UI", 10))
+        style.configure("MultiAccounts.Treeview.Heading", background="#E43F5A",
+                        foreground="#FFFFFF", font=("Segoe UI", 10, "bold"),
+                        relief="flat")
+        columns = ("stt", "check", "live", "platform", "avatar", "name", "uid",
+                   "email", "sync", "browser", "actions")
+        self._acct_tree = ttk.Treeview(
+            outer, columns=columns, show="headings",
+            style="MultiAccounts.Treeview", selectmode="extended")
+        headers = {
+            "stt": "STT", "check": "□", "live": "Live", "platform": "Nền tảng",
+            "avatar": "Avatar", "name": "Name", "uid": "UID", "email": "Email",
+            "sync": "Đồng bộ", "browser": "Trình duyệt", "actions": "⋮",
+        }
+        widths = {"stt": 50, "check": 45, "live": 115, "platform": 110,
+                  "avatar": 70, "name": 220, "uid": 170, "email": 210,
+                  "sync": 150, "browser": 150, "actions": 45}
+        for col in columns:
+            self._acct_tree.heading(col, text=headers[col])
+            self._acct_tree.column(col, width=widths[col], minwidth=40, anchor="center")
+        self._acct_tree.column("name", anchor="w")
+        self._acct_tree.column("email", anchor="w")
+        vsb = ttk.Scrollbar(outer, orient="vertical", command=self._acct_tree.yview)
+        hsb = ttk.Scrollbar(outer, orient="horizontal", command=self._acct_tree.xview)
+        self._acct_tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        vsb.pack(side="right", fill="y")
+        hsb.pack(side="bottom", fill="x")
+        self._acct_tree.pack(side="left", fill="both", expand=True)
+        self._acct_tree.bind("<<TreeviewSelect>>", self._on_acct_tree_select)
+        self._acct_tree.bind("<Double-1>", lambda _e: self._edit_selected())
+        self._acct_tree.bind("<Button-3>", self._open_account_menu)
+        self._status = ctk.CTkLabel(main, text="", font=ctk.CTkFont(size=11),
+                                    text_color="#64748B")
+        self._status.pack(anchor="w", padx=4, pady=(4, 0))
+
+    def _legacy_build_account_tab(self, parent):
         main = ctk.CTkFrame(parent, fg_color="transparent")
         main.pack(fill="both", expand=True, padx=4, pady=4)
 
@@ -854,6 +1179,130 @@ class AccountManagerDialog(ctk.CTkToplevel):
     # ═══════════════════════════════════════════════════════════════════════
 
     def _refresh_list(self):
+        self._proxies = get_all_proxies(self._db())
+        self._accounts = get_all_accounts(self._db())
+        self._social_accounts = get_social_accounts(self._db())
+        if hasattr(self, "_acct_tree"):
+            self._render_social_accounts()
+
+    def _render_social_accounts(self):
+        if not hasattr(self, "_acct_tree"):
+            return
+        self._acct_tree.delete(*self._acct_tree.get_children())
+        platform_filter = self._platform_filter.get() if hasattr(self, "_platform_filter") else "Tất cả nền tảng"
+        status_filter = self._status_filter.get() if hasattr(self, "_status_filter") else "Tất cả trạng thái"
+        query = self._search_var_accounts.get().strip().lower() if hasattr(self, "_search_var_accounts") else ""
+        platform_key = next((k for k, v in PLATFORM_LABELS.items() if v == platform_filter), "")
+        rows = list(self._social_accounts)
+        if platform_key:
+            rows = [a for a in rows if a.get("platform") == platform_key]
+        if status_filter != "Tất cả trạng thái":
+            rows = [a for a in rows if a.get("sync_status") == status_filter]
+        if query:
+            rows = [
+                a for a in rows
+                if query in " ".join([
+                    a.get("label", ""), a.get("username", ""),
+                    a.get("email", ""), a.get("uid", ""),
+                ]).lower()
+            ]
+        if not rows:
+            self._acct_tree.insert("", "end", iid="__empty",
+                                   values=("", "", "—", "", "", "Chưa có tài khoản", "", "", "", "", ""),
+                                   tags=("empty",))
+            return
+        for idx, acc in enumerate(rows, 1):
+            platform = acc.get("platform", "facebook")
+            status = acc.get("sync_status") or "Chưa đồng bộ"
+            name = acc.get("label") or acc.get("username") or acc.get("email") or f"Account {acc['id']}"
+            profile = "Profile riêng" if acc.get("profile_dir") else "Chưa tạo"
+            sync_text = acc.get("last_synced", "")[:16] if acc.get("last_synced") else status
+            self._acct_tree.insert(
+                "", "end", iid=f"sacc_{acc['id']}",
+                values=(idx, "□", status, PLATFORM_LABELS.get(platform, platform),
+                        PLATFORM_ICONS.get(platform, ""), name,
+                        acc.get("uid") or acc.get("username", ""),
+                        acc.get("email", ""), sync_text, profile, "⋮"),
+                tags=(str(acc["id"]), status),
+            )
+
+    def _on_acct_tree_select(self, _event=None):
+        sel = self._acct_tree.selection()
+        if not sel:
+            self._selected_social_id = None
+            return
+        tags = self._acct_tree.item(sel[0], "tags")
+        if not tags or "empty" in tags:
+            self._selected_social_id = None
+            return
+        try:
+            self._selected_social_id = int(tags[0])
+        except (ValueError, IndexError):
+            self._selected_social_id = None
+
+    def _selected_social_accounts(self) -> List[dict]:
+        ids = []
+        for iid in self._acct_tree.selection():
+            tags = self._acct_tree.item(iid, "tags")
+            if tags and "empty" not in tags:
+                try:
+                    ids.append(int(tags[0]))
+                except (ValueError, IndexError):
+                    pass
+        if not ids and self._selected_social_id:
+            ids = [self._selected_social_id]
+        return [a for a in self._social_accounts if a["id"] in ids]
+
+    def _new_account(self):
+        self._selected_social_id = None
+        SocialAccountEditor(self, None, self._proxies, self._save_social_account)
+
+    def _edit_selected(self):
+        accounts = self._selected_social_accounts()
+        if not accounts:
+            self._status.configure(text="Chọn tài khoản trước", text_color="#D97706")
+            return
+        self._selected_social_id = accounts[0]["id"]
+        SocialAccountEditor(self, accounts[0], self._proxies, self._save_social_account)
+
+    def _save_social_account(self, data: dict) -> bool:
+        db = self._db()
+        if self._selected_social_id and get_social_account(db, self._selected_social_id):
+            ok = update_social_account(db, self._selected_social_id, **data)
+            account_id = self._selected_social_id
+        else:
+            account_id = add_social_account(db, **data)
+            ok = account_id > 0
+            self._selected_social_id = account_id if ok else None
+        if ok:
+            account = get_social_account(db, account_id)
+            if account and not account.get("profile_dir"):
+                update_social_account(db, account_id,
+                                      profile_dir=_default_profile_dir(account["platform"], account_id))
+            if account and account.get("platform") == "facebook":
+                sync_social_account_to_fb_account(db, account_id)
+            self._refresh_list()
+            self._refresh_groups_and_pages()
+            if self._on_change:
+                self._on_change()
+        return ok
+
+    def _delete_account(self):
+        accounts = self._selected_social_accounts()
+        if not accounts:
+            self._status.configure(text="Chọn tài khoản trước", text_color="#D97706")
+            return
+        if not messagebox.askyesno("Xác nhận", f"Xóa {len(accounts)} tài khoản đã chọn?"):
+            return
+        for acc in accounts:
+            delete_social_account(self._db(), acc["id"])
+        self._selected_social_id = None
+        self._refresh_list()
+        self._refresh_groups_and_pages()
+        if self._on_change:
+            self._on_change()
+
+    def _legacy_refresh_list(self):
         self._accounts = get_all_accounts(self._db())
         self._proxies = get_all_proxies(self._db())
 
@@ -888,7 +1337,7 @@ class AccountManagerDialog(ctk.CTkToplevel):
         except Exception:
             pass
 
-    def _on_acct_tree_select(self, _event=None):
+    def _legacy_on_acct_tree_select(self, _event=None):
         """Handle treeview row selection → fill the detail form."""
         sel = self._acct_tree.selection()
         if not sel:
@@ -930,7 +1379,7 @@ class AccountManagerDialog(ctk.CTkToplevel):
             self._acct_tree.selection_set(iid)
             self._acct_tree.see(iid)
 
-    def _new_account(self):
+    def _legacy_new_account(self):
         self._selected_id = None
         for entry in self._entries.values():
             entry.delete(0, "end")
@@ -938,7 +1387,7 @@ class AccountManagerDialog(ctk.CTkToplevel):
         self._status.configure(text="Thêm tài khoản mới", text_color=self._GREEN)
         self._refresh_list()
 
-    def _save_account(self):
+    def _legacy_save_account(self):
         username = self._entries["username"].get().strip()
         cookie = self._entries["cookie"].get().strip()
         if not username and not cookie:
@@ -976,7 +1425,7 @@ class AccountManagerDialog(ctk.CTkToplevel):
         if self._on_change:
             self._on_change()
 
-    def _delete_account(self):
+    def _legacy_delete_account(self):
         if not self._selected_id:
             self._status.configure(text="⚠ Chọn tài khoản trước", text_color="#D97706")
             return
@@ -989,10 +1438,226 @@ class AccountManagerDialog(ctk.CTkToplevel):
         if self._on_change:
             self._on_change()
 
-    def _open_import(self):
+    def _open_account_menu(self, event):
+        import tkinter as tk
+        iid = self._acct_tree.identify_row(event.y)
+        if iid:
+            self._acct_tree.selection_set(iid)
+            self._on_acct_tree_select()
+        menu = tk.Menu(self, tearoff=0, bg="#FFFFFF", fg="#334155",
+                       activebackground=self._ACCENT, activeforeground="#FFFFFF",
+                       font=("Segoe UI", 10))
+        menu.add_command(label="Sửa tài khoản", command=self._edit_selected)
+        menu.add_command(label="Đồng bộ", command=self._sync_selected)
+        menu.add_command(label="Mở profile", command=self._open_profile)
+        menu.add_command(label="Check Live", command=self._check_live)
+        menu.add_separator()
+        menu.add_command(label="Xóa profile", command=self._delete_profile, foreground=self._RED)
+        menu.add_command(label="Xóa tài khoản", command=self._delete_account, foreground=self._RED)
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _sync_selected(self):
+        accounts = self._selected_social_accounts()
+        if not accounts:
+            self._status.configure(text="Chọn tài khoản để đồng bộ", text_color="#D97706")
+            return
+        self._status.configure(text=f"Đang đồng bộ {len(accounts)} tài khoản...", text_color="#7C3AED")
+        threading.Thread(target=self._sync_accounts_thread, args=(accounts,), daemon=True).start()
+
+    def _sync_accounts_thread(self, accounts: List[dict]):
+        for acc in accounts:
+            try:
+                self._sync_one_account(acc)
+            except Exception as e:
+                logger.exception(
+                    "Social account sync failed", e,
+                    extra={"account_id": acc.get("id"), "platform": acc.get("platform")},
+                    widget=self,
+                )
+                update_social_account(
+                    self._db(), acc["id"], is_active=0, sync_status="Lỗi không xác định",
+                    status_reason=str(e)[:300],
+                    last_checked=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                )
+        self.after(0, self._refresh_list)
+        self.after(0, self._refresh_groups_and_pages)
+        self.after(0, self._status.configure, {
+            "text": "Đồng bộ xong. Xem trạng thái trong bảng.",
+            "text_color": self._GREEN,
+        })
+
+    def _sync_one_account(self, acc: dict):
+        db = self._db()
+        platform = acc.get("platform", "facebook")
+        profile_dir = acc.get("profile_dir") or _default_profile_dir(platform, acc["id"])
+        Path(profile_dir).mkdir(parents=True, exist_ok=True)
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        update_social_account(db, acc["id"], profile_dir=profile_dir, last_checked=now)
+        acc = get_social_account(db, acc["id"]) or acc
+        if platform == "facebook":
+            legacy_id = sync_social_account_to_fb_account(db, acc["id"])
+            fb_acc = get_account(db, legacy_id) if legacy_id > 0 else None
+            if not fb_acc:
+                update_social_account(db, acc["id"], is_active=0, sync_status="Lỗi không xác định",
+                                      status_reason="Không tạo được Facebook legacy account",
+                                      last_checked=now)
+                return
+            fb_acc["profile_dir"] = profile_dir
+            poster = AutoPoster(account=fb_acc, headless=False)
+            try:
+                if not poster.start():
+                    update_social_account(db, acc["id"], is_active=0, sync_status="Hết session",
+                                          status_reason="Không mở được Facebook session",
+                                          last_checked=now)
+                    return
+                pages, business_id = poster.scan_managed_pages()
+                if business_id:
+                    save_business_id(db, legacy_id, business_id)
+                if pages:
+                    selected = [{
+                        "page_name": p.get("name", ""),
+                        "page_url": p.get("url", ""),
+                        "page_id": p.get("page_id", ""),
+                        "avatar_url": p.get("avatar_url", ""),
+                    } for p in pages]
+                    delete_managed_pages(db, legacy_id)
+                    save_managed_pages(db, legacy_id, selected)
+                    save_social_targets(db, acc["id"], [{
+                        "target_type": "fanpage",
+                        "target_name": p.get("name", ""),
+                        "target_uid": p.get("page_id", ""),
+                        "target_url": p.get("url", ""),
+                    } for p in pages])
+                    update_social_account(
+                        db, acc["id"], is_active=1, sync_status="Live",
+                        status_reason=f"Đã đồng bộ {len(pages)} fanpage",
+                        uid=acc.get("uid") or acc.get("username", ""),
+                        last_checked=now, last_synced=now)
+                else:
+                    update_social_account(
+                        db, acc["id"], is_active=1, sync_status="Không có quyền đăng",
+                        status_reason="Đăng nhập được nhưng chưa tìm thấy Fanpage",
+                        last_checked=now, last_synced=now)
+            finally:
+                poster.stop()
+            return
+        self._open_browser_for_account(acc, profile_dir)
+        reason = (
+            "Đã mở Zalo Video profile. Quét kênh tự động sẽ được bổ sung ở bước sau."
+            if platform == "zalo_video"
+            else f"Đã mở {PLATFORM_LABELS.get(platform, platform)}. Đăng nhập nếu cần rồi bấm Check Live/Đồng bộ lại."
+        )
+        update_social_account(db, acc["id"], is_active=0, sync_status="Cần xác minh",
+                              status_reason=reason, last_checked=now, last_synced=now)
+
+    def _check_live(self):
+        accounts = self._selected_social_accounts() or list(self._social_accounts)
+        if not accounts:
+            self._status.configure(text="Chưa có tài khoản", text_color="#D97706")
+            return
+        self._status.configure(text=f"Đang check {len(accounts)} tài khoản...", text_color="#7C3AED")
+        threading.Thread(target=self._check_live_thread, args=(accounts,), daemon=True).start()
+
+    def _check_live_thread(self, accounts: list):
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        for acc in accounts:
+            platform = acc.get("platform", "facebook")
+            try:
+                if platform == "facebook":
+                    legacy_id = sync_social_account_to_fb_account(self._db(), acc["id"])
+                    fb_acc = get_account(self._db(), legacy_id) if legacy_id > 0 else None
+                    if fb_acc:
+                        fb_acc["profile_dir"] = acc.get("profile_dir", "")
+                        from core.page_scraper import PageScraper
+                        scraper = PageScraper(account=fb_acc)
+                        live = scraper.start()
+                        scraper.stop()
+                        update_social_account(
+                            self._db(), acc["id"], is_active=1 if live else 0,
+                            sync_status="Live" if live else "Hết session",
+                            status_reason="Facebook check live OK" if live else "Không mở được Facebook session",
+                            last_checked=now)
+                    continue
+                profile_dir = acc.get("profile_dir") or _default_profile_dir(platform, acc["id"])
+                exists = Path(profile_dir).exists()
+                update_social_account(
+                    self._db(), acc["id"], is_active=0,
+                    sync_status="Cần xác minh" if exists else "Chưa đồng bộ",
+                    status_reason="Profile đã tồn tại; mở Đồng bộ để xác minh session" if exists else "Chưa có browser profile",
+                    last_checked=now)
+            except Exception as e:
+                update_social_account(
+                    self._db(), acc["id"], is_active=0, sync_status="Lỗi không xác định",
+                    status_reason=str(e)[:300], last_checked=now)
+        self.after(0, self._refresh_list)
+        self.after(0, self._status.configure, {"text": "Check Live xong.", "text_color": self._GREEN})
+
+    def _open_profile(self):
+        accounts = self._selected_social_accounts()
+        if not accounts:
+            self._status.configure(text="Chọn tài khoản trước", text_color="#D97706")
+            return
+        acc = accounts[0]
+        profile_dir = acc.get("profile_dir") or _default_profile_dir(acc.get("platform", "facebook"), acc["id"])
+        self._open_browser_for_account(acc, profile_dir)
+
+    def _open_browser_for_account(self, acc: dict, profile_dir: str):
+        Path(profile_dir).mkdir(parents=True, exist_ok=True)
+        url = PLATFORM_HOME_URLS.get(acc.get("platform", "facebook"), "https://www.google.com/")
+        cmd = [
+            _find_chrome_path(), f"--user-data-dir={profile_dir}",
+            "--no-first-run", "--no-default-browser-check",
+            "--window-size=1280,900", url,
+        ]
+        subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        logger.info(f"Opened {PLATFORM_LABELS.get(acc.get('platform'), acc.get('platform'))} profile: {profile_dir}")
+
+    def _delete_profile(self):
+        accounts = self._selected_social_accounts()
+        if not accounts:
+            self._status.configure(text="Chọn tài khoản trước", text_color="#D97706")
+            return
+        if not messagebox.askyesno("Xác nhận", f"Xóa profile của {len(accounts)} tài khoản đã chọn?"):
+            return
+        deleted = 0
+        for acc in accounts:
+            profile_dir = acc.get("profile_dir")
+            if profile_dir and Path(profile_dir).exists():
+                shutil.rmtree(profile_dir, ignore_errors=True)
+                deleted += 1
+            update_social_account(self._db(), acc["id"], profile_dir="",
+                                  sync_status="Chưa đồng bộ", status_reason="Profile đã bị xóa",
+                                  is_active=0)
+        self._refresh_list()
+        self._status.configure(text=f"Đã xóa {deleted} profile", text_color=self._RED)
+
+    def _export_accounts(self):
+        if not self._social_accounts:
+            self._status.configure(text="Không có dữ liệu để lưu", text_color="#D97706")
+            return
+        filepath = Path(self._db()).parent / f"social_accounts_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        import csv
+        with open(filepath, "w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.DictWriter(
+                f,
+                fieldnames=["id", "platform", "label", "username", "uid", "email",
+                            "sync_status", "status_reason", "profile_dir", "proxy_label",
+                            "last_checked", "last_synced"])
+            writer.writeheader()
+            for acc in self._social_accounts:
+                writer.writerow({k: acc.get(k, "") for k in writer.fieldnames})
+        self._status.configure(text=f"Đã lưu: {filepath}", text_color=self._GREEN)
+
+    def _update_browser(self):
+        self._status.configure(text=f"Chrome: {_find_chrome_path()}", text_color=self._ACCENT)
+
+    def _legacy_open_import(self):
         BulkImportDialog(self, on_import=self._do_bulk_import)
 
-    def _do_bulk_import(self, accounts: list) -> int:
+    def _legacy_do_bulk_import(self, accounts: list) -> int:
         count = 0
         for acc in accounts:
             if not acc.get("username") and not acc.get("cookie"):
@@ -1015,7 +1680,7 @@ class AccountManagerDialog(ctk.CTkToplevel):
             self._on_change()
         return count
 
-    def _check_live(self):
+    def _legacy_check_live(self):
         if not self._accounts:
             self._status.configure(text="⚠ Chưa có tài khoản", text_color="#D97706")
             return
@@ -1027,7 +1692,7 @@ class AccountManagerDialog(ctk.CTkToplevel):
             text=f"🔍 Đang check {len(to_check)} tài khoản...", text_color="#7C3AED")
         threading.Thread(target=self._check_live_thread, args=(to_check,), daemon=True).start()
 
-    def _check_live_thread(self, accounts: list):
+    def _legacy_check_live_thread(self, accounts: list):
         try:
             from core.page_scraper import PageScraper
             import time

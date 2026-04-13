@@ -2445,6 +2445,11 @@ class AutoPoster:
 
     def _get_profile_dir(self) -> str:
         base = Path(__file__).parent.parent
+        custom_profile = self._account.get("profile_dir", "")
+        if custom_profile:
+            d = Path(custom_profile)
+            d.mkdir(parents=True, exist_ok=True)
+            return str(d)
         acct_id = self._account.get("id", 0)
         if acct_id:
             name = f"chrome_profile_poster_{acct_id}"
