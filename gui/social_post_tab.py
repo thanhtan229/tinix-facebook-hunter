@@ -1,6 +1,6 @@
 """
-Tinix Facebook Down — Social Post Tab (Library + Scheduling + Execution)
-Smart Library with content import, search, scheduling engine, preview, and auto-posting.
+Tinix Facebook Down — Photo Post Tab (Library + Scheduling + Execution)
+Smart Library with photo content import, search, scheduling engine, preview, and auto-posting.
 """
 
 import os
@@ -44,7 +44,12 @@ _PURPLE = "#7C3AED"
 
 
 class SocialPostTab(ctk.CTkFrame):
-    """Social Post — Smart Library + Scheduling + Execution Engine."""
+    """Photo Post - Smart Library + Scheduling + Execution Engine."""
+
+    TAB_TITLE = "Photo Post"
+    TAB_SUBTITLE = "Photo Library & Scheduler"
+    SHOW_PLATFORM_SELECTOR = False
+    PLATFORM_OPTIONS: List[str] = []
 
     def __init__(self, master, **kwargs):
         super().__init__(master, fg_color=_BG, corner_radius=0, **kwargs)
@@ -72,12 +77,12 @@ class SocialPostTab(ctk.CTkFrame):
         title_frame.pack(fill="x", padx=16, pady=(10, 4))
 
         ctk.CTkLabel(
-            title_frame, text="📤 Social Post",
+            title_frame, text=self.TAB_TITLE,
             font=ctk.CTkFont(size=18, weight="bold"), text_color=_TEXT,
         ).pack(side="left")
 
         ctk.CTkLabel(
-            title_frame, text="Library & Scheduler",
+            title_frame, text=self.TAB_SUBTITLE,
             font=ctk.CTkFont(size=12), text_color=_TEXT2,
         ).pack(side="left", padx=10, pady=(4, 0))
 
@@ -432,7 +437,7 @@ class SocialPostTab(ctk.CTkFrame):
         self._load_accounts_and_pages()
         # ── Platform selection (checkboxes) ──
         self._platform_vars = {}
-        platforms = ["Facebook Reel", "TikTok", "Instagram", "Zalo", "YouTube"]
+        platforms = self.PLATFORM_OPTIONS if self.SHOW_PLATFORM_SELECTOR else []
         platform_frame = ctk.CTkFrame(inner, fg_color=_CARD2, corner_radius=6)
         platform_frame.pack(fill="x", pady=(0, 8))
         ctk.CTkLabel(platform_frame, text="📱 Nền tảng", font=ctk.CTkFont(size=11, weight="bold"), text_color=_TEXT2).pack(side="left", padx=4)
@@ -440,6 +445,8 @@ class SocialPostTab(ctk.CTkFrame):
             var = ctk.BooleanVar(value=False)
             self._platform_vars[name] = var
             ctk.CTkCheckBox(platform_frame, text=name, variable=var, fg_color=_CARD2, text_color=_TEXT2).pack(side="left", padx=2)
+        if not self.SHOW_PLATFORM_SELECTOR:
+            platform_frame.pack_forget()
 
         # ── Start / End Date (range picker) ──
         self._section_label(inner, "📆 Schedule Range")

@@ -175,8 +175,8 @@ class MainApp(ctk.CTk):
         tab_dashboard = self._tabview.add("  📈  Dashboard  ")
         self._setup_dashboard_tab(tab_dashboard)
 
-        # Tab 4: Social Post
-        tab_social = self._tabview.add("  📤  Social Post  ")
+        # Tab 4: Photo Post
+        tab_social = self._tabview.add("  📷  Photo Post  ")
         self._setup_social_post_tab(tab_social)
 
         # Tab 5: Video Post
@@ -460,9 +460,9 @@ class MainApp(ctk.CTk):
             )
 
     def _execute_missed_posts(self, records: list) -> None:
-        """V15: Hand missed records to the Social Post tab's execute handler."""
+        """V15: Hand missed records to the Photo Post tab's execute handler."""
         try:
-            self._tabview.set("  📤  Social Post  ")
+            self._tabview.set("  📷  Photo Post  ")
             self._social_post_tab._execute_records_from_calendar(records)
         except Exception as e:
             logger.exception(

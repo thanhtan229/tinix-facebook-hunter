@@ -26,6 +26,10 @@ class VideoPostTab(SocialPostTab):
     """
 
     _ACCENT = _ACCENT_VIDEO
+    TAB_TITLE = "Video Post"
+    TAB_SUBTITLE = "Video Library & Scheduler"
+    SHOW_PLATFORM_SELECTOR = True
+    PLATFORM_OPTIONS = ["Facebook Reel", "TikTok", "Instagram", "Zalo", "YouTube"]
 
     def __init__(self, master, **kwargs):
         super().__init__(master, **kwargs)
