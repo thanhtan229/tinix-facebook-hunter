@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Runtime data
+logs/
+_DOWNLOAD/
+_temp_uploads/
+debug_html/
+debug_screenshots/
+ghost_sessions/
+history.json
+config.json
+
+# Browser profiles and caches
+chrome_profile*/
+
+# Local databases
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+.claude/
