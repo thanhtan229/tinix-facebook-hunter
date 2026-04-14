@@ -21,9 +21,11 @@ diagnostics/
 ghost_sessions/
 history.json
 config.json
+social_accounts_*.csv
 
 # Browser profiles and caches
 chrome_profile*/
+chrome_profiles/
 
 # Local databases
 *.db

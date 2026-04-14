@@ -1498,6 +1498,8 @@ class AccountManagerDialog(ctk.CTkToplevel):
         update_social_account(db, acc["id"], profile_dir=profile_dir, last_checked=now)
         acc = get_social_account(db, acc["id"]) or acc
         if platform == "facebook":
+            from core.auto_poster import AutoPoster
+
             legacy_id = sync_social_account_to_fb_account(db, acc["id"])
             fb_acc = get_account(db, legacy_id) if legacy_id > 0 else None
             if not fb_acc:
