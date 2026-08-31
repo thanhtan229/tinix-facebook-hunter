@@ -2,6 +2,10 @@ import pandas as pd
 import os
 from typing import List, Dict
 
+IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.gif'}
+VIDEO_EXTS = {'.mp4', '.mov', '.webm', '.avi'}
+MEDIA_EXTS = IMAGE_EXTS | VIDEO_EXTS
+
 
 def load_post_excel(excel_path: str) -> List[Dict[str, str]]:
     """Read the Excel template (or user-provided file) and return a list of dicts.
@@ -58,27 +62,26 @@ def count_media_in_folder(folder_path: str) -> tuple[int, int]:
     Recognized video extensions: .mp4, .mov, .webm, .avi"""
     if not folder_path or not os.path.isdir(folder_path):
         return 0, 0
-    image_ext = {'.jpg', '.jpeg', '.png', '.gif'}
-    video_ext = {'.mp4', '.mov', '.webm', '.avi'}
     img_count = 0
     vid_count = 0
     for f in os.listdir(folder_path):
         ext = os.path.splitext(f)[1].lower()
-        if ext in image_ext:
+        if ext in IMAGE_EXTS:
             img_count += 1
-        elif ext in video_ext:
+        elif ext in VIDEO_EXTS:
             vid_count += 1
     return img_count, vid_count
-    """Count image and video files inside a folder.
-    Recognized extensions: .jpg, .jpeg, .png, .gif, .mp4, .mov, .webm, .avi"""
+
+
+def folder_has_video(folder_path: str) -> bool:
+    """Return True when a folder contains at least one supported video file."""
     if not folder_path or not os.path.isdir(folder_path):
-        return 0
-    media_ext = {'.jpg', '.jpeg', '.png', '.gif', '.mp4', '.mov', '.webm', '.avi'}
-    count = 0
+        return False
     for f in os.listdir(folder_path):
-        if os.path.splitext(f)[1].lower() in media_ext:
-            count += 1
-    return count
+        if os.path.splitext(f)[1].lower() in VIDEO_EXTS:
+            return True
+    return False
+
 
 # Exported symbols
-__all__ = ["load_post_excel", "scan_main_folder", "count_media_in_folder"]
+__all__ = ["load_post_excel", "scan_main_folder", "count_media_in_folder", "folder_has_video"]

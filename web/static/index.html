@@ -1,0 +1,431 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Tinix FB Studio — All-in-One Facebook Hub</title>
+  <link rel="stylesheet" href="/static/hubspot.css?v=1.3.0">
+  <link rel="stylesheet" href="/static/styles.css?v=1.3.0">
+</head>
+<body>
+
+<div class="app-container">
+  <!-- Sidebar Navigation -->
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <div class="stat-icon" style="background: var(--orange-light); color: var(--orange-primary); font-size: 22px;">⚡</div>
+      <div class="sidebar-brand">
+        <span class="sidebar-title">Tinix FB Studio</span>
+        <span class="sidebar-subtitle">HubSpot Edition</span>
+      </div>
+    </div>
+
+    <nav class="sidebar-nav">
+      <div class="nav-item active" data-tab="tab-downloader">
+        <span class="nav-index">1</span>
+        <span class="icon">📥</span>
+        <span>Tải Facebook</span>
+      </div>
+      <div class="nav-item" data-tab="tab-scraper">
+        <span class="nav-index">2</span>
+        <span class="icon">🔍</span>
+        <span>Quét Page</span>
+      </div>
+      <div class="nav-item" data-tab="tab-spy">
+        <span class="nav-index">3</span>
+        <span class="icon">📊</span>
+        <span>Kho Dữ Liệu</span>
+      </div>
+      <div class="nav-item" data-tab="tab-poster">
+        <span class="nav-index">4</span>
+        <span class="icon">🚀</span>
+        <span>Đăng Tự Động</span>
+      </div>
+      <div class="nav-item" data-tab="tab-accounts">
+        <span class="nav-index">5</span>
+        <span class="icon">👥</span>
+        <span>Tài Khoản</span>
+      </div>
+    </nav>
+
+    <div class="sidebar-footer">
+      <button class="btn btn-secondary btn-sm" style="width: 100%;" id="btn-open-output-dir">
+        📂 Mở thư mục tải về
+      </button>
+    </div>
+  </aside>
+
+  <!-- Main Wrapper -->
+  <main class="main-wrapper">
+    <!-- Top Header -->
+    <header class="top-header">
+      <div class="header-title-box">
+        <h2 id="current-tab-title">📥 Tải Facebook — Media Downloader</h2>
+      </div>
+      <div class="header-actions">
+        <span class="badge badge-green" id="ws-badge">🟢 Realtime Connected</span>
+        <button class="btn btn-secondary btn-sm" id="btn-settings-modal">⚙️ Cài đặt</button>
+      </div>
+    </header>
+
+    <!-- Workspace Content -->
+    <div class="workspace-content">
+      <!-- Stats Overview Banner -->
+      <div class="stats-banner">
+        <div class="stat-item">
+          <div class="stat-icon">📄</div>
+          <div class="stat-info">
+            <div class="stat-value" id="stat-total-posts">0</div>
+            <div class="stat-label">Tổng bài viết đã cào</div>
+          </div>
+        </div>
+        <div class="stat-item">
+          <div class="stat-icon" style="background: var(--success-light); color: var(--success-green);">✅</div>
+          <div class="stat-info">
+            <div class="stat-value" id="stat-downloaded-posts">0</div>
+            <div class="stat-label">Bài viết đã tải media</div>
+          </div>
+        </div>
+        <div class="stat-item">
+          <div class="stat-icon" style="background: var(--info-light); color: var(--info-blue);">🌐</div>
+          <div class="stat-info">
+            <div class="stat-value" id="stat-total-pages">0</div>
+            <div class="stat-label">Fanpage theo dõi</div>
+          </div>
+        </div>
+        <div class="stat-item">
+          <div class="stat-icon" style="background: var(--orange-light); color: var(--orange-primary);">👤</div>
+          <div class="stat-info">
+            <div class="stat-value" id="stat-active-accounts">0</div>
+            <div class="stat-label">Tài khoản Live</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- TAB 1: MEDIA DOWNLOADER -->
+      <div class="tab-panel active" id="tab-downloader">
+        <div class="studio-card">
+          <h3 style="font-size: 15px; margin-bottom: 12px;">Nhập danh sách link bài viết Facebook</h3>
+          <textarea id="dl-urls" placeholder="Dán link bài viết Facebook tại đây (mỗi link 1 dòng)...&#10;https://www.facebook.com/.../posts/...&#10;https://www.facebook.com/watch/?v=..." rows="6"></textarea>
+
+          <div style="display: flex; gap: 20px; align-items: center; margin-top: 14px; flex-wrap: wrap;">
+            <div style="display: flex; align-items: center; gap: 8px;">
+              <label style="font-size: 13px; font-weight: 600;">Số luồng tải:</label>
+              <select id="dl-threads" style="width: 80px;">
+                <option value="1">1</option>
+                <option value="2">2</option>
+                <option value="4" selected>4</option>
+                <option value="8">8</option>
+                <option value="16">16</option>
+              </select>
+            </div>
+
+            <label class="custom-checkbox">
+              <input type="checkbox" id="dl-auto-open" checked>
+              <span>Tự động mở thư mục sau khi tải xong</span>
+            </label>
+
+            <label class="custom-checkbox">
+              <input type="checkbox" id="dl-use-accounts">
+              <span>Sử dụng Profile tài khoản Facebook đã lưu</span>
+            </label>
+          </div>
+
+          <div style="display: flex; gap: 10px; margin-top: 18px;">
+            <button class="btn btn-primary btn-lg" id="btn-start-dl">🚀 Bắt đầu tải</button>
+            <button class="btn btn-secondary btn-lg" id="btn-pause-dl">⏸ Tạm dừng</button>
+            <button class="btn btn-danger btn-lg" id="btn-stop-dl">🛑 Dừng lại</button>
+          </div>
+
+          <!-- Progress Bar -->
+          <div style="margin-top: 20px;" id="dl-progress-box">
+            <div style="display: flex; justify-content: space-between; font-size: 12.5px; font-weight: 600; margin-bottom: 6px;">
+              <span id="dl-progress-text">Sẵn sàng</span>
+              <span id="dl-progress-percent">0%</span>
+            </div>
+            <div style="background: var(--border-subtle); border-radius: var(--radius-pill); height: 10px; overflow: hidden;">
+              <div id="dl-progress-bar" style="background: var(--orange-primary); height: 100%; width: 0%; transition: width 0.3s;"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- TAB 2: PAGE SCRAPER -->
+      <div class="tab-panel" id="tab-scraper">
+        <div class="studio-card">
+          <h3 style="font-size: 15px; margin-bottom: 12px;">Quét nhanh Fanpage Facebook</h3>
+          
+          <div style="display: flex; gap: 12px; margin-bottom: 12px; flex-wrap:wrap;">
+            <input type="text" id="scrape-url" placeholder="Nhập URL hoặc Username Fanpage (ví dụ: https://www.facebook.com/tinixpage)" style="flex: 1;">
+            <select id="scrape-mode" style="width: 170px;">
+              <option value="All" selected>Quét tất cả</option>
+              <option value="New Posts">Chỉ bài viết mới</option>
+            </select>
+            <input type="number" id="scrape-limit" value="100" min="5" max="2000" style="width: 100px;" title="Số lượng bài tối đa">
+            <select id="scrape-account" style="min-width:190px;">
+              <option value="">Profile mặc định</option>
+            </select>
+          </div>
+
+          <div style="display: flex; gap: 12px; flex-wrap:wrap;">
+            <button class="btn btn-primary" id="btn-start-scrape">🔍 Bắt đầu quét</button>
+            <button class="btn btn-secondary" id="btn-save-favorite">⭐ Lưu vào yêu thích</button>
+            <button class="btn btn-danger" id="btn-stop-scrape">🛑 Dừng quét</button>
+          </div>
+        </div>
+
+        <div class="studio-card">
+          <div style="display:flex; justify-content:space-between; align-items:center; gap:12px; margin-bottom:14px; flex-wrap:wrap;">
+            <div>
+              <h3 style="font-size:15px; margin-bottom:4px;">⭐ Fanpage yêu thích</h3>
+              <div class="text-muted" style="font-size:12px;">Chỉ lấy post chưa lưu và giữ mốc của lần quét thành công gần nhất.</div>
+            </div>
+            <div style="display:flex; gap:8px; flex-wrap:wrap;">
+              <span class="badge badge-teal" id="favorite-scan-summary">0 Fanpage</span>
+              <button class="btn btn-teal btn-sm" id="btn-scan-selected-favorites">Quét Page đã chọn</button>
+              <button class="btn btn-primary btn-sm" id="btn-scan-all-favorites">Quét tất cả yêu thích</button>
+            </div>
+          </div>
+          <div style="overflow-x:auto;">
+            <table style="width:100%; border-collapse:collapse; text-align:left; font-size:12.5px;">
+              <thead>
+                <tr style="background:var(--teal-dark); color:#FFFFFF;">
+                  <th style="padding:9px 10px; width:34px;"><input type="checkbox" id="favorite-select-all" checked></th>
+                  <th style="padding:9px 10px;">Fanpage</th>
+                  <th style="padding:9px 10px;">Account / Giới hạn</th>
+                  <th style="padding:9px 10px;">Lần quét gần nhất</th>
+                  <th style="padding:9px 10px;">Kết quả</th>
+                  <th style="padding:9px 10px; text-align:right;">Hành động</th>
+                </tr>
+              </thead>
+              <tbody id="favorite-pages-tbody"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <!-- TAB 3: SPY STUDIO (KHO DỮ LIỆU) -->
+      <div class="tab-panel" id="tab-spy">
+        <div class="studio-card">
+          <!-- Filter Controls -->
+          <div style="display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin-bottom: 16px;">
+            <input type="text" id="spy-search" placeholder="🔍 Tìm kiếm bài viết theo caption, ID..." style="flex: 1; min-width: 200px;">
+            
+            <select id="spy-mode" style="width: 150px;">
+              <option value="newest" selected>Mới nhất</option>
+              <option value="top_engagement">Tương tác cao nhất</option>
+            </select>
+
+            <select id="spy-post-type" style="width: 130px;">
+              <option value="Tất cả" selected>Tất cả loại</option>
+              <option value="Photo">Ảnh</option>
+              <option value="Video">Video</option>
+              <option value="Text">Văn bản</option>
+            </select>
+
+            <select id="spy-dl-status" style="width: 130px;">
+              <option value="Tất cả" selected>Tất cả trạng thái</option>
+              <option value="Chưa tải">Chưa tải</option>
+              <option value="Đã tải">Đã tải</option>
+            </select>
+
+            <button class="btn btn-teal" id="btn-refresh-spy">🔍 Lọc</button>
+            <button class="btn btn-secondary" id="btn-export-excel">📊 Xuất Excel</button>
+            <button class="btn btn-danger" id="btn-delete-spy-pages">🗑 Xóa Pages đã chọn</button>
+            <button class="btn btn-danger" id="btn-clear-spy">⚠ Dọn toàn bộ kho</button>
+          </div>
+
+          <!-- Page Checkbox Strip -->
+          <div style="background: var(--bg-light); border: 1px solid var(--border-subtle); border-radius: var(--radius-sm); padding: 10px 14px; margin-bottom: 16px;">
+            <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px;">
+              <label class="custom-checkbox">
+                <input type="checkbox" id="spy-select-all-pages" checked>
+                <span style="font-weight: 700;">📄 Chọn tất cả Pages</span>
+              </label>
+              <span class="badge badge-teal" id="spy-pages-counter">0 Pages</span>
+            </div>
+            <div id="spy-pages-container" style="display: flex; gap: 12px; flex-wrap: wrap; max-height: 80px; overflow-y: auto;">
+              <!-- Dynamic Page Checkboxes -->
+            </div>
+            <label class="custom-checkbox" style="margin-top: 10px;">
+              <input type="checkbox" id="spy-delete-media">
+              <span>Xóa cả thư mục media đã tải (chỉ bên trong thư mục output)</span>
+            </label>
+          </div>
+
+          <!-- View Toggle -->
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
+            <div style="display: flex; gap: 10px; align-items: center;">
+              <label class="custom-checkbox">
+                <input type="checkbox" id="spy-select-all-posts">
+                <span>Chọn tất cả bài</span>
+              </label>
+              <span class="text-muted" id="spy-selected-counter">0 bài đã chọn</span>
+            </div>
+            <div style="display: flex; gap: 6px;">
+              <button class="btn btn-secondary btn-sm" id="btn-view-grid">🔲 Dạng Thẻ</button>
+              <button class="btn btn-secondary btn-sm" id="btn-view-table">📑 Dạng Bảng</button>
+            </div>
+          </div>
+
+          <!-- Posts Card Grid -->
+          <div class="post-cards-grid" id="spy-posts-grid">
+            <!-- Dynamic Post Cards -->
+          </div>
+
+          <!-- Posts Table View (Hidden by default) -->
+          <div id="spy-posts-table-wrap" style="display: none; overflow-x: auto; margin-top: 14px;">
+            <table style="width: 100%; border-collapse: collapse; text-align: left; font-size: 13px;">
+              <thead>
+                <tr style="background: var(--teal-dark); color: #FFFFFF;">
+                  <th style="padding: 10px 12px;">STT</th>
+                  <th style="padding: 10px 12px;">Page</th>
+                  <th style="padding: 10px 12px;">Ngày</th>
+                  <th style="padding: 10px 12px;">Loại</th>
+                  <th style="padding: 10px 12px;">Engage</th>
+                  <th style="padding: 10px 12px;">Caption</th>
+                  <th style="padding: 10px 12px;">Trạng thái</th>
+                </tr>
+              </thead>
+              <tbody id="spy-posts-tbody"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <!-- TAB 4: SOCIAL POSTER STUDIO -->
+      <div class="tab-panel" id="tab-poster">
+        <div class="studio-card">
+          <h3 style="font-size: 15px; margin-bottom: 12px;">Tự Động Đăng Bài & Đặt Lịch Fanpage</h3>
+          
+          <div style="display: flex; gap: 12px; margin-bottom: 16px;">
+            <input type="text" id="poster-folder" placeholder="Nhập đường dẫn thư mục bài viết (chứa các subfolders + caption/media)" style="flex: 1;">
+            <button class="btn btn-teal" id="btn-scan-poster-folder">📂 Quét thư mục</button>
+          </div>
+
+          <!-- Scheduling Settings -->
+          <div class="grid-3" style="margin-bottom: 20px;">
+            <div>
+              <label style="font-size: 12.5px; font-weight: 700; margin-bottom: 6px; display: block;">Ngày bắt đầu:</label>
+              <input type="date" id="poster-start-date">
+            </div>
+            <div>
+              <label style="font-size: 12.5px; font-weight: 700; margin-bottom: 6px; display: block;">Khung giờ đăng:</label>
+              <div style="display: flex; gap: 8px;">
+                <input type="text" id="poster-time-slots" value="08:00, 20:00" placeholder="08:00, 20:00">
+              </div>
+            </div>
+            <div>
+              <label style="font-size: 12.5px; font-weight: 700; margin-bottom: 6px; display: block;">Thao tác:</label>
+              <button class="btn btn-primary" style="width: 100%;" id="btn-generate-schedule">📅 Tạo Lịch & Xem Trước</button>
+            </div>
+          </div>
+
+          <!-- Scanned Items Grid -->
+          <div class="post-cards-grid" id="poster-items-grid"></div>
+        </div>
+
+        <div class="studio-card" style="margin-top: 16px;">
+          <div style="display:flex; justify-content:space-between; align-items:center; gap:12px; margin-bottom:12px;">
+            <div>
+              <h3 style="font-size:15px;">Hàng Đợi Đăng Bài</h3>
+              <div class="text-muted" id="poster-queue-summary" style="font-size:12px;">Đang tải...</div>
+            </div>
+            <div style="display:flex; gap:8px; flex-wrap:wrap;">
+              <button class="btn btn-secondary btn-sm" id="btn-refresh-poster-jobs">↻ Làm mới</button>
+              <button class="btn btn-primary btn-sm" id="btn-run-poster-jobs">▶ Chạy Pending</button>
+              <button class="btn btn-secondary btn-sm" id="btn-retry-poster-jobs">↻ Retry Failed</button>
+              <button class="btn btn-danger btn-sm" id="btn-delete-poster-jobs">🗑 Xóa chọn</button>
+              <button class="btn btn-danger btn-sm" id="btn-stop-poster-jobs">■ Dừng</button>
+            </div>
+          </div>
+          <div style="overflow-x:auto; max-height:340px;">
+            <table style="width:100%; border-collapse:collapse; text-align:left; font-size:12.5px;">
+              <thead>
+                <tr style="background:var(--teal-dark); color:#fff; position:sticky; top:0;">
+                  <th style="padding:8px;"><input type="checkbox" id="poster-jobs-select-all"></th>
+                  <th style="padding:8px;">Nội dung</th>
+                  <th style="padding:8px;">Fanpage</th>
+                  <th style="padding:8px;">Thời gian</th>
+                  <th style="padding:8px;">Trạng thái</th>
+                  <th style="padding:8px;">Lỗi</th>
+                </tr>
+              </thead>
+              <tbody id="poster-jobs-tbody"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <!-- TAB 5: ACCOUNTS -->
+      <div class="tab-panel" id="tab-accounts">
+        <div class="studio-card">
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;">
+            <h3 style="font-size: 15px;">Danh Sách Tài Khoản Facebook</h3>
+            <div style="display:flex; gap:8px; align-items:center;">
+              <button class="btn btn-danger btn-sm" id="btn-close-all-chrome">✕ Close All</button>
+              <button class="btn btn-primary btn-sm" id="btn-add-account">➕ Thêm Tài Khoản</button>
+            </div>
+          </div>
+
+          <div style="overflow-x: auto;">
+            <table style="width: 100%; border-collapse: collapse; text-align: left; font-size: 13px;">
+              <thead>
+                <tr style="background: var(--teal-dark); color: #FFFFFF;">
+                  <th style="padding: 10px 14px;">ID</th>
+                  <th style="padding: 10px 14px;">Tên gợi nhớ</th>
+                  <th style="padding: 10px 14px;">Username / UID</th>
+                  <th style="padding: 10px 14px;">Trạng thái</th>
+                  <th style="padding: 10px 14px; text-align: right;">Hành động</th>
+                </tr>
+              </thead>
+              <tbody id="accounts-tbody"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <!-- Terminal / Console Log Component -->
+      <div class="terminal-container">
+        <div class="terminal-header">
+          <div class="terminal-title">
+            <span>🖥️ Terminal Logs & Sự kiện thời gian thực</span>
+          </div>
+          <div style="display: flex; gap: 12px; align-items: center;">
+            <label class="custom-checkbox" style="font-size: 11.5px;">
+              <input type="checkbox" id="terminal-autoscroll" checked>
+              <span>Tự cuộn</span>
+            </label>
+            <button class="btn btn-secondary btn-sm" id="btn-clear-logs">Xóa log</button>
+          </div>
+        </div>
+        <div class="terminal-body" id="terminal-logs">
+          <div class="log-row">
+            <span class="log-tag OK">[SYSTEM]</span>
+            <span>Tinix FB Studio WebUI đã sẵn sàng kết nối.</span>
+          </div>
+        </div>
+      </div>
+
+    </div>
+  </main>
+</div>
+
+<!-- Modal Dialogs & Lightbox -->
+<div class="modal-overlay" id="generic-modal">
+  <div class="modal-content">
+    <div class="modal-header">
+      <h3 id="modal-title" style="font-size: 15px;">Tiêu đề</h3>
+      <button class="btn btn-secondary btn-sm" id="btn-close-modal">✕</button>
+    </div>
+    <div class="modal-body" id="modal-body"></div>
+    <div class="modal-footer" id="modal-footer"></div>
+  </div>
+</div>
+
+<!-- Toast Container -->
+<div class="toast-container" id="toast-container"></div>
+
+<script src="/static/app.js?v=1.3.0"></script>
+</body>
+</html>

@@ -8,6 +8,50 @@ import os
 from pathlib import Path
 from typing import Any
 
+from utils.secure_store import protect_secret, reveal_secret
+
+# ─── .env file loader (no external dependency) ──────────────────────────────
+_env_cache: dict = None
+_SECRET_CONFIG_KEYS = {"saved_cookies", "cookies"}
+
+
+def _load_env_file() -> dict:
+    """Parse .env file from app root directory. Supports KEY=VALUE lines."""
+    global _env_cache
+    if _env_cache is not None:
+        return _env_cache
+
+    _env_cache = {}
+    env_path = _get_config_dir() / ".env"
+    if not env_path.exists():
+        return _env_cache
+
+    try:
+        with open(env_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" not in line:
+                    continue
+                key, _, value = line.partition("=")
+                key = key.strip()
+                value = value.strip().strip("'\"")  # remove surrounding quotes
+                if key:
+                    _env_cache[key] = value
+    except Exception:
+        pass
+    return _env_cache
+
+
+def get_env(key: str, default: str = "") -> str:
+    """Get an environment variable: .env file first, then os.environ fallback."""
+    env = _load_env_file()
+    val = env.get(key, "")
+    if val:
+        return val
+    return os.environ.get(key, default)
+
 # Default configuration values
 DEFAULTS = {
     "max_threads": 1,
@@ -61,6 +105,9 @@ def load_config() -> dict:
         try:
             with open(config_path, "r", encoding="utf-8") as f:
                 saved = json.load(f)
+            for key in _SECRET_CONFIG_KEYS:
+                if key in saved:
+                    saved[key] = reveal_secret(saved[key])
             config.update(saved)
         except (json.JSONDecodeError, IOError) as e:
             # If config is corrupted, use defaults
@@ -77,8 +124,12 @@ def save_config(config: dict) -> None:
 
     try:
         config_path.parent.mkdir(parents=True, exist_ok=True)
+        disk_config = config.copy()
+        for key in _SECRET_CONFIG_KEYS:
+            if key in disk_config:
+                disk_config[key] = protect_secret(disk_config[key])
         with open(config_path, "w", encoding="utf-8") as f:
-            json.dump(config, f, indent=2, ensure_ascii=False)
+            json.dump(disk_config, f, indent=2, ensure_ascii=False)
         _config_cache = config.copy()
     except IOError as e:
         print(f"[ERROR] Could not save config: {e}")

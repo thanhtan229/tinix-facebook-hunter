@@ -5,6 +5,7 @@ This bypasses all Facebook bot detection since it uses a real browser.
 """
 
 import os
+import json
 import re
 import shutil
 import sys
@@ -15,6 +16,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 from utils import logger
+from utils.chrome_profiles import browser_profile_dir
 
 # Suppress warnings
 import warnings
@@ -65,13 +67,7 @@ def _find_chrome() -> Optional[str]:
 
 def _get_profile_dir() -> Path:
     """Get a separate Chrome profile directory for the tool."""
-    if getattr(sys, 'frozen', False):
-        base = Path(sys.executable).parent
-    else:
-        base = Path(__file__).parent.parent
-    profile_dir = base / "chrome_profile"
-    profile_dir.mkdir(parents=True, exist_ok=True)
-    return profile_dir
+    return browser_profile_dir()
 
 
 class BrowserManager:
@@ -80,12 +76,15 @@ class BrowserManager:
     Uses a separate profile so user's Chrome stays untouched.
     """
 
-    def __init__(self):
+    def __init__(self, profile_dir: Optional[str] = None, cdp_port: Optional[int] = None, headless: bool = True):
         self._chrome_process = None
         self._browser = None
         self._context = None
         self._playwright = None
         self._pw_instance = None
+        self._profile_dir = Path(profile_dir) if profile_dir else None
+        self._cdp_port = cdp_port or CDP_PORT
+        self._headless = headless
 
     def start(self, cookies: Dict[str, str]) -> bool:
         """Launch Chrome with remote debugging and connect Playwright."""
@@ -97,22 +96,24 @@ class BrowserManager:
                 logger.error("Không tìm thấy Chrome. Vui lòng cài đặt Google Chrome.")
                 return False
 
-            profile_dir = _get_profile_dir()
+            profile_dir = self._profile_dir or _get_profile_dir()
+            profile_dir.mkdir(parents=True, exist_ok=True)
 
             # Launch Chrome with remote debugging
             import subprocess
             chrome_cmd = [
                 chrome_path,
-                f"--remote-debugging-port={CDP_PORT}",
+                f"--remote-debugging-port={self._cdp_port}",
                 f"--user-data-dir={profile_dir}",
                 "--no-first-run",
                 "--no-default-browser-check",
                 "--disable-popup-blocking",
-                "--headless=new",
                 "--disable-gpu",
                 "--window-size=1280,900",
                 "--disable-blink-features=AutomationControlled",
             ]
+            if self._headless:
+                chrome_cmd.append("--headless=new")
 
             logger.info("Đang khởi động trình duyệt...")
             self._chrome_process = subprocess.Popen(
@@ -126,7 +127,7 @@ class BrowserManager:
             # Connect Playwright via CDP
             self._pw_instance = sync_playwright().start()
             self._browser = self._pw_instance.chromium.connect_over_cdp(
-                f"http://localhost:{CDP_PORT}",
+                f"http://localhost:{self._cdp_port}",
                 timeout=15000,
             )
 
@@ -146,7 +147,8 @@ class BrowserManager:
                     "path": "/",
                     "secure": True,
                 })
-            self._context.add_cookies(pw_cookies)
+            if pw_cookies:
+                self._context.add_cookies(pw_cookies)
 
             logger.info("Trình duyệt đã sẵn sàng")
             return True
@@ -255,6 +257,11 @@ class BrowserManager:
 
             # Click "Xem thêm" / "See more" to expand truncated text
             self._click_see_more(page)
+            page_html = ""
+            try:
+                page_html = page.evaluate("() => document.documentElement.innerHTML")
+            except Exception:
+                page_html = ""
 
             # Find the main post container
             article = self._find_main_article(page)
@@ -296,6 +303,10 @@ class BrowserManager:
                 video_id = post_id
 
             post_data.text = self._extract_text(article, page, video_id)
+            json_caption = self._extract_caption_from_story_json(page_html, post_id, video_id)
+            if json_caption and (not post_data.text or len(json_caption) > len(post_data.text)):
+                post_data.text = json_caption
+                logger.info(f"Caption from Facebook JSON ({len(json_caption)} chars)")
             post_data.image_urls = self._extract_images(article)
 
             # Video detection — extracts URL from page source JS data
@@ -332,6 +343,79 @@ class BrowserManager:
                     pass
 
         return post_data
+
+    def _extract_caption_from_story_json(self, html: str, post_id: str = "", video_id: str = "") -> str:
+        """Extract caption from Facebook SSR/GraphQL JSON near the post/video id."""
+        if not html:
+            return ""
+
+        anchors = []
+        for value in {str(post_id or "").strip(), str(video_id or "").strip()}:
+            if not value:
+                continue
+            for pattern in (
+                f'"post_id":"{value}"',
+                f'"post_id": "{value}"',
+                f'"video_id":"{value}"',
+                f'"video_id": "{value}"',
+            ):
+                start = 0
+                while True:
+                    pos = html.find(pattern, start)
+                    if pos < 0:
+                        break
+                    anchors.append(pos)
+                    start = pos + 1
+
+        blocks = []
+        if anchors:
+            for pos in anchors:
+                blocks.append(html[max(0, pos - 15000): min(len(html), pos + 35000)])
+        else:
+            blocks.append(html)
+
+        best = ""
+        for block in blocks:
+            for match in re.finditer(r'"message":\s*\{"text":\s*"((?:[^"\\]|\\.){3,})"', block):
+                caption = self._decode_fb_json_text(match.group(1))
+                if self._looks_like_caption(caption) and len(caption) > len(best):
+                    best = caption
+
+        return best.strip()
+
+    @staticmethod
+    def _decode_fb_json_text(raw: str) -> str:
+        try:
+            text = json.loads(f'"{raw}"')
+        except Exception:
+            try:
+                text = raw.encode("utf-8").decode("unicode_escape")
+            except Exception:
+                text = raw
+        return (
+            text.replace("\\/", "/")
+            .replace("\\n", "\n")
+            .replace("\\u0026", "&")
+            .replace("\\u003C", "<")
+            .replace("\\u003E", ">")
+            .strip()
+        )
+
+    @staticmethod
+    def _looks_like_caption(text: str) -> bool:
+        text = (text or "").strip()
+        if len(text) < 3:
+            return False
+        lowered = text.lower()
+        ui_phrases = (
+            "like", "comment", "share", "see more", "write a comment",
+            "thích", "bình luận", "chia sẻ", "xem thêm", "viết bình luận",
+        )
+        if len(text) < 60 and any(phrase == lowered or lowered.startswith(phrase) for phrase in ui_phrases):
+            return False
+        if re.fullmatch(r"[\d,.\s]+", text):
+            return False
+        return True
 
     def _click_see_more(self, page) -> None:
         """Click 'Xem thêm' / 'See more' buttons to expand truncated text."""

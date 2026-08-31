@@ -246,8 +246,11 @@ def parse_urls(text: str) -> list[str]:
         if not line:
             continue
 
-        # Support bare numeric ID → convert to FB URL
+        # Support bare post_id → convert to FB URL
         if re.match(r'^\d{10,}$', line):
+            urls.append(f"https://www.facebook.com/{line}")
+            continue
+        if re.match(r'^(?:pfbid)?[A-Za-z0-9_-]{12,}$', line):
             urls.append(f"https://www.facebook.com/{line}")
             continue
 

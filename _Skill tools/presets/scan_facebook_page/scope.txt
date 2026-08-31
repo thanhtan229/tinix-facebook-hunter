@@ -1,0 +1,1 @@
+gui\scrape_tab.py core\page_scraper.py core\db_storage.py gui\page_spy_manager.py gui\post_spy_manager.py gui\results_dialog.py .agent\skills\scan_facebook_page

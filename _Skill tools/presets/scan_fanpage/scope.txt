@@ -1,0 +1,1 @@
+core\fanpage_scanner.py gui\account_manager.py .agent\skills\scan_fanpage_account

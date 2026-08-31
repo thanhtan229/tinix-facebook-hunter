@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional
 
 from utils import logger
+from utils.chrome_profiles import scraper_profile_dir
 
 
 @dataclass
@@ -28,7 +29,7 @@ class ScrapedPost:
     post_type: str = "Text"  # Ảnh / Video / Text
     engagement: int = 0
     comments: int = 0
-    views: int = 0
+    shares: int = 0
     caption: str = ""
     page_name: str = ""
     url: str = ""
@@ -40,7 +41,7 @@ CHROME_PATHS = [
     os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
 ]
 
-CDP_PORT = 9224
+CDP_PORT_BASE = 9300  # Base port; actual = base + account_id
 
 
 def _find_chrome() -> Optional[str]:
@@ -52,13 +53,7 @@ def _find_chrome() -> Optional[str]:
 
 
 def _get_profile_dir() -> Path:
-    if getattr(sys, 'frozen', False):
-        base = Path(sys.executable).parent
-    else:
-        base = Path(__file__).parent.parent
-    profile_dir = base / "chrome_profile_scraper"
-    profile_dir.mkdir(parents=True, exist_ok=True)
-    return profile_dir
+    return scraper_profile_dir()
 
 
 def _parse_fb_number(s: str) -> int:
@@ -68,6 +63,24 @@ def _parse_fb_number(s: str) -> int:
     s = s.strip().upper().replace(",", "").replace(".", "")
     mul = 1
     if s.endswith("K") or s.endswith("N"):
+        mul = 1000
+        s = s[:-1]
+    elif s.endswith("M"):
+        mul = 1000000
+        s = s[:-1]
+    try:
+        return int(float(s) * mul)
+    except (ValueError, TypeError):
+        return 0
+
+
+def _parse_abbreviated_number(s: str) -> int:
+    """Parse abbreviated numbers from FB JSON: '1,234', '1.2K', '3.5M', '1K'."""
+    if not s:
+        return 0
+    s = s.strip().upper().replace(",", "")
+    mul = 1
+    if s.endswith("K"):
         mul = 1000
         s = s[:-1]
     elif s.endswith("M"):
@@ -138,10 +151,39 @@ class _PostCollector:
 
             try:
                 data = json.loads(line)
-                new_count += self._extract_from_json(data)
+                added = self._extract_from_json(data)
+                if added > 0 and self.count <= 5:
+                    logger.debug(f"[JSON-PATH] +{added} bài (tổng: {self.count})")
+                new_count += added
             except (json.JSONDecodeError, ValueError):
-                # Fallback: try regex for non-JSON content (e.g. raw HTML source)
-                new_count += self._extract_from_text(line)
+                # Try to extract JSON from embedded <script> tags (SSR HTML)
+                # Facebook SSR uses <script type="application/json" data-sjs>...</script>
+                script_added = 0
+                if '<script' in line and '"post_id"' in line:
+                    # Find data-sjs script boundaries and parse each
+                    for m in re.finditer(r'<script[^>]*data-sjs[^>]*>',  line):
+                        start = m.end()
+                        end = line.find('</script>', start)
+                        if end == -1:
+                            continue
+                        chunk = line[start:end].strip()
+                        if '"post_id"' not in chunk:
+                            continue
+                        try:
+                            script_data = json.loads(chunk)
+                            script_added += self._extract_from_json(script_data)
+                        except (json.JSONDecodeError, ValueError):
+                            pass
+                    if script_added > 0 and self.count <= 5:
+                        logger.debug(f"[SCRIPT-JSON] +{script_added} bài (tổng: {self.count})")
+                    new_count += script_added
+
+                # Final fallback: regex text extraction
+                if script_added == 0:
+                    added = self._extract_from_text(line)
+                    if added > 0 and self.count <= 5:
+                        logger.debug(f"[TEXT-PATH] +{added} bài (tổng: {self.count})")
+                    new_count += added
 
         return new_count
 
@@ -161,6 +203,27 @@ class _PostCollector:
                     if pid not in self._posts:
                         self._posts[pid] = post
                         new_count += 1
+                    else:
+                        # Post already exists (e.g. from SSR with empty engagement).
+                        # Update with better data if the new version has non-zero values.
+                        existing = self._posts[pid]
+                        # Merge engagement data (take higher values)
+                        if post.get("engagement", 0) > existing.get("engagement", 0):
+                            existing["engagement"] = post["engagement"]
+                        if post.get("comments", 0) > existing.get("comments", 0):
+                            existing["comments"] = post["comments"]
+                        if post.get("shares", 0) > existing.get("shares", 0):
+                            existing["shares"] = post["shares"]
+                        # Merge empty text fields
+                        if post.get("date") and not existing.get("date"):
+                            existing["date"] = post["date"]
+                        if post.get("caption") and not existing.get("caption"):
+                            existing["caption"] = post["caption"]
+                        if post.get("url") and (not existing.get("url") or existing["url"] == f"https://www.facebook.com/{pid}"):
+                            existing["url"] = post["url"]
+                        # Update post_type if previously Text
+                        if existing.get("post_type") == "Text" and post.get("post_type") in ("Ảnh", "Video"):
+                            existing["post_type"] = post["post_type"]
 
         return new_count
 
@@ -225,21 +288,52 @@ class _PostCollector:
         if caption and len(caption) > 500:
             caption = caption[:500] + "..."
 
-        # --- Engagement (reactions, comments, views) ---
+        # --- Engagement (reactions, comments, shares) ---
         engagement = 0
         comments = 0
-        views = 0
+        shares = 0
 
         # Path: comet_sections.feedback.story.story_ufi_container.story.feedback_context
         feedback = cs.get("feedback", {})
         feedback_str = json.dumps(feedback, default=str)
+
+        # Debug: log feedback keys for first few posts
+        if len(self._posts) < 3:
+            fb_keys = list(feedback.keys()) if isinstance(feedback, dict) else []
+            # Extract context around key patterns
+            _snippets = []
+            for pattern_name, pattern in [
+                ("reaction_count", r'"reaction_count"[^}]{0,80}'),
+                ("total_comment", r'"total_comment_count"[^,}]{0,40}'),
+                ("comment_count", r'"comment_count"[^}]{0,80}'),
+                ("share_count", r'"share_count"[^}]{0,80}'),
+                ("reshare_count", r'"reshare_count"[^}]{0,80}'),
+                ("i18n_reaction", r'"i18n_reaction_count"[^,}]{0,60}'),
+                ("i18n_comment", r'"i18n_comment_count"[^,}]{0,60}'),
+                ("i18n_share", r'"i18n_share_count"[^,}]{0,60}'),
+            ]:
+                m = re.search(pattern, feedback_str)
+                if m:
+                    _snippets.append(f"{pattern_name}={m.group(0)[:80]}")
+
+            logger.debug(
+                f"[DEBUG] Post {post_id}: feedback_len={len(feedback_str)}, "
+                f"fb_keys={fb_keys[:4]}"
+            )
+            if _snippets:
+                for s in _snippets:
+                    logger.debug(f"[DEBUG]   → {s}")
+            else:
+                logger.debug(f"[DEBUG]   → No engagement patterns found in feedback!")
+                # Show first 500 chars of feedback for manual inspection
+                logger.debug(f"[DEBUG]   → feedback_preview: {feedback_str[:500]}")
 
         # Reactions
         react_match = re.search(r'"reaction_count":\s*\{"count":\s*(\d+)', feedback_str)
         if react_match:
             engagement = int(react_match.group(1))
 
-        # Comments — try several patterns
+        # Comments — try several patterns (Facebook varies the field names)
         cmt_match = re.search(r'"total_comment_count":\s*(\d+)', feedback_str)
         if cmt_match:
             comments = int(cmt_match.group(1))
@@ -247,23 +341,82 @@ class _PostCollector:
             cmt_match2 = re.search(r'"comment_count":\s*\{"total_count":\s*(\d+)', feedback_str)
             if cmt_match2:
                 comments = int(cmt_match2.group(1))
+        if comments == 0:
+            # Fallback: "comments":{"total_count":N}
+            cmt_match3 = re.search(r'"comments":\s*\{"total_count":\s*(\d+)', feedback_str)
+            if cmt_match3:
+                comments = int(cmt_match3.group(1))
+        if comments == 0:
+            # Fallback: i18n text like "123 bình luận" or "123 comments"
+            cmt_match4 = re.search(r'"i18n_comment_count":\s*"([\d,.KkMm]+)', feedback_str)
+            if cmt_match4:
+                comments = _parse_abbreviated_number(cmt_match4.group(1))
+        if comments == 0:
+            # Fallback: top_level_comment_count
+            cmt_match5 = re.search(r'"top_level_comment_count":\s*(\d+)', feedback_str)
+            if cmt_match5:
+                comments = int(cmt_match5.group(1))
+        if comments == 0:
+            # Deep-find in the parsed feedback dict
+            for key in ("total_comment_count", "comment_count"):
+                val = self._deep_find(feedback, key)
+                if isinstance(val, int) and val > 0:
+                    comments = val
+                    break
+                elif isinstance(val, dict):
+                    tc = val.get("total_count")
+                    if isinstance(tc, int) and tc > 0:
+                        comments = tc
+                        break
 
-        # Views
-        view_match = re.search(r'"video_view_count":\s*(\d+)', feedback_str)
-        if view_match:
-            val = view_match.group(1)
-            if val != "null":
-                try:
-                    views = int(val)
-                except ValueError:
-                    pass
-        if views == 0:
-            play_match = re.search(r'"play_count":\s*(\d+)', feedback_str)
-            if play_match:
-                views = int(play_match.group(1))
+        # Shares — try several patterns
+        share_match = re.search(r'"share_count":\s*\{"count":\s*(\d+)', feedback_str)
+        if share_match:
+            shares = int(share_match.group(1))
+        if shares == 0:
+            share_match2 = re.search(r'"reshare_count":\s*\{"count":\s*(\d+)', feedback_str)
+            if share_match2:
+                shares = int(share_match2.group(1))
+        if shares == 0:
+            share_match3 = re.search(r'"share_count":\s*(\d+)', feedback_str)
+            if share_match3:
+                shares = int(share_match3.group(1))
+        if shares == 0:
+            # Fallback: i18n share count text
+            share_match4 = re.search(r'"i18n_share_count":\s*"([\d,.KkMm]+)', feedback_str)
+            if share_match4:
+                shares = _parse_abbreviated_number(share_match4.group(1))
+        if shares == 0:
+            # Deep-find in parsed feedback dict
+            for key in ("share_count", "reshare_count"):
+                val = self._deep_find(feedback, key)
+                if isinstance(val, int) and val > 0:
+                    shares = val
+                    break
+                elif isinstance(val, dict):
+                    c = val.get("count")
+                    if isinstance(c, int) and c > 0:
+                        shares = c
+                        break
 
-        # --- Post type (after engagement so we can use views) ---
-        post_type = self._detect_post_type(node, views)
+        # Also search the FULL node (not just feedback) for engagement fallback
+        if comments == 0 or shares == 0:
+            node_str = json.dumps(node, default=str)
+            if comments == 0:
+                cm = re.search(r'"total_comment_count":\s*(\d+)', node_str)
+                if cm:
+                    comments = int(cm.group(1))
+            if comments == 0:
+                cm2 = re.search(r'"comment_count":\s*\{"total_count":\s*(\d+)', node_str)
+                if cm2:
+                    comments = int(cm2.group(1))
+            if shares == 0:
+                sm = re.search(r'"share_count":\s*\{"count":\s*(\d+)', node_str)
+                if sm:
+                    shares = int(sm.group(1))
+
+        # --- Post type ---
+        post_type = self._detect_post_type(node)
 
         # --- URL ---
         url = f"https://www.facebook.com/{post_id}"
@@ -279,13 +432,20 @@ class _PostCollector:
         if not date_str and not caption and not engagement:
             return None
 
+        # Debug: log final values for first few posts
+        if len(self._posts) < 5:
+            logger.debug(
+                f"[DEBUG] Post {post_id} FINAL: date={date_str}, engagement={engagement}, "
+                f"comments={comments}, shares={shares}, type={post_type}"
+            )
+
         return {
             "post_id": post_id,
             "date": date_str,
             "post_type": post_type,
             "engagement": engagement,
             "comments": comments,
-            "views": views,
+            "shares": shares,
             "caption": caption,
             "url": url,
         }
@@ -306,7 +466,7 @@ class _PostCollector:
                     return result
         return None
 
-    def _detect_post_type(self, node: dict, views: int) -> str:
+    def _detect_post_type(self, node: dict) -> str:
         """Detect post type (Video/Ảnh/Text) via JSON traversal of media attachments."""
         has_video = False
         has_photo = False
@@ -345,10 +505,6 @@ class _PostCollector:
         if not has_video:
             check_types(cs.get("feedback", {}))
 
-        # 2. Fallback: if views > 0, it must be a video
-        if not has_video and views and views > 0:
-            has_video = True
-
         # 3. If still nothing found, check for scontent image URLs in attachments
         if not has_video and not has_photo:
             content = cs.get("content", {})
@@ -363,17 +519,21 @@ class _PostCollector:
         new_count = 0
         post_ids = set(re.findall(r'"post_id":\s*"(\d+)"', text))
 
+        if post_ids and self.count < 5:
+            logger.debug(f"[TEXT-EXTRACT] Found {len(post_ids)} post_ids: {list(post_ids)[:5]}")
+
         for pid in post_ids:
-            if pid in self._posts:
-                continue
 
             pos = text.find(f'"post_id":"{pid}"')
             if pos == -1:
+                # Also try with space after colon
+                pos = text.find(f'"post_id": "{pid}"')
+            if pos == -1:
                 continue
 
-            # Wide window for SSR data
-            start = max(0, pos - 10000)
-            end = min(len(text), pos + 30000)
+            # Moderate window for SSR data
+            start = max(0, pos - 15000)
+            end = min(len(text), pos + 35000)
             block = text[start:end]
 
             date_str = ""
@@ -407,14 +567,35 @@ class _PostCollector:
             cmt_m = re.search(r'"comment_count":\s*\{"total_count":\s*(\d+)', block)
             if cmt_m:
                 comments = int(cmt_m.group(1))
+            if comments == 0:
+                cmt_m2 = re.search(r'"total_comment_count":\s*(\d+)', block)
+                if cmt_m2:
+                    comments = int(cmt_m2.group(1))
+            if comments == 0:
+                cmt_m3 = re.search(r'"comments":\s*\{"total_count":\s*(\d+)', block)
+                if cmt_m3:
+                    comments = int(cmt_m3.group(1))
 
-            views = 0
-            view_m = re.search(r'"video_view_count":\s*(\d+)', block)
-            if view_m:
-                try:
-                    views = int(view_m.group(1))
-                except ValueError:
-                    pass
+            shares = 0
+            share_m = re.search(r'"share_count":\s*\{"count":\s*(\d+)', block)
+            if share_m:
+                shares = int(share_m.group(1))
+            if shares == 0:
+                share_m2 = re.search(r'"reshare_count":\s*\{"count":\s*(\d+)', block)
+                if share_m2:
+                    shares = int(share_m2.group(1))
+            if shares == 0:
+                share_m3 = re.search(r'"share_count":\s*(\d+)', block)
+                if share_m3:
+                    shares = int(share_m3.group(1))
+
+            # Debug: show extracted values for first posts
+            if self.count < 5:
+                logger.debug(
+                    f"[TEXT-POST] pid={pid}: date={date_str}, "
+                    f"engage={engagement}, cmt={comments}, shares={shares}, "
+                    f"type={post_type}, caption_len={len(caption)}"
+                )
 
             if not date_str and not caption and not engagement:
                 continue
@@ -427,11 +608,26 @@ class _PostCollector:
                         "post_type": post_type,
                         "engagement": engagement,
                         "comments": comments,
-                        "views": views,
+                        "shares": shares,
                         "caption": _safe_str(caption),
                         "url": f"https://www.facebook.com/{pid}",
                     }
                     new_count += 1
+                else:
+                    # Merge better engagement values
+                    existing = self._posts[pid]
+                    if engagement > existing.get("engagement", 0):
+                        existing["engagement"] = engagement
+                    if comments > existing.get("comments", 0):
+                        existing["comments"] = comments
+                    if shares > existing.get("shares", 0):
+                        existing["shares"] = shares
+                    if date_str and not existing.get("date"):
+                        existing["date"] = date_str
+                    if caption and not existing.get("caption"):
+                        existing["caption"] = _safe_str(caption)
+                    if existing.get("post_type") == "Text" and post_type in ("Ảnh", "Video"):
+                        existing["post_type"] = post_type
 
         return new_count
 
@@ -440,51 +636,46 @@ class PageScraper:
     """
     Scrapes posts from Facebook Pages using Chrome + Playwright.
     Intercepts GraphQL API responses to capture post data directly.
-    Supports per-account Chrome profiles and proxy.
+    Supports dedicated Chrome profiles per account.
     """
 
-    def __init__(self, account: Optional[Dict] = None, cookies: Optional[Dict[str, str]] = None):
+    def __init__(self, account: Optional[Dict] = None, cookies: Optional[Dict[str, str]] = None,
+                 cdp_port: Optional[int] = None):
         """
         Args:
-            account: dict from db_storage.get_all_accounts() with keys:
-                     id, username, password, secret_2fa, cookie,
-                     proxy_host, proxy_port, proxy_protocol, proxy_auth_user, proxy_auth_pass
+            account: dict from db_storage.get_all_accounts() with credentials
+                     and a dedicated profile_dir.
             cookies: legacy cookie dict (fallback if no account)
+            cdp_port: Chrome DevTools Protocol port (unique per instance).
+                      Defaults to CDP_PORT_BASE + account_id.
         """
         self._account = account or {}
         self._cookies = cookies or {}
+        # Calculate unique CDP port per account
+        if cdp_port is not None:
+            self._cdp_port = cdp_port
+        else:
+            acct_id = self._account.get("id", 0) or 0
+            self._cdp_port = CDP_PORT_BASE + int(acct_id)
         self._stop_event = threading.Event()
         self._chrome_process = None
         self._browser = None
         self._context = None
         self._pw_instance = None
         self.last_follower_count = 0  # populated after scrape_page
+        self.last_observed_post_ids: List[str] = []
+        self.last_scan_stop_reason = ""
+        self.last_scan_complete = False
 
     def _get_profile_dir(self) -> str:
         """Get per-account Chrome profile directory."""
-        base = Path(__file__).parent.parent
         custom_profile = self._account.get("profile_dir", "")
         if custom_profile:
             profile_dir = Path(custom_profile)
             profile_dir.mkdir(parents=True, exist_ok=True)
             return str(profile_dir)
         acct_id = self._account.get("id", 0)
-        if acct_id:
-            profile_name = f"chrome_profile_acc_{acct_id}"
-        else:
-            profile_name = "chrome_profile_scraper"
-        profile_dir = base / profile_name
-        profile_dir.mkdir(exist_ok=True)
-        return str(profile_dir)
-
-    def _get_proxy_arg(self) -> Optional[str]:
-        """Build --proxy-server arg from account proxy info."""
-        host = self._account.get("proxy_host", "")
-        port = self._account.get("proxy_port", 0)
-        protocol = self._account.get("proxy_protocol", "http")
-        if host and port:
-            return f"--proxy-server={protocol}://{host}:{port}"
-        return None
+        return str(scraper_profile_dir(acct_id or None))
 
     def start(self) -> bool:
         """Launch Chrome and connect Playwright."""
@@ -502,7 +693,7 @@ class PageScraper:
 
             chrome_cmd = [
                 chrome_path,
-                f"--remote-debugging-port={CDP_PORT}",
+                f"--remote-debugging-port={self._cdp_port}",
                 f"--user-data-dir={profile_dir}",
                 "--no-first-run",
                 "--no-default-browser-check",
@@ -512,13 +703,7 @@ class PageScraper:
                 "--disable-blink-features=AutomationControlled",
             ]
 
-            # Add proxy if configured
-            proxy_arg = self._get_proxy_arg()
-            if proxy_arg:
-                chrome_cmd.append(proxy_arg)
-                logger.info(f"🌐 Proxy: {proxy_arg.split('=')[1]}")
-
-            logger.info("Đang khởi động Chrome...")
+            logger.info(f"Đang khởi động Chrome (port {self._cdp_port})...")
             self._chrome_process = subprocess.Popen(
                 chrome_cmd,
                 stdout=subprocess.DEVNULL,
@@ -531,7 +716,7 @@ class PageScraper:
 
             self._pw_instance = sync_playwright().start()
             self._browser = self._pw_instance.chromium.connect_over_cdp(
-                f"http://localhost:{CDP_PORT}",
+                f"http://localhost:{self._cdp_port}",
                 timeout=15000,
             )
 
@@ -539,26 +724,6 @@ class PageScraper:
                 self._context = self._browser.contexts[0]
             else:
                 self._context = self._browser.new_context()
-
-            # Handle proxy authentication if needed
-            proxy_user = self._account.get("proxy_auth_user", "")
-            proxy_pass = self._account.get("proxy_auth_pass", "")
-            if proxy_user and proxy_pass:
-                # Set up HTTP credentials for proxy auth
-                try:
-                    tmp = self._context.new_page()
-                    cdp = self._context.new_cdp_session(tmp)
-                    cdp.send("Network.setExtraHTTPHeaders", {
-                        "headers": {
-                            "Proxy-Authorization": "Basic " + __import__("base64").b64encode(
-                                f"{proxy_user}:{proxy_pass}".encode()
-                            ).decode()
-                        }
-                    })
-                    cdp.detach()
-                    tmp.close()
-                except Exception:
-                    pass
 
             # Login using FacebookLogin engine
             if self._account.get("username") and self._account.get("password"):
@@ -749,7 +914,7 @@ class PageScraper:
                             logger.info("✅ Đã đăng nhập Facebook thành công")
                         elif post_click.get("hasPasswordInput") or "mật khẩu" in post_click.get("bodyText", "").lower():
                             logger.warning("⚠ COOKIES ĐÃ HẾT HẠN!")
-                            logger.warning("📋 Vui lòng vào ⚙ Cài đặt → cập nhật cookies mới")
+                            logger.warning("📋 Bấm nút Tài khoản ở thanh trên cùng để cập nhật cookies mới")
                             logger.warning("Tiếp tục quét ở chế độ công khai (giới hạn dữ liệu)...")
                         else:
                             logger.info("✅ Đã xác nhận đăng nhập")
@@ -759,7 +924,7 @@ class PageScraper:
                     logger.warning("⚠ Không thể xác nhận đăng nhập tự động")
             elif check.get("loginForm"):
                 logger.warning("⚠ Cookies không hợp lệ hoặc đã hết hạn!")
-                logger.warning("📋 Vui lòng vào ⚙ Cài đặt → cập nhật cookies mới")
+                logger.warning("📋 Bấm nút Tài khoản ở thanh trên cùng để cập nhật cookies mới")
             else:
                 logger.info("✅ Facebook đã nhận cookies")
 
@@ -785,18 +950,22 @@ class PageScraper:
         max_posts: int = 50,
         on_progress: Optional[Callable] = None,
         known_post_ids: Optional[set] = None,
+        stop_post_ids: Optional[set] = None,
     ) -> List[ScrapedPost]:
         """Scrape up to max_posts from a Facebook Page.
         
         Args:
-            known_post_ids: If provided, stop when encountering already-known posts
-                           (used by 'Scan New Posts' mode).
+            known_post_ids: IDs filtered from the returned results.
+            stop_post_ids: Previous cursor markers used as the incremental boundary.
         """
         if not self._context:
             logger.error("Chrome chưa khởi tạo")
             return []
 
         self._stop_event.clear()
+        self.last_observed_post_ids = []
+        self.last_scan_stop_reason = ""
+        self.last_scan_complete = False
         url = self._normalize_page_url(page_url)
         logger.info(f"Đang tải: {url}")
         if known_post_ids:
@@ -842,7 +1011,7 @@ class PageScraper:
             body_text = page.evaluate("() => document.body.innerText.slice(0, 200)")
             if "Tiếp tục" in body_text and "Dùng trang cá nhân khác" in body_text:
                 logger.warning("⚠ Cookies hết hạn — trang yêu cầu đăng nhập lại")
-                logger.warning("Vui lòng cập nhật cookies mới trong ⚙ Cài đặt")
+                logger.warning("Vui lòng bấm nút Tài khoản ở thanh trên cùng để cập nhật cookies mới")
 
             # Extract page name
             page_name = self._extract_page_name(page)
@@ -862,8 +1031,32 @@ class PageScraper:
             except Exception:
                 pass
 
-            # Scroll to trigger GraphQL calls and load more posts
-            self._scroll_for_posts(page, collector, max_posts, on_progress, known_post_ids)
+            boundary_ids = stop_post_ids if stop_post_ids is not None else known_post_ids
+            initial_ids = {str(item.get("post_id") or "") for item in collector.get_posts()}
+            if boundary_ids and initial_ids.intersection(boundary_ids):
+                self.last_scan_stop_reason = "boundary"
+                logger.info("🆕 Đã gặp mốc quét trước trong dữ liệu ban đầu")
+            else:
+                self.last_scan_stop_reason = self._scroll_for_posts(
+                    page, collector, max_posts, on_progress, boundary_ids
+                )
+
+            self.last_observed_post_ids = [
+                str(item.get("post_id") or "")
+                for item in collector.get_posts()
+                if str(item.get("post_id") or "")
+            ]
+            self.last_scan_complete = self.last_scan_stop_reason in {"boundary", "exhausted"}
+
+            # Scroll back to top so DOM enrichment can see the newest posts
+            try:
+                page.evaluate("() => window.scrollTo(0, 0)")
+                time.sleep(2)
+            except Exception:
+                pass
+
+            # Enrich engagement + dates from DOM (may not be in JSON)
+            self._enrich_engagement_from_dom(page, collector)
 
             # Build final results
             posts = self._build_results(collector, page_name, max_posts, known_post_ids)
@@ -874,6 +1067,7 @@ class PageScraper:
             return posts
 
         except Exception as e:
+            self.last_scan_stop_reason = "error"
             logger.error(f"Lỗi quét page: {str(e)[:200]}")
             return []
         finally:
@@ -890,7 +1084,7 @@ class PageScraper:
         max_posts: int,
         on_progress: Optional[Callable],
         known_post_ids: Optional[set] = None,
-    ) -> None:
+    ) -> str:
         """Scroll the page to trigger GraphQL data loading.
         
         Facebook uses either window scroll OR a #scrollview div container.
@@ -899,7 +1093,6 @@ class PageScraper:
         If known_post_ids is set (scan-new mode), stops when enough known
         posts are encountered consecutively.
         """
-        known_hit_count = 0  # consecutive scrolls where ALL new posts are known
         no_new_count = 0
         prev_count = collector.count
         max_scrolls = max(max_posts * 3, 50)
@@ -907,11 +1100,11 @@ class PageScraper:
         for i in range(max_scrolls):
             if self._stop_event.is_set():
                 logger.info("⏹ Đã dừng quét")
-                break
+                return "stopped"
 
             if collector.count >= max_posts:
                 logger.info(f"Đã đạt {max_posts} bài")
-                break
+                return "limit"
 
             # Scroll both window AND #scrollview container
             page.evaluate("""() => {
@@ -935,23 +1128,16 @@ class PageScraper:
                     f"Scroll #{i + 1}: +{new} bài (tổng: {current})"
                 )
                 if on_progress:
-                    on_progress(min(current, max_posts), max_posts)
+                    on_progress(min(current, max_posts), f"{current}/{max_posts}")
 
-                # Check if new posts are all known (scan-new mode)
+                # Stop as soon as one stable marker from the previous successful scan appears.
                 if known_post_ids:
                     new_posts = collector.get_posts()
                     recent_ids = [p["post_id"] for p in new_posts[prev_count:]]
-                    overlap = sum(1 for pid in recent_ids if pid in known_post_ids)
-                    if overlap == len(recent_ids):
-                        known_hit_count += 1
-                        logger.info(
-                            f"🆕 Tất cả {overlap} bài mới đều đã quét — lần {known_hit_count}/3"
-                        )
-                        if known_hit_count >= 3:
-                            logger.info("🆕 Đã gặp bài đã quét — dừng quét bài mới")
-                            break
-                    else:
-                        known_hit_count = 0
+                    overlap = [pid for pid in recent_ids if pid in known_post_ids]
+                    if overlap:
+                        logger.info("🆕 Đã gặp mốc quét trước — dừng quét bài mới")
+                        return "boundary"
 
                 prev_count = current
             else:
@@ -960,7 +1146,214 @@ class PageScraper:
             # Stop if no new posts after many scrolls
             if no_new_count >= 12:
                 logger.info("Không còn bài mới")
-                break
+                return "exhausted"
+        return "exhausted"
+
+    def _enrich_engagement_from_dom(self, page, collector: _PostCollector) -> None:
+        """Enrich posts with engagement data AND dates from visible DOM.
+        
+        Facebook often renders engagement text ('45 bình luận') and relative
+        dates ('14 giờ', '29 tháng 1') in the DOM but NOT in GraphQL JSON.
+        This scans the rendered page to fill in missing data.
+        """
+        try:
+            logger.debug("[DOM] Starting DOM enrichment scan...")
+            engagement_data = page.evaluate("""() => {
+                const results = [];
+                const processedPostIds = new Set();
+                
+                // Helper: parse a number string with K/M/N suffix
+                function parseNum(s) {
+                    if (!s) return 0;
+                    let n = s.toUpperCase().replace(/,/g, '').replace('N', 'K');
+                    let mul = 1;
+                    if (n.endsWith('K')) { mul = 1000; n = n.slice(0, -1); }
+                    else if (n.endsWith('M')) { mul = 1000000; n = n.slice(0, -1); }
+                    return Math.round(parseFloat(n) * mul) || 0;
+                }
+                
+                // Helper: parse Vietnamese relative date to dd/mm/yyyy
+                function parseDate(text) {
+                    const now = new Date();
+                    
+                    // "X phút" → today
+                    if (/\d+\s*phút/.test(text)) {
+                        return now.toLocaleDateString('en-GB'); // dd/mm/yyyy
+                    }
+                    // "X giờ" → today
+                    if (/\d+\s*giờ/.test(text)) {
+                        return now.toLocaleDateString('en-GB');
+                    }
+                    // "Hôm qua" → yesterday
+                    if (/hôm qua/i.test(text)) {
+                        const d = new Date(now);
+                        d.setDate(d.getDate() - 1);
+                        return d.toLocaleDateString('en-GB');
+                    }
+                    // "Hôm nay" → today
+                    if (/hôm nay/i.test(text)) {
+                        return now.toLocaleDateString('en-GB');
+                    }
+                    // "X ngày" → X days ago
+                    const daysMatch = text.match(/(\d+)\s*ngày/);
+                    if (daysMatch) {
+                        const d = new Date(now);
+                        d.setDate(d.getDate() - parseInt(daysMatch[1]));
+                        return d.toLocaleDateString('en-GB');
+                    }
+                    // "DD tháng MM" or "DD tháng MM, YYYY"
+                    const vnDateMatch = text.match(/(\d{1,2})\s*tháng\s*(\d{1,2})(?:,?\s*(\d{4}))?/);
+                    if (vnDateMatch) {
+                        const day = vnDateMatch[1].padStart(2, '0');
+                        const month = vnDateMatch[2].padStart(2, '0');
+                        const year = vnDateMatch[3] || now.getFullYear().toString();
+                        return `${day}/${month}/${year}`;
+                    }
+                    // "Tháng MM DD, YYYY" (another format)
+                    const vnDateMatch2 = text.match(/tháng\s*(\d{1,2})\s*(\d{1,2}),?\s*(\d{4})/i);
+                    if (vnDateMatch2) {
+                        const month = vnDateMatch2[1].padStart(2, '0');
+                        const day = vnDateMatch2[2].padStart(2, '0');
+                        const year = vnDateMatch2[3];
+                        return `${day}/${month}/${year}`;
+                    }
+                    return '';
+                }
+                
+                // Helper: extract post ID from a link href
+                function extractPostId(href) {
+                    const m1 = href.match(/(?:posts|videos|permalink)\/?(\d{10,})/);
+                    if (m1) return m1[1];
+                    const m2 = href.match(/(pfbid[A-Za-z0-9]+)/);
+                    if (m2) return m2[1];
+                    const m3 = href.match(/facebook\.com\/(\d{15,})/);
+                    if (m3) return m3[1];
+                    return '';
+                }
+                
+                // Scan all article elements (each = one post on the page)
+                const articles = document.querySelectorAll('[role="article"]');
+                for (const article of articles) {
+                    const text = article.innerText || '';
+                    
+                    // Find post ID from ALL links in the article
+                    // Use link.href (resolved absolute URL) not getAttribute('href')
+                    // because Facebook often uses relative URLs like /122129141792999978
+                    const links = article.querySelectorAll('a[href]');
+                    let postId = '';
+                    for (const link of links) {
+                        const h = link.href || '';  // resolved absolute URL
+                        postId = extractPostId(h);
+                        if (postId) break;
+                    }
+                    if (!postId || processedPostIds.has(postId)) continue;
+                    processedPostIds.add(postId);
+                    
+                    // Extract date from time-related text
+                    // Facebook shows dates near the page name, e.g. "14 giờ", "29 tháng 1"
+                    let dateStr = '';
+                    const timeElements = article.querySelectorAll('a[href] span, abbr, [data-utime], span[id]');
+                    for (const el of timeElements) {
+                        const t = (el.innerText || el.getAttribute('title') || '').trim();
+                        if (t && (/(\d+\s*(giờ|phút|ngày))|(tháng\s*\d)|(hôm\s*(qua|nay))/i.test(t))) {
+                            dateStr = parseDate(t);
+                            if (dateStr) break;
+                        }
+                    }
+                    // Also try link text that looks like a date
+                    if (!dateStr) {
+                        for (const link of links) {
+                            const t = (link.innerText || '').trim();
+                            if (t && /(\d+\s*(giờ|phút|ngày))|(tháng\s*\d)|(hôm\s*(qua|nay))/i.test(t)) {
+                                dateStr = parseDate(t);
+                                if (dateStr) break;
+                            }
+                        }
+                    }
+                    
+                    // Extract engagement
+                    let comments = 0, shares = 0, reactions = 0;
+                    
+                    const cmtM = text.match(/([\d,.]+[KkMmNn]?)\s*(?:bình luận|comments?)/i);
+                    if (cmtM) comments = parseNum(cmtM[1]);
+                    
+                    const shareM = text.match(/([\d,.]+[KkMmNn]?)\s*(?:lượt chia sẻ|chia sẻ|shares?)/i);
+                    if (shareM) shares = parseNum(shareM[1]);
+                    
+                    const reactM = text.match(/([\d,.]+[KkMmNn]?)\s*(?:lượt thích|likes?|reactions?)/i);
+                    if (reactM) reactions = parseNum(reactM[1]);
+                    
+                    if (comments > 0 || shares > 0 || reactions > 0 || dateStr) {
+                        results.push({
+                            postId: postId,
+                            comments: comments,
+                            shares: shares,
+                            reactions: reactions,
+                            date: dateStr,
+                        });
+                    }
+                }
+                
+                return results;
+            }""")
+
+            if not engagement_data:
+                logger.debug("[DOM] No articles found or no engagement data extracted")
+                return
+
+            logger.debug(f"[DOM] Found {len(engagement_data)} article(s) with data")
+
+            # Merge DOM data into collector's posts
+            enriched = 0
+            with collector._lock:
+                for item in engagement_data:
+                    pid = item.get("postId", "")
+                    if not pid:
+                        continue
+
+                    # Try exact match first
+                    post = collector._posts.get(pid)
+
+                    # If not found by exact ID, try to match by URL substring
+                    if not post:
+                        for existing_pid, existing_post in collector._posts.items():
+                            post_url = existing_post.get("url", "")
+                            if pid in post_url or existing_pid in pid:
+                                post = existing_post
+                                break
+
+                    if not post:
+                        continue
+
+                    changed = False
+                    if item.get("comments", 0) > 0 and post.get("comments", 0) == 0:
+                        post["comments"] = item["comments"]
+                        changed = True
+                    if item.get("shares", 0) > 0 and post.get("shares", 0) == 0:
+                        post["shares"] = item["shares"]
+                        changed = True
+                    if item.get("reactions", 0) > 0 and post.get("engagement", 0) == 0:
+                        post["engagement"] = item["reactions"]
+                        changed = True
+                    if item.get("date") and not post.get("date"):
+                        post["date"] = item["date"]
+                        changed = True
+                    if changed:
+                        enriched += 1
+                        if enriched <= 3:
+                            logger.debug(
+                                f"[DOM] Enriched {pid[:20]}: "
+                                f"date={item.get('date','')}, "
+                                f"react={item.get('reactions',0)}, "
+                                f"cmt={item.get('comments',0)}, "
+                                f"shares={item.get('shares',0)}"
+                            )
+
+            if enriched > 0:
+                logger.info(f"📊 DOM enrichment: bổ sung dữ liệu cho {enriched} bài viết")
+
+        except Exception as e:
+            logger.warning(f"⚠ DOM enrichment error: {str(e)[:200]}")
 
     def _build_results(
         self,
@@ -989,7 +1382,7 @@ class PageScraper:
                 post_type=item.get("post_type", "Text"),
                 engagement=item.get("engagement", 0),
                 comments=item.get("comments", 0),
-                views=item.get("views", 0),
+                shares=item.get("shares", 0),
                 caption=item.get("caption", ""),
                 url=item.get("url", ""),
                 page_name=page_name,
@@ -1000,11 +1393,13 @@ class PageScraper:
             logger.info(f"🆕 Bỏ qua {skipped} bài đã quét, giữ {len(posts)} bài mới")
 
         # Sort by date (newest first), parsing dd/mm/yyyy
+        # Posts without date are typically the newest (from SSR initial load)
+        # so they sort to the top.
         def date_sort_key(p):
             try:
                 return datetime.strptime(p.date, "%d/%m/%Y")
             except (ValueError, TypeError):
-                return datetime.min
+                return datetime.max
 
         posts.sort(key=date_sort_key, reverse=True)
         return posts[:max_posts]
@@ -1045,7 +1440,15 @@ class PageScraper:
         return f"https://www.facebook.com/{first_segment}"
 
     def _extract_page_name(self, page) -> str:
-        """Extract page name from the page, avoiding FB UI elements like 'Thông báo'."""
+        """Extract page name from the page, avoiding FB UI elements.
+        
+        Strategy:
+        1. Try og:title meta tag
+        2. Try document.title (cleaned)
+        3. Try the profile/page name from specific DOM selectors
+        4. Fallback: h1/h2 with comprehensive skip list
+        5. Last resort: extract from URL
+        """
         try:
             name = page.evaluate(
                 """() => {
@@ -1053,7 +1456,7 @@ class PageScraper:
                 let og = document.querySelector('meta[property="og:title"]');
                 if (og && og.content) {
                     let t = og.content.trim();
-                    if (t && t !== 'Facebook') return t;
+                    if (t && t !== 'Facebook' && t.length > 1) return t;
                 }
 
                 // 2. Title tag (cleaned)
@@ -1064,20 +1467,52 @@ class PageScraper:
                              .trim();
                 if (title && title.length > 1 && title !== 'Facebook') return title;
 
-                // 3. Fallback: h1 but skip known FB UI labels
-                const skipLabels = ['Thông báo', 'Facebook', 'Đăng nhập', 'Log in',
-                                    'Notifications', 'Messenger', 'Watch', 'Marketplace'];
+                // 3. Try specific Facebook page name selectors
+                // Profile/Page name is usually in a prominent h1 inside main content
+                let mainContent = document.querySelector('[role="main"]');
+                if (mainContent) {
+                    let mainH1 = mainContent.querySelector('h1');
+                    if (mainH1) {
+                        let t = mainH1.innerText.trim();
+                        if (t && t.length > 1) return t;
+                    }
+                }
+
+                // 4. Try aria-label of profile image
+                let profileImg = document.querySelector('image[style*="border-radius"]');
+                if (profileImg) {
+                    let label = profileImg.getAttribute('aria-label') || '';
+                    let alt = profileImg.closest('svg')?.getAttribute('aria-label') || '';
+                    let t = (label || alt).trim();
+                    if (t && t.length > 1) return t;
+                }
+
+                // 5. Fallback: h1 but skip known FB UI labels
+                const skipLabels = [
+                    // Vietnamese UI
+                    'Thông báo', 'Đoạn chat', 'Trang chủ', 'Watch', 'Marketplace',
+                    'Đăng nhập', 'Tạo tài khoản', 'Bạn bè', 'Nhóm', 'Video',
+                    'Reels', 'Kỷ niệm', 'Đã lưu', 'Quảng cáo', 'Sự kiện',
+                    'Trang', 'Chơi game', 'Tin', 'Cửa hàng',
+                    // English UI
+                    'Facebook', 'Notifications', 'Messenger', 'Log in', 'Sign Up',
+                    'Home', 'Friends', 'Groups', 'Gaming', 'Bookmarks',
+                    'Memories', 'Saved', 'Events', 'Pages', 'News Feed',
+                    'Chats',
+                ];
                 let allH1 = document.querySelectorAll('h1');
                 for (let h of allH1) {
                     let t = h.innerText.trim();
                     if (t && !skipLabels.includes(t) && t.length > 1) return t;
                 }
 
-                // 4. Try h2 near top
-                let h2 = document.querySelector('h2');
-                if (h2) {
-                    let t = h2.innerText.trim();
-                    if (t && t.length > 1) return t;
+                // 6. Try h2 inside main content only
+                if (mainContent) {
+                    let h2 = mainContent.querySelector('h2');
+                    if (h2) {
+                        let t = h2.innerText.trim();
+                        if (t && !skipLabels.includes(t) && t.length > 1) return t;
+                    }
                 }
 
                 return '';
@@ -1085,6 +1520,30 @@ class PageScraper:
             )
             if name:
                 return name
+        except Exception:
+            pass
+
+        # Try extracting page name from GraphQL data in page source
+        try:
+            name_from_json = page.evaluate(
+                """() => {
+                // Search for page name in embedded JSON data
+                let scripts = document.querySelectorAll('script[type="application/json"]');
+                for (let s of scripts) {
+                    try {
+                        let text = s.textContent;
+                        // Look for "name":"PageName" near "__typename":"Page"
+                        let pageMatch = text.match(/"__typename":\s*"(?:Page|User)"[^}]*"name":\s*"([^"]{2,})"/)
+                                     || text.match(/"name":\s*"([^"]{2,})"[^}]*"__typename":\s*"(?:Page|User)"/)
+                                     || text.match(/"page_name":\s*"([^"]{2,})"/);
+                        if (pageMatch) return pageMatch[1];
+                    } catch(e) {}
+                }
+                return '';
+            }"""
+            )
+            if name_from_json:
+                return name_from_json
         except Exception:
             pass
 

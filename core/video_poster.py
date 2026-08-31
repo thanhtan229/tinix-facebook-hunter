@@ -180,24 +180,6 @@ class VideoPoster:
             except Exception:
                 pass
 
-    # ---------------------------------------------------------------------
-    # Placeholder methods for future platforms
-    # ---------------------------------------------------------------------
-    def post_to_tiktok(self, *args, **kwargs):
-        logger.info("TikTok posting not yet implemented.")
-        return False
-
-    def post_to_instagram(self, *args, **kwargs):
-        logger.info("Instagram posting not yet implemented.")
-        return False
-
-    def post_to_zalo(self, *args, **kwargs):
-        logger.info("Zalo video posting not yet implemented.")
-        return False
-
-    def post_to_youtube(self, *args, **kwargs):
-        logger.info("YouTube posting not yet implemented.")
-        return False
 
 # Helper to instantiate a singleton for the current session
 _video_poster_instance: Optional[VideoPoster] = None

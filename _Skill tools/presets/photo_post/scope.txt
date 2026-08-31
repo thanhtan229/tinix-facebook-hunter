@@ -1,0 +1,1 @@
+gui\social_post_tab.py core\auto_poster.py core\content_scanner.py core\video_post_dispatcher.py core\db_storage.py .agent\skills\photo_post

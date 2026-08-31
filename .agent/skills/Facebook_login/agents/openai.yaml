@@ -1,4 +1,0 @@
-interface:
-  display_name: Facebook Login
-  short_description: Facebook login and avatar retrieval helper
-  default_prompt: Use Facebook Login to open a Chrome profile, sign in to Facebook with username, password, and 2FA secret, then fetch the account avatar.

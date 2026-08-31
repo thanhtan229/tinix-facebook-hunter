@@ -29,7 +29,7 @@ COLUMNS = [
     ("Loại bài viết", "post_type", 14),
     ("Engagement", "engagement", 13),
     ("Bình luận", "comments", 12),
-    ("Lượt xem", "views", 13),
+    ("Shares", "shares", 13),
     ("Caption", "caption", 60),
     ("Link bài viết", "url", 40),
 ]
@@ -141,7 +141,7 @@ def export_to_excel(
                     post.post_type,
                     post.engagement,
                     post.comments,
-                    post.views,
+                    post.shares,
                     post.caption,
                     post_url,
                 ]
@@ -162,7 +162,7 @@ def export_to_excel(
                         type_fill = _TYPE_FILLS.get(value)
                         if type_fill:
                             cell.fill = type_fill
-                    elif col_key in ("engagement", "comments", "views"):
+                    elif col_key in ("engagement", "comments", "shares"):
                         cell.alignment = _DATA_ALIGNMENT
                         # Format numbers
                         if isinstance(value, (int, float)) and value > 0:

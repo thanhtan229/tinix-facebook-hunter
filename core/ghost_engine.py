@@ -6,7 +6,7 @@ Triết lý: "Tàng hình" trước Meta Anti-Bot.
 - Sử dụng mbasic.facebook.com (HTML thuần, không JS)  
 - httpx thay vì browser → không có Chromium fingerprint  
 - Random Mobile User-Agent cho mỗi session
-- Proxy rotation + persistent cookies per Via
+- Persistent cookies per Via
 - Human-like delays (gaussian distribution)
 """
 
@@ -73,10 +73,9 @@ def _get_sessions_dir() -> Path:
 
 @dataclass
 class ViaConfig:
-    """A single Via (Facebook account) + Proxy pair."""
+    """A single Facebook account session."""
     via_id: str                      # Unique ID for this via (hash of cookie)
     cookies: Dict[str, str]          # Parsed Facebook cookies
-    proxy_url: Optional[str] = None  # HTTP proxy URL (http://user:pass@ip:port)
     user_agent: str = ""             # Assigned User-Agent for this session
     viewport: Tuple[int, int] = (390, 844)
     posts_scraped: int = 0           # Counter for rotation
@@ -91,11 +90,7 @@ class ViaConfig:
 
 def parse_via_list(text: str) -> List[ViaConfig]:
     """
-    Parse Via/Proxy input text.
-    Format: cookie_string|proxy_ip:port  (one per line)
-    
-    Cookie string: c_user=xxx; xs=xxx; ...
-    Proxy: ip:port or user:pass@ip:port
+    Parse one Facebook cookie string per line.
     
     Returns list of ViaConfig objects.
     """
@@ -105,14 +100,7 @@ def parse_via_list(text: str) -> List[ViaConfig]:
         if not line or line.startswith("#"):
             continue
 
-        # Split by | separator
-        parts = line.split("|", 1)
-        if len(parts) < 1:
-            logger.warning(f"Dòng {line_num}: format không hợp lệ, bỏ qua")
-            continue
-
-        cookie_str = parts[0].strip()
-        proxy_str = parts[1].strip() if len(parts) > 1 else ""
+        cookie_str = line
 
         # Parse cookies: "c_user=xxx; xs=yyy; ..."
         cookies = {}
@@ -127,21 +115,12 @@ def parse_via_list(text: str) -> List[ViaConfig]:
             logger.warning(f"Dòng {line_num}: thiếu cookie 'c_user', bỏ qua")
             continue
 
-        # Parse proxy
-        proxy_url = None
-        if proxy_str:
-            if not proxy_str.startswith("http"):
-                proxy_url = f"http://{proxy_str}"
-            else:
-                proxy_url = proxy_str
-
         # Create unique ID from c_user
         via_id = cookies.get("c_user", f"via_{line_num}")
 
         vias.append(ViaConfig(
             via_id=via_id,
             cookies=cookies,
-            proxy_url=proxy_url,
         ))
 
     return vias
@@ -154,7 +133,6 @@ class GhostSession:
     Handles:
     - Cookie persistence (saves/loads from disk)
     - Mobile User-Agent fingerprinting
-    - Proxy routing
     - Human-like random delays
     """
 
@@ -189,20 +167,15 @@ class GhostSession:
                 "Cache-Control": "max-age=0",
             }
 
-            # Configure proxy
-            proxy = self.via.proxy_url if self.via.proxy_url else None
-
             self._client = httpx.Client(
                 cookies=self.via.cookies,
                 headers=headers,
-                proxy=proxy,
                 timeout=30.0,
                 follow_redirects=True,
                 http2=False,  # mbasic doesn't need HTTP/2
             )
 
             logger.info(f"👻 Via {self.via.via_id}: session ready"
-                        f" | Proxy: {self.via.proxy_url or 'direct'}"
                         f" | UA: ...{self.via.user_agent[-30:]}")
             return True
 

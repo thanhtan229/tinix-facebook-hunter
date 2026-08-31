@@ -14,11 +14,13 @@ import sys
 import tempfile
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
 from urllib.parse import parse_qs, urlparse
 
 from utils import logger
+from utils.chrome_profiles import poster_profile_dir
 
 # ─── Constants ─────────────────────────────────────────────────────────────
 
@@ -211,18 +213,24 @@ class AutoPoster:
     - Screenshot on error for debugging
     """
 
-    def __init__(self, account: Optional[Dict] = None, headless: bool = False):
+    def __init__(self, account: Optional[Dict] = None, headless: bool = False,
+                 user_agent: str = ""):
         self._account = account or {}
         self._headless = headless
+        self._user_agent = user_agent
         self._stop_event = threading.Event()
         self._chrome_process = None
         self._browser = None
         self._context = None
         self._pw_instance = None
         # Meta Business Portfolio ID — loaded from account, resolved during scan
-        self._business_id: str = str(account.get("business_id", "") or "")
+        self._business_id: str = str(self._account.get("business_id", "") or "")
         # Last error message from post_content / post_now (for error logging)
         self._last_error: str = ""
+
+    def _random_delay(self, min_s: float = 1.5, max_s: float = 4.0):
+        """Expose the module-level human-like delay for helper modules."""
+        _random_delay(min_s, max_s)
 
     # ─── Lifecycle ─────────────────────────────────────────────────────────
 
@@ -230,24 +238,31 @@ class AutoPoster:
         """Launch Chrome and connect Playwright."""
         try:
             from playwright.sync_api import sync_playwright
+            from core.fb_login import FacebookLogin
 
             chrome_path = _find_chrome()
             if not chrome_path:
-                logger.error("Chrome not found!")
+                logger.error("Không tìm thấy Chrome")
                 return False
 
             profile_dir = self._get_profile_dir()
             logger.info(f"🚀 AutoPoster Chrome: {os.path.basename(profile_dir)}")
 
+            cdp_port = int(self._account.get("cdp_port") or CDP_PORT_POSTER)
             chrome_cmd = [
                 chrome_path,
-                f"--remote-debugging-port={CDP_PORT_POSTER}",
+                f"--remote-debugging-port={cdp_port}",
                 f"--user-data-dir={profile_dir}",
                 "--no-first-run",
                 "--no-default-browser-check",
                 "--disable-popup-blocking",
                 "--disable-blink-features=AutomationControlled",
             ]
+
+            # Apply user-agent if configured
+            if self._user_agent:
+                chrome_cmd.append(f"--user-agent={self._user_agent}")
+                logger.info(f"🔖 UA: ...{self._user_agent[-40:]}")
 
             # Always run as a real visible browser — Facebook detects headless
             # via GPU fingerprint and breaks React events / file choosers.
@@ -269,7 +284,7 @@ class AutoPoster:
 
             self._pw_instance = sync_playwright().start()
             self._browser = self._pw_instance.chromium.connect_over_cdp(
-                f"http://localhost:{CDP_PORT_POSTER}",
+                f"http://localhost:{cdp_port}",
                 timeout=15000,
             )
 
@@ -278,17 +293,44 @@ class AutoPoster:
             else:
                 self._context = self._browser.new_context()
 
-            # Login if needed
-            if self._account.get("username") and self._account.get("password"):
-                self._do_login()
-            elif self._account.get("cookie"):
-                self._inject_cookies()
+            # Prefer the persistent Chrome profile first. Only fall back to the
+            # DB cookie snapshot if the profile no longer has a live FB session.
+            login_page = self._context.new_page()
+            try:
+                login = FacebookLogin(login_page, self._account)
+                profile_fresh = self._profile_is_fresh(profile_dir)
+                if login.check_session():
+                    logger.info("✅ Dùng lại session Facebook từ Chrome profile")
+                else:
+                    restored = False
+                    if self._account.get("username") and self._account.get("password"):
+                        logger.info("🔐 Profile chưa live — thử đăng nhập trực tiếp")
+                        self._do_login(page=login_page)
+                        restored = login.check_session()
 
-            logger.info("✅ AutoPoster ready")
+                    if (not restored) and self._account.get("cookie"):
+                        cookie_reason = "profile mới/trống" if profile_fresh else "session cũ đã rớt"
+                        logger.info(f"🍪 {cookie_reason} — thử khôi phục bằng cookie đã lưu")
+                        injected = self._inject_cookies()
+                        if injected and login.ensure_logged_in():
+                            logger.info("✅ Khôi phục session Facebook bằng cookie đã lưu")
+                            restored = True
+                        else:
+                            logger.warning("⚠ Cookie fallback không khôi phục được session Facebook")
+
+                    if not restored and not self._account.get("cookie"):
+                        logger.warning("⚠ Không có session live; bỏ qua cookie fallback cho profile đã có dữ liệu")
+            finally:
+                try:
+                    login_page.close()
+                except Exception:
+                    pass
+
+            logger.info("✅ AutoPoster sẵn sàng")
             return True
 
         except Exception as e:
-            logger.error(f"AutoPoster start error: {str(e)[:200]}")
+            logger.error(f"Lỗi khởi động AutoPoster: {str(e)[:200]}")
             self.stop()
             return False
 
@@ -307,8 +349,11 @@ class AutoPoster:
             pass
         try:
             if self._chrome_process:
-                self._chrome_process.terminate()
-                self._chrome_process.wait(timeout=5)
+                try:
+                    self._chrome_process.wait(timeout=3)
+                except Exception:
+                    self._chrome_process.terminate()
+                    self._chrome_process.wait(timeout=5)
         except Exception:
             try:
                 if self._chrome_process:
@@ -326,7 +371,944 @@ class AutoPoster:
     def is_stopped(self) -> bool:
         return self._stop_event.is_set()
 
-    # ─── Posting ───────────────────────────────────────────────────────────
+    # ─── User-Agent Detection ──────────────────────────────────────────────
+
+    def detect_user_agent(self) -> str:
+        """Detect the actual User-Agent from the browser profile.
+        Opens a blank tab, reads navigator.userAgent, then closes it.
+        Returns the UA string or empty string on failure."""
+        if not self._context:
+            return ""
+        page = None
+        try:
+            page = self._context.new_page()
+            page.goto("about:blank", wait_until="load", timeout=5000)
+            ua = page.evaluate("() => navigator.userAgent") or ""
+            if ua:
+                logger.info(f"🔖 Detected UA: ...{ua[-50:]}")
+            return ua
+        except Exception as e:
+            logger.warning(f"UA detection failed: {str(e)[:100]}")
+            return ""
+        finally:
+            if page:
+                try:
+                    page.close()
+                except Exception:
+                    pass
+
+    # ─── Token Extraction ──────────────────────────────────────────────────
+
+    def extract_access_token(self) -> Optional[str]:
+        """Extract a Facebook User access token from the active session.
+
+        Primary strategy: network interception across Business Suite pages.
+        Visits multiple FB admin pages and captures access_token= params and
+        JSON response bodies. Then validates each candidate against /me/accounts
+        to select the one with page management scope.
+
+        Token values are NEVER logged in full.
+        Returns EAA... access token string or None.
+        """
+        if not self._context:
+            logger.warning("[token] No browser context — skipping extraction")
+            return None
+
+        page = None
+        try:
+            import json as _json
+            import threading as _thr
+
+            page = self._context.new_page()
+            page.set_default_timeout(20000)
+
+            # ── Collect tokens via network interception ──────────────────────
+            tokens: List[str] = []
+            sources: dict = {}          # token → source label
+            current_url = ""
+            found = _thr.Event()
+
+            def _label():
+                return current_url.split("/")[-1] or current_url[-25:]
+
+            def _on_response(resp):
+                try:
+                    url = resp.url
+                    # 1) Token in URL query params
+                    if "access_token=" in url:
+                        m = re.search(r'access_token=([A-Za-z0-9_.-]{20,})', url)
+                        if m and m.group(1) not in tokens:
+                            t = m.group(1)
+                            tokens.append(t)
+                            sources[t] = f"url@{_label()}"
+                            found.set()
+
+                    # 2) Token in JSON response body
+                    if any(h in url for h in ("graph.facebook.com", "/api/graphql",
+                                              "business.facebook.com/api")):
+                        ct = resp.headers.get("content-type", "")
+                        if any(k in ct for k in ("json", "javascript", "text")):
+                            body = resp.text()
+                            for pat in (r'"access_token"\s*:\s*"([A-Za-z0-9_.-]{20,})"',
+                                        r'"accessToken"\s*:\s*"([A-Za-z0-9_.-]{20,})"'):
+                                for m in re.finditer(pat, body):
+                                    t = m.group(1)
+                                    if t not in tokens and len(t) > 20:
+                                        tokens.append(t)
+                                        sources[t] = f"body@{_label()}"
+                                        found.set()
+                except Exception:
+                    pass
+
+            page.on("response", _on_response)
+
+            # Visit the FB admin pages that have proven to expose usable EAA tokens
+            # most often in our real sync logs. `content_management` and Ads Manager
+            # usually surface a page-capable token faster than `/settings/people`,
+            # while `/settings/people` is slower and often yields weaker candidates.
+            visit_urls = [
+                ("https://business.facebook.com/content_management",     "content"),
+                ("https://www.facebook.com/adsmanager/manage/campaigns", "campaigns"),
+                ("https://business.facebook.com/latest/home",            "home"),
+                ("https://business.facebook.com/settings/people",        "people"),
+            ]
+            logger.info("[token] Network interception scan...")
+            for idx, (url, label) in enumerate(visit_urls):
+                current_url = url
+                try:
+                    logger.debug(f"[token] → /{label}")
+                    page.goto(url, wait_until="domcontentloaded", timeout=15000)
+                    for _ in range(20):  # max 10s per page
+                        if found.is_set() and len(tokens) >= 3:
+                            break
+                        found.wait(0.5)
+                    found.clear()
+                except Exception as e:
+                    logger.debug(f"[token] /{label} error: {str(e)[:50]}")
+
+                # Early exit: once we already have an EAA token from one of the two
+                # highest-yield routes, don't waste time on slower backup routes.
+                if idx >= 1 and any(t.startswith("EAA") for t in tokens):
+                    break
+
+            # ── Select best token ────────────────────────────────────────────
+            eaa = [t for t in tokens if t.startswith("EAA")]
+            candidates = eaa + [t for t in tokens if not t.startswith("EAA")]
+            logger.info(f"[token] Captured {len(candidates)} tokens ({len(eaa)} EAA)")
+
+            if candidates:
+                best_with_pages = None
+                best_with_access = None
+
+                for i, tok in enumerate(candidates, 1):
+                    src = sources.get(tok, "?")
+                    try:
+                        url = f"https://graph.facebook.com/v25.0/me/accounts?limit=1&access_token={tok}"
+                        page.goto(url, wait_until="load", timeout=8000)
+                        body = page.evaluate("() => document.body.innerText || ''")
+                        data = _json.loads(body) if body else {}
+                        if "data" in data and "error" not in data:
+                            n = len(data["data"])
+                            logger.info(f"[token] #{i} ({src}): ✅ {n} pages")
+                            if n > 0 and not best_with_pages:
+                                best_with_pages = tok
+                            elif not best_with_access:
+                                best_with_access = tok
+                        elif "error" in data:
+                            logger.info(f"[token] #{i} ({src}): ❌ {data['error'].get('message','')[:50]}")
+                    except Exception:
+                        logger.debug(f"[token] #{i} ({src}): test error")
+
+                chosen = best_with_pages or best_with_access or candidates[0]
+                src = sources.get(chosen, "?")
+                tag = "with pages" if chosen == best_with_pages else "API access"
+                logger.info(f"[token] ✅ Selected ({tag}) from {src} (len={len(chosen)})")
+                return chosen
+
+            # ── Fallback: JS runtime scan ────────────────────────────────────
+            logger.info("[token] Fallback: JS runtime scan...")
+            try:
+                token = page.evaluate("""() => {
+                    try {
+                        for (const s of document.querySelectorAll('script')) {
+                            const m = (s.textContent || '').match(/"(EAA[A-Za-z0-9_.-]{20,})"/);
+                            if (m) return m[1];
+                        }
+                    } catch(e) {}
+                    try { if (window.__accessToken) return window.__accessToken; } catch(e) {}
+                    return null;
+                }""")
+                if token and str(token).startswith("EAA"):
+                    logger.info(f"[token] ✅ Token via JS scan (len={len(token)})")
+                    return token
+            except Exception:
+                pass
+
+            # ── All strategies failed — save debug ───────────────────────────
+            try:
+                debug_dir = Path(__file__).parent.parent / "diagnostics"
+                debug_dir.mkdir(exist_ok=True)
+                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                page.screenshot(path=str(debug_dir / f"token_debug_{ts}.png"))
+            except Exception:
+                pass
+
+            logger.warning("[token] ❌ All strategies failed")
+            return None
+
+        except Exception as e:
+            logger.error(f"[token] Extraction error: {str(e)[:200]}")
+            return None
+        finally:
+            if page:
+                try:
+                    page.close()
+                except Exception:
+                    pass
+
+    def debug_token(self, access_token: str) -> dict:
+        """Call Graph API /debug_token to get token metadata.
+
+        Returns dict with keys: is_valid, app_id, expires_at, scopes, error
+        Token values are NEVER logged.
+        """
+        result = {
+            "is_valid": False, "app_id": "", "expires_at": "",
+            "scopes": "", "expires_in": 0, "error": "",
+            "user_id": "", "type": "",
+        }
+        if not access_token or not self._context:
+            return result
+
+        page = None
+        try:
+            import json as _json
+            page = self._context.new_page()
+            page.set_default_timeout(12000)
+
+            api_url = (
+                f"https://graph.facebook.com/v25.0/debug_token"
+                f"?input_token={access_token}"
+                f"&access_token={access_token}"
+            )
+            page.goto(api_url, wait_until="load", timeout=12000)
+            _random_delay(1.0, 1.5)
+
+            body = page.evaluate("() => document.body.innerText || ''")
+            if not body:
+                return result
+
+            data = _json.loads(body).get("data", {})
+
+            result["is_valid"] = bool(data.get("is_valid", False))
+            result["app_id"] = str(data.get("app_id", ""))
+            result["user_id"] = str(data.get("user_id", ""))
+            result["type"] = data.get("type", "")
+
+            # Scopes
+            scopes_list = data.get("scopes", [])
+            if scopes_list:
+                result["scopes"] = ",".join(scopes_list)
+
+            # Expiry
+            expires_at = data.get("expires_at", 0)
+            if expires_at and expires_at > 0:
+                from datetime import datetime as _dt
+                result["expires_at"] = _dt.fromtimestamp(expires_at).strftime("%Y-%m-%d %H:%M:%S")
+                result["expires_in"] = max(0, int(expires_at - _dt.now().timestamp()))
+
+            # Error info
+            err = data.get("error", {})
+            if err:
+                result["error"] = err.get("message", "")
+
+            valid_str = "✅ Valid" if result["is_valid"] else "❌ Invalid"
+            logger.info(f"[token] debug_token: {valid_str}, "
+                        f"scopes={len(scopes_list)}, "
+                        f"expires_in={result['expires_in']}s")
+            return result
+
+        except Exception as e:
+            logger.debug(f"[token] debug_token error: {str(e)[:100]}")
+            return result
+        finally:
+            if page:
+                try:
+                    page.close()
+                except Exception:
+                    pass
+
+    def validate_account_status(self, access_token: str) -> dict:
+        """Check if the Facebook account is live, checkpoint, or expired.
+
+        Calls GET /me with the token and interprets the response.
+        Returns: {"status": "Live"/"Checkpoint"/"Expired"/"Error", "detail": "..."}
+        """
+        result = {"status": "Error", "detail": "No token"}
+        if not access_token or not self._context:
+            return result
+
+        page = None
+        try:
+            import json as _json
+            page = self._context.new_page()
+            page.set_default_timeout(12000)
+
+            api_url = f"https://graph.facebook.com/v25.0/me?fields=id,name&access_token={access_token}"
+            page.goto(api_url, wait_until="load", timeout=12000)
+            _random_delay(0.8, 1.2)
+
+            body = page.evaluate("() => document.body.innerText || ''")
+            if not body:
+                result["detail"] = "Empty response"
+                return result
+
+            data = _json.loads(body)
+
+            if "id" in data and "name" in data:
+                result["status"] = "Live"
+                result["name"] = data["name"]
+                result["detail"] = f"{data['name']} (ID: {data['id']})"
+                logger.info(f"[token] Account status: ✅ Live — {data['name']}")
+                return result
+
+            if "error" in data:
+                err = data["error"]
+                code = err.get("code", 0)
+                subcode = err.get("error_subcode", 0)
+                msg = err.get("message", "")
+
+                if code == 190:
+                    if subcode in (492, 459):
+                        result["status"] = "Checkpoint"
+                        result["detail"] = f"Checkpoint (subcode={subcode}): {msg[:100]}"
+                    elif subcode in (463, 467):
+                        result["status"] = "Expired"
+                        result["detail"] = f"Token expired (subcode={subcode})"
+                    elif subcode == 460:
+                        result["status"] = "Password Changed"
+                        result["detail"] = "Password changed, need re-login"
+                    else:
+                        result["status"] = "Expired"
+                        result["detail"] = f"OAuthException ({code}/{subcode}): {msg[:100]}"
+                else:
+                    result["status"] = "Error"
+                    result["detail"] = f"API error ({code}): {msg[:100]}"
+
+                logger.info(f"[token] Account status: {result['status']} — {result['detail'][:80]}")
+                return result
+
+            result["detail"] = "Unexpected response"
+            return result
+
+        except Exception as e:
+            result["detail"] = str(e)[:100]
+            logger.debug(f"[token] validate error: {str(e)[:100]}")
+            return result
+        finally:
+            if page:
+                try:
+                    page.close()
+                except Exception:
+                    pass
+
+    # ─── Token Escalation: API helpers via urllib ──────────────────────────
+
+    def _build_api_opener(self):
+        """Build urllib opener with the account's User-Agent.
+
+        Returns (opener, headers_dict) tuple.
+        All Graph API calls MUST use this to maintain consistent environment.
+        """
+        import urllib.request
+
+        opener = urllib.request.build_opener()
+        ua = self._user_agent or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        return opener, {"User-Agent": ua}
+
+    def _open_api_request(self, opener, req, timeout: int = 15, retries: int = 2):
+        """Open a urllib request with retries for transient network disconnects."""
+        last_error = None
+        for attempt in range(retries + 1):
+            try:
+                return opener.open(req, timeout=timeout)
+            except Exception as e:
+                last_error = e
+                is_last = attempt >= retries
+                msg = str(e).lower()
+                transient = any(key in msg for key in [
+                    "remote end closed connection without response",
+                    "connection reset",
+                    "connection aborted",
+                    "timed out",
+                    "temporarily unavailable",
+                ])
+                if is_last or not transient:
+                    raise
+                logger.info(
+                    f"[token-escalation] API retry {attempt + 1}/{retries} after transient error: {str(e)[:100]}"
+                )
+                time.sleep(1.2 + attempt * 0.8)
+        if last_error:
+            raise last_error
+
+    def acquire_app_owned_user_token(self, timeout_s: int = 90) -> Optional[str]:
+        """Run Facebook Login for the configured shared app inside the current profile."""
+        if not self._context:
+            return None
+        try:
+            from core.facebook_app_oauth import FacebookAppOAuth
+
+            oauth = FacebookAppOAuth(self._build_api_opener, account=self._account)
+            return oauth.acquire_user_token(self._context, timeout_s=timeout_s)
+        except Exception as e:
+            logger.warning(f"[app-oauth] Failed to acquire app-owned user token: {str(e)[:120]}")
+            return None
+
+    def exchange_long_lived_token(self, short_token: str) -> Optional[str]:
+        """Exchange a short-lived token for a 60-day long-lived user token.
+
+        POST graph.facebook.com/v25.0/oauth/access_token
+            ?grant_type=fb_exchange_token
+            &client_id={FB_APP_ID}
+            &client_secret={FB_APP_SECRET}
+            &fb_exchange_token={short_token}
+
+        Returns: long-lived token string, or None if exchange fails.
+        Calls use the account's User-Agent.
+        """
+        from utils.config import get_env
+        import json as _json
+        import urllib.request
+        import urllib.error
+
+        app_id = get_env("FB_APP_ID")
+        app_secret = get_env("FB_APP_SECRET")
+
+        if not app_id or not app_secret:
+            logger.warning("[token-escalation] FB_APP_ID / FB_APP_SECRET not configured in .env — skipping exchange")
+            return None
+
+        opener, headers = self._build_api_opener()
+
+        url = (
+            f"https://graph.facebook.com/v25.0/oauth/access_token"
+            f"?grant_type=fb_exchange_token"
+            f"&client_id={app_id}"
+            f"&client_secret={app_secret}"
+            f"&fb_exchange_token={short_token}"
+        )
+
+        try:
+            req = urllib.request.Request(url)
+            for k, v in headers.items():
+                req.add_header(k, v)
+            with self._open_api_request(opener, req, timeout=15, retries=2) as resp:
+                data = _json.loads(resp.read().decode())
+
+            new_token = data.get("access_token", "")
+            expires_in = data.get("expires_in", 0)
+
+            if new_token:
+                days = expires_in // 86400 if expires_in else "?"
+                logger.info(f"[token-escalation] ✅ Long-lived token acquired (expires in {days} days)")
+                return new_token
+            else:
+                logger.warning(f"[token-escalation] Exchange returned no token: {str(data)[:120]}")
+                return None
+
+        except urllib.error.HTTPError as e:
+            try:
+                err_body = _json.loads(e.read().decode())
+                err_msg = err_body.get("error", {}).get("message", "")[:120]
+                logger.warning(f"[token-escalation] Exchange failed: HTTP {e.code} — {err_msg}")
+            except Exception:
+                logger.warning(f"[token-escalation] Exchange failed: HTTP {e.code}")
+            return None
+        except Exception as e:
+            logger.warning(f"[token-escalation] Exchange error: {str(e)[:100]}")
+            return None
+
+    def extract_page_tokens_api(self, user_token: str) -> List[Dict]:
+        """Fetch Page Access Tokens via Graph API using urllib (no Playwright).
+
+        Uses the account's User-Agent for a consistent environment.
+        When called with a long-lived user token, the returned page tokens are PERMANENT.
+
+        Returns: [{"page_id": "...", "page_name": "...", "access_token": "..."}]
+        """
+        if not user_token:
+            return []
+
+        import json as _json
+        import urllib.request
+        import urllib.error
+        import urllib.parse
+
+        opener, headers = self._build_api_opener()
+        results = []
+        url = (
+            f"https://graph.facebook.com/v25.0/me/accounts"
+            f"?fields=id,name,access_token"
+            f"&limit=200"
+            f"&access_token={user_token}"
+        )
+
+        try:
+            logger.info("[token-escalation] Fetching page tokens via /me/accounts (urllib)...")
+            req = urllib.request.Request(url)
+            for k, v in headers.items():
+                req.add_header(k, v)
+            with self._open_api_request(opener, req, timeout=15, retries=2) as resp:
+                data = _json.loads(resp.read().decode())
+
+            if "error" in data:
+                err_msg = data["error"].get("message", "Unknown")[:120]
+                logger.warning(f"[token-escalation] /me/accounts error: {err_msg}")
+                return []
+
+            for p in data.get("data", []):
+                pid = p.get("id", "")
+                pname = p.get("name", "")
+                ptok = p.get("access_token", "")
+                if pid and ptok:
+                    results.append({
+                        "page_id": pid,
+                        "page_name": pname,
+                        "access_token": ptok,
+                    })
+
+            logger.info(f"[token-escalation] ✅ Got {len(results)} page tokens")
+            return results
+
+        except urllib.error.HTTPError as e:
+            try:
+                err_body = _json.loads(e.read().decode())
+                err_msg = err_body.get("error", {}).get("message", "")[:120]
+                logger.warning(f"[token-escalation] /me/accounts HTTP {e.code}: {err_msg}")
+            except Exception:
+                logger.warning(f"[token-escalation] /me/accounts HTTP {e.code}")
+            return []
+        except Exception as e:
+            logger.warning(f"[token-escalation] /me/accounts error: {str(e)[:100]}")
+            return []
+
+    def _encode_multipart_formdata(self, fields: Dict[str, str], files: List[dict]):
+        """Encode fields + files as multipart/form-data for Graph API uploads."""
+        import mimetypes
+        import uuid
+
+        boundary = f"----TinixBoundary{uuid.uuid4().hex}"
+        body = bytearray()
+
+        for key, value in (fields or {}).items():
+            body.extend(f"--{boundary}\r\n".encode())
+            body.extend(f'Content-Disposition: form-data; name="{key}"\r\n\r\n'.encode())
+            body.extend(str(value).encode("utf-8"))
+            body.extend(b"\r\n")
+
+        for file_info in files or []:
+            field_name = file_info.get("field_name", "source")
+            file_path = file_info.get("path", "")
+            filename = os.path.basename(file_path)
+            content_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+            with open(file_path, "rb") as fh:
+                content = fh.read()
+            body.extend(f"--{boundary}\r\n".encode())
+            body.extend(
+                f'Content-Disposition: form-data; name="{field_name}"; filename="{filename}"\r\n'.encode()
+            )
+            body.extend(f"Content-Type: {content_type}\r\n\r\n".encode())
+            body.extend(content)
+            body.extend(b"\r\n")
+
+        body.extend(f"--{boundary}--\r\n".encode())
+        return f"multipart/form-data; boundary={boundary}", bytes(body)
+
+    # Transient Facebook API error codes that should be retried automatically.
+    _TRANSIENT_API_CODES = {1, 2, 4, 17}
+
+    def _graph_api_post_json(
+        self,
+        url: str,
+        fields: Optional[Dict[str, str]] = None,
+        files: Optional[List[dict]] = None,
+        timeout: int = 30,
+        retries: int = 3,
+    ) -> Dict:
+        """POST to Graph API and return parsed JSON.
+
+        Automatically retries on transient Facebook API errors (codes 1, 2, 4, 17)
+        with exponential backoff before raising.
+        """
+        import json as _json
+        import urllib.error
+        import urllib.parse
+        import urllib.request
+        last_error = None
+        for attempt in range(retries + 1):
+            opener, headers = self._build_api_opener()
+            req_headers = dict(headers or {})
+
+            if files:
+                content_type, body = self._encode_multipart_formdata(fields or {}, files)
+                req = urllib.request.Request(url, data=body, method="POST")
+                req_headers["Content-Type"] = content_type
+            else:
+                payload = urllib.parse.urlencode(fields or {}).encode("utf-8")
+                req = urllib.request.Request(url, data=payload, method="POST")
+                req_headers["Content-Type"] = "application/x-www-form-urlencoded"
+
+            for k, v in req_headers.items():
+                req.add_header(k, v)
+
+            try:
+                with self._open_api_request(opener, req, timeout=timeout, retries=2) as resp:
+                    data = _json.loads(resp.read().decode("utf-8", errors="replace"))
+            except urllib.error.HTTPError as e:
+                try:
+                    resp_body = e.read().decode("utf-8", errors="replace")
+                    data = _json.loads(resp_body)
+                except Exception:
+                    raise RuntimeError(f"HTTP {e.code}")
+            except Exception as e:
+                raise RuntimeError(str(e)[:200])
+
+            if "error" in data:
+                err = data.get("error", {}) or {}
+                code = err.get("code", "")
+                msg = err.get("message", "Unknown error")
+                err_type = err.get("type", "")
+                err_subcode = err.get("error_subcode", "")
+                fbtrace = err.get("fbtrace_id", "")
+                is_transient = (
+                    isinstance(code, int) and code in self._TRANSIENT_API_CODES
+                ) or (
+                    str(code).isdigit() and int(code) in self._TRANSIENT_API_CODES
+                )
+                if is_transient and attempt < retries:
+                    wait = 3.0 * (attempt + 1)
+                    logger.warning(
+                        f"[api] Transient error (code {code}), retry {attempt + 1}/{retries} "
+                        f"in {wait:.0f}s: {msg[:120]}"
+                    )
+                    if attempt == 0:
+                        logger.debug(
+                            f"[api] Full error: code={code} type={err_type} subcode={err_subcode} "
+                            f"fbtrace_id={fbtrace} msg={msg[:200]} url={url[:120]}"
+                        )
+                    time.sleep(wait)
+                    last_error = RuntimeError(f"API error ({code}): {msg[:180]}")
+                    continue
+                logger.error(
+                    f"[api] FINAL error: code={code} type={err_type} subcode={err_subcode} "
+                    f"fbtrace_id={fbtrace} msg={msg[:200]} url={url[:120]}"
+                )
+                if err_subcode not in ("", None):
+                    raise RuntimeError(f"API error ({code}/{err_subcode}): {msg[:180]}")
+                raise RuntimeError(f"API error ({code}): {msg[:180]}")
+            return data
+
+        # Should not reach here, but just in case
+        if last_error:
+            raise last_error
+        raise RuntimeError("Graph API POST failed after retries")
+
+    def post_via_api(
+        self,
+        folder_path: str,
+        caption: str,
+        page_name: str,
+        page_id: str,
+        page_access_token: str,
+        scheduled_time: str = "",
+        brand_name: str = "",
+        cta_enabled: bool = False,
+        share_to_story: bool = True,
+        on_status: Optional[Callable] = None,
+    ) -> bool:
+        """Publish or schedule a photo post via Graph API using a page access token."""
+        temp_dir = None
+        self._last_error = ""
+        try:
+            if not page_id or not page_access_token:
+                self._last_error = "Missing page_id or page access token"
+                return False
+
+            from core.content_scanner import folder_has_video
+
+            if folder_has_video(folder_path):
+                self._last_error = "API photo mode does not support video folders"
+                logger.warning(f"[api-post] {self._last_error}: {os.path.basename(folder_path)}")
+                return False
+
+            if cta_enabled:
+                logger.info("[api-post] CTA is not supported in Facebook API photo mode — skipping")
+            if share_to_story:
+                logger.info("[api-post] Share to Story is not supported in Facebook API photo mode — skipping")
+
+            if on_status:
+                on_status(f"🔖 Chuẩn bị media API: {os.path.basename(folder_path)}")
+
+            temp_dir = brand_media_to_temp(folder_path, brand_name)
+            if not temp_dir:
+                self._last_error = "Failed to prepare media files"
+                return False
+
+            image_files = [
+                os.path.join(temp_dir, f)
+                for f in sorted(os.listdir(temp_dir))
+                if Path(f).suffix.lower() in {".jpg", ".jpeg", ".png", ".gif"}
+            ]
+
+            scheduled_unix = None
+            if scheduled_time:
+                scheduled_dt = datetime.strptime(scheduled_time.strip(), "%Y-%m-%d %H:%M")
+                scheduled_unix = int(scheduled_dt.timestamp())
+
+            media_ids = []
+            if image_files:
+                for idx, image_path in enumerate(image_files, start=1):
+                    if self._stop_event.is_set():
+                        self._last_error = "Stopped by user"
+                        return False
+                    if on_status:
+                        on_status(f"📤 Upload ảnh API {idx}/{len(image_files)}...")
+                    upload_data = self._graph_api_post_json(
+                        f"https://graph.facebook.com/v25.0/{page_id}/photos",
+                        fields={
+                            "access_token": page_access_token,
+                            "published": "false",
+                        },
+                        files=[{"field_name": "source", "path": image_path}],
+                        timeout=60,
+                    )
+                    media_id = str(upload_data.get("id") or "").strip()
+                    if not media_id:
+                        raise RuntimeError("Graph API did not return uploaded media id")
+                    media_ids.append(media_id)
+
+            if on_status:
+                action_text = f"📅 Lên lịch API: {scheduled_time}" if scheduled_unix else "🚀 Đăng bài API..."
+                on_status(action_text)
+
+            fields = {
+                "access_token": page_access_token,
+                "message": caption or "",
+            }
+            for idx, media_id in enumerate(media_ids):
+                fields[f"attached_media[{idx}]"] = (
+                    f'{{"media_fbid":"{media_id}"}}'
+                )
+            if scheduled_unix:
+                fields["published"] = "false"
+                fields["scheduled_publish_time"] = str(scheduled_unix)
+
+            post_data = self._graph_api_post_json(
+                f"https://graph.facebook.com/v25.0/{page_id}/feed",
+                fields=fields,
+                timeout=60,
+            )
+            post_id = str(post_data.get("id") or post_data.get("post_id") or "").strip()
+            if not post_id:
+                raise RuntimeError("Graph API did not return created post id")
+
+            if on_status:
+                if scheduled_unix:
+                    on_status(f"✅ Đã lên lịch API cho {page_name}")
+                else:
+                    on_status(f"✅ Đã đăng API lên {page_name}")
+            logger.info(
+                f"[api-post] {'Scheduled' if scheduled_unix else 'Published'} via token for "
+                f"{page_name} (page_id={page_id})"
+            )
+            return True
+        except Exception as e:
+            self._last_error = str(e)[:300]
+            logger.error(f"[api-post] {self._last_error}")
+            return False
+        finally:
+            if temp_dir:
+                cleanup_temp(temp_dir)
+
+    def post_video_via_api(
+        self,
+        folder_path: str,
+        caption: str,
+        page_name: str,
+        page_id: str,
+        page_access_token: str,
+        scheduled_time: str = "",
+        brand_name: str = "",
+        cta_enabled: bool = False,
+        share_to_story: bool = True,
+        on_status: Optional[Callable] = None,
+    ) -> bool:
+        """Publish or schedule a Page video via Graph API using a page access token."""
+        temp_dir = None
+        self._last_error = ""
+        try:
+            if not page_id or not page_access_token:
+                self._last_error = "Missing page_id or page access token"
+                return False
+
+            if cta_enabled:
+                logger.info("[api-video] CTA is not supported in Facebook API video mode - skipping")
+            if share_to_story:
+                logger.info("[api-video] Share to Story is not supported in Facebook API video mode - skipping")
+
+            if on_status:
+                on_status(f"Preparing video API media: {os.path.basename(folder_path)}")
+
+            temp_dir = brand_media_to_temp(folder_path, brand_name)
+            if not temp_dir:
+                self._last_error = "Failed to prepare media files"
+                return False
+
+            video_files = [
+                os.path.join(temp_dir, f)
+                for f in sorted(os.listdir(temp_dir))
+                if Path(f).suffix.lower() in {".mp4", ".mov"}
+            ]
+            if not video_files:
+                self._last_error = "No video file found for API video post"
+                logger.warning(f"[api-video] {self._last_error}: {os.path.basename(folder_path)}")
+                return False
+
+            video_path = video_files[0]
+            if len(video_files) > 1:
+                logger.info(
+                    f"[api-video] Multiple videos found in {os.path.basename(folder_path)}; "
+                    f"uploading first file: {os.path.basename(video_path)}"
+                )
+
+            scheduled_unix = None
+            if scheduled_time:
+                scheduled_dt = datetime.strptime(scheduled_time.strip(), "%Y-%m-%d %H:%M")
+                scheduled_unix = int(scheduled_dt.timestamp())
+
+            if self._stop_event.is_set():
+                self._last_error = "Stopped by user"
+                return False
+
+            if on_status:
+                action_text = (
+                    f"Scheduling video API: {scheduled_time}"
+                    if scheduled_unix else
+                    f"Uploading video API: {os.path.basename(video_path)}"
+                )
+                on_status(action_text)
+
+            fields = {
+                "access_token": page_access_token,
+                "description": caption or "",
+            }
+            if scheduled_unix:
+                fields["published"] = "false"
+                fields["scheduled_publish_time"] = str(scheduled_unix)
+
+            post_data = self._graph_api_post_json(
+                f"https://graph.facebook.com/v25.0/{page_id}/videos",
+                fields=fields,
+                files=[{"field_name": "source", "path": video_path}],
+                timeout=600,
+            )
+            video_id = str(post_data.get("id") or post_data.get("video_id") or "").strip()
+            if not video_id:
+                raise RuntimeError("Graph API did not return created video id")
+
+            if on_status:
+                if scheduled_unix:
+                    on_status(f"Scheduled video API for {page_name}")
+                else:
+                    on_status(f"Posted video API to {page_name}")
+            logger.info(
+                f"[api-video] {'Scheduled' if scheduled_unix else 'Published'} via token for "
+                f"{page_name} (page_id={page_id})"
+            )
+            return True
+        except Exception as e:
+            self._last_error = str(e)[:300]
+            logger.error(f"[api-video] {self._last_error}")
+            return False
+        finally:
+            if temp_dir:
+                cleanup_temp(temp_dir)
+
+    def extract_page_tokens(self, user_token: str) -> List[Dict]:
+        """Fetch Page Access Tokens for all pages managed by this account.
+
+        Uses the Graph API /me/accounts endpoint with the user access token.
+        Returns a list of dicts: [{"page_id": "...", "page_name": "...", "access_token": "..."}]
+        Token values are NEVER logged in full.
+
+        NOTE: This method uses Playwright (browser context) as a fallback.
+        Prefer extract_page_tokens_api() for direct urllib calls.
+        """
+        if not user_token:
+            return []
+        if not self._context:
+            return []
+
+        page = None
+        try:
+            import json as _json
+
+            page = self._context.new_page()
+            page.set_default_timeout(15000)
+
+            # Use Graph API to get page tokens
+            api_url = (
+                f"https://graph.facebook.com/v21.0/me/accounts"
+                f"?fields=id,name,access_token"
+                f"&access_token={user_token}"
+            )
+            logger.info("[token] Fetching page tokens via Graph API /me/accounts...")
+            page.goto(api_url, wait_until="load", timeout=15000)
+            _random_delay(1.5, 2.5)
+
+            # Parse JSON response
+            body_text = page.evaluate("() => document.body.innerText || document.body.textContent || ''")
+            if not body_text:
+                logger.warning("[token] Empty response from /me/accounts")
+                return []
+
+            try:
+                data = _json.loads(body_text)
+            except _json.JSONDecodeError as e:
+                logger.warning(f"[token] /me/accounts JSON parse error: {str(e)[:100]}")
+                return []
+
+            if "error" in data:
+                err_msg = data["error"].get("message", "Unknown error")
+                logger.warning(f"[token] Graph API error: {err_msg[:120]}")
+                return []
+
+            pages_data = data.get("data", [])
+            results = []
+            for p_item in pages_data:
+                pid = p_item.get("id", "")
+                pname = p_item.get("name", "")
+                ptok = p_item.get("access_token", "")
+                if pid and ptok:
+                    results.append({
+                        "page_id": pid,
+                        "page_name": pname,
+                        "access_token": ptok,
+                    })
+
+            logger.info(f"[token] ✅ Got {len(results)} page tokens from Graph API")
+            return results
+
+        except Exception as e:
+            logger.error(f"[token] Page token extraction error: {str(e)[:200]}")
+            return []
+        finally:
+            if page:
+                try:
+                    page.close()
+                except Exception:
+                    pass
 
     def _resolve_business_id(self, page) -> str:
         """
@@ -437,7 +1419,6 @@ class AutoPoster:
         except Exception:
             pass
         _random_delay(1.5, 2.5)
-
         if "login" in page.url or "checkpoint" in page.url:
             logger.warning("[composer] redirected to login — not authenticated")
             page.goto(CREATE_POST_URL, wait_until="domcontentloaded")
@@ -633,6 +1614,7 @@ class AutoPoster:
         brand_name: str = "",
         cta_enabled: bool = False,
         share_to_story: bool = True,
+        video_as_reel: bool = True,
         on_status: Optional[Callable] = None,
     ) -> bool:
         """
@@ -673,7 +1655,8 @@ class AutoPoster:
 
             # Route: video folder → Reel Composer; images/text → Post Composer
             from core.content_scanner import folder_has_video
-            if folder_has_video(folder_path):
+            has_video = folder_has_video(folder_path)
+            if video_as_reel and has_video:
                 logger.info(f"🎬 Video detected — using Reel Composer for {os.path.basename(folder_path)}")
                 page = self._context.new_page()
                 page.set_default_timeout(30000)
@@ -703,7 +1686,7 @@ class AutoPoster:
             if on_status:
                 on_status(f"📎 Uploading media files...")
 
-            upload_success = self._upload_media(page, temp_dir)
+            upload_success = self._upload_media(page, temp_dir, video_only=has_video and not video_as_reel)
             if not upload_success:
                 self._screenshot_error(page, "upload_failed")
                 return False
@@ -793,6 +1776,7 @@ class AutoPoster:
         brand_name: str = "",
         cta_enabled: bool = False,
         share_to_story: bool = True,
+        video_as_reel: bool = True,
         on_status: Optional[Callable] = None,
     ) -> bool:
         """
@@ -831,7 +1815,8 @@ class AutoPoster:
 
             # Route: video folder → Reel Composer; images/text → Post Composer
             from core.content_scanner import folder_has_video
-            if folder_has_video(folder_path):
+            has_video = folder_has_video(folder_path)
+            if video_as_reel and has_video:
                 logger.info(f"🎬 Video detected — using Reel Composer for {os.path.basename(folder_path)}")
                 page = self._context.new_page()
                 page.set_default_timeout(30000)
@@ -856,7 +1841,7 @@ class AutoPoster:
             if on_status:
                 on_status("📎 Uploading media...")
 
-            if not self._upload_media(page, temp_dir):
+            if not self._upload_media(page, temp_dir, video_only=has_video and not video_as_reel):
                 self._screenshot_error(page, "upload_failed")
                 return False
 
@@ -984,7 +1969,7 @@ class AutoPoster:
                 break
         logger.debug("[clear_media] done")
 
-    def _upload_media(self, page, temp_dir: str) -> bool:
+    def _upload_media(self, page, temp_dir: str, video_only: bool = False) -> bool:
         """Upload media files to Meta Business Suite composer.
 
         Two possible FB layouts:
@@ -999,7 +1984,7 @@ class AutoPoster:
             media_files = sorted([
                 os.path.join(temp_dir, f)
                 for f in os.listdir(temp_dir)
-                if Path(f).suffix.lower() in MEDIA_EXTS
+                if Path(f).suffix.lower() in ({".mp4", ".mov"} if video_only else MEDIA_EXTS)
             ])
             if not media_files:
                 logger.error("No media files to upload")
@@ -1021,8 +2006,9 @@ class AutoPoster:
 
             # Candidate photo button texts (exact) and sub-option texts
             photo_texts = [
-                "Thêm ảnh", "Thêm video", "Ảnh/video",
-                "Add Photo", "Add photo", "Photo/video",
+                "Thêm ảnh/video", "Thêm ảnh", "Thêm video", "Ảnh/video",
+                "File phương tiện", "Add Photo", "Add photo", "Photo/video",
+                "Add photo/video", "Add photos/videos",
             ]
             upload_texts = [
                 "Tải lên từ máy tính", "Upload from computer",
@@ -1036,9 +2022,9 @@ class AutoPoster:
             # Find the photo button locator using Playwright (not JS)
             photo_loc = None
             for txt in photo_texts:
-                loc = page.get_by_text(txt, exact=True).first
                 try:
-                    if loc.count() > 0 and loc.is_visible(timeout=1000):
+                    loc = page.get_by_text(txt, exact=False).first
+                    if loc.count() > 0 and loc.is_visible(timeout=1500):
                         photo_loc = loc
                         logger.debug(f"  Found photo button: '{txt}'")
                         break
@@ -1046,6 +2032,10 @@ class AutoPoster:
                     continue
 
             if photo_loc is None:
+                if self._set_file_input(page, media_files, image_only=False):
+                    logger.info(f"  📎 Input fallback: {len(media_files)} files uploaded")
+                    _random_delay(2.0, 4.0)
+                    return True
                 logger.error("Upload failed — photo button not found on page")
                 return False
 
@@ -1066,8 +2056,8 @@ class AutoPoster:
 
             sub_loc = None
             for txt in upload_texts:
-                loc = page.get_by_text(txt, exact=True).first
                 try:
+                    loc = page.get_by_text(txt, exact=False).first
                     if loc.count() > 0 and loc.is_visible(timeout=2000):
                         sub_loc = loc
                         logger.debug(f"  Found sub-option: '{txt}'")
@@ -1092,8 +2082,8 @@ class AutoPoster:
                     photo_loc.click()
                     _random_delay(1.0, 1.5)
                     for txt in upload_texts:
-                        loc = page.get_by_text(txt, exact=True).first
                         try:
+                            loc = page.get_by_text(txt, exact=False).first
                             if loc.count() > 0 and loc.is_visible(timeout=2000):
                                 with page.expect_file_chooser(timeout=10000) as fc_info:
                                     loc.click()
@@ -1105,6 +2095,11 @@ class AutoPoster:
                             continue
                 except Exception:
                     pass
+
+            if self._set_file_input(page, media_files, image_only=False):
+                logger.info(f"  📎 Input fallback: {len(media_files)} files uploaded")
+                _random_delay(2.0, 4.0)
+                return True
 
             logger.error("Upload failed — no method succeeded")
             return False
@@ -1595,7 +2590,8 @@ class AutoPoster:
             biz_id = self._resolve_business_id(page) or ""
         url = (
             f"https://business.facebook.com/latest/reels_composer/"
-            f"?asset_id={page_id}&business_id={biz_id}&ref=biz_web_home_create_reel"
+            f"?asset_id={page_id}&business_id={biz_id}"
+            f"&ir_qe_exposed=1&ref=biz_web_home_create_reel&context_ref=HOME"
         )
         if on_status:
             on_status(f"🎬 Opening Reel Composer for '{page_name}'...")
@@ -1607,6 +2603,20 @@ class AutoPoster:
         except Exception:
             pass
         _random_delay(1.5, 2.5)
+        if biz_id and self._reel_has_permission_error(page):
+            fallback_url = (
+                f"https://business.facebook.com/latest/reels_composer/"
+                f"?asset_id={page_id}&ir_qe_exposed=1"
+                f"&ref=biz_web_home_create_reel&context_ref=HOME"
+            )
+            logger.warning("  🎬 Business-specific composer denied access; retrying without business_id")
+            page.goto(fallback_url, wait_until="domcontentloaded", timeout=30000)
+            _random_delay(2.0, 3.0)
+            try:
+                page.wait_for_load_state("networkidle", timeout=15000)
+            except Exception:
+                pass
+            _random_delay(1.0, 1.5)
 
     def _reel_upload_video(self, page, temp_dir: str, on_status=None) -> bool:
         """Upload video file(s) via the Reel Composer file chooser."""
@@ -1624,6 +2634,10 @@ class AutoPoster:
             on_status("📹 Uploading video...")
 
         self._screenshot_error(page, "reel_before_upload")
+        if self._reel_has_permission_error(page):
+            logger.error(f"  Reel permission error: {self._last_error}")
+            self._screenshot_error(page, "reel_permission_error")
+            return False
 
         # Try multiple selectors for the "Thêm video" / "Add video" button
         upload_btn_texts = ["Thêm video", "Add video", "Add Video", "Tải lên", "Upload"]
@@ -1662,9 +2676,12 @@ class AutoPoster:
                 except Exception as e:
                     logger.debug(f"  🎬 selector '{sel}' failed: {e}")
             else:
-                logger.error("  🎬 Could not find upload button")
-                self._screenshot_error(page, "reel_upload_btn_fail")
-                return False
+                if self._set_file_input(page, video_files, image_only=False):
+                    logger.info("  🎬 Video set via file input fallback")
+                else:
+                    logger.error("  🎬 Could not find upload button")
+                    self._screenshot_error(page, "reel_upload_btn_fail")
+                    return False
 
         # Wait for upload to complete — poll for progress indicator disappearance
         if on_status:
@@ -1692,6 +2709,27 @@ class AutoPoster:
         _random_delay(2.0, 3.0)
         self._screenshot_error(page, "reel_after_upload")
         return True
+
+    def _reel_has_permission_error(self, page) -> bool:
+        """Detect Business Suite permission dialogs before upload starts."""
+        try:
+            text = (page.locator("body").inner_text(timeout=2000) or "").lower()
+        except Exception:
+            return False
+        checks = [
+            "chưa xử lý được yêu cầu",
+            "không có quyền truy cập",
+            "không có quyền",
+            "don't have permission",
+            "request couldn't be processed",
+        ]
+        if any(check in text for check in checks):
+            self._last_error = (
+                "Business Suite không có quyền quản lý page này trong business hiện tại. "
+                "Hãy chọn đúng account/page hoặc đồng bộ lại fanpage."
+            )
+            return True
+        return False
 
     def _reel_enter_caption(self, page, caption: str) -> None:
         """Enter description/caption in the Reel Composer."""
@@ -1768,9 +2806,15 @@ class AutoPoster:
                 try:
                     btn = page.get_by_text(txt, exact=False).first
                     if btn.is_visible(timeout=2000):
-                        with page.expect_file_chooser(timeout=8000) as fc_info:
+                        try:
+                            with page.expect_file_chooser(timeout=8000) as fc_info:
+                                btn.click()
+                            fc_info.value.set_files([image_files[0]])
+                        except Exception:
                             btn.click()
-                        fc_info.value.set_files([image_files[0]])
+                            _random_delay(0.5, 1.0)
+                            if not self._set_file_input(page, image_files[0], image_only=True):
+                                raise
                         logger.info(f"  🎬 Thumbnail uploaded: {os.path.basename(image_files[0])}")
                         _random_delay(1.5, 2.5)
                         self._screenshot_error(page, "reel_thumbnail_uploaded")
@@ -1825,6 +2869,25 @@ class AutoPoster:
             pass
 
         logger.warning("  🎬 Could not select thumbnail")
+
+    def _set_file_input(self, page, files, image_only: bool = False) -> bool:
+        """Set files on the best matching file input when no file chooser opens."""
+        accept_needles = ("image", ".jpg", ".jpeg", ".png") if image_only else ("video", ".mp4", ".mov")
+        try:
+            inputs = page.locator('input[type="file"]').all()
+        except Exception:
+            inputs = []
+        for inp in inputs:
+            try:
+                accept = (inp.get_attribute("accept") or "").lower()
+                if accept and not any(needle in accept for needle in accept_needles):
+                    continue
+                inp.set_input_files(files)
+                logger.info("  🎬 File set via input[type=file] fallback")
+                return True
+            except Exception:
+                pass
+        return False
 
     def _reel_enter_tags(self, page, temp_dir: str, folder_path: str) -> None:
         """Enter tags from key.txt / key.text file if present."""
@@ -2444,60 +3507,75 @@ class AutoPoster:
     # ─── Helpers ───────────────────────────────────────────────────────────
 
     def _get_profile_dir(self) -> str:
-        base = Path(__file__).parent.parent
         custom_profile = self._account.get("profile_dir", "")
         if custom_profile:
             d = Path(custom_profile)
             d.mkdir(parents=True, exist_ok=True)
             return str(d)
         acct_id = self._account.get("id", 0)
-        if acct_id:
-            name = f"chrome_profile_poster_{acct_id}"
-        else:
-            name = "chrome_profile_poster"
-        d = base / name
-        d.mkdir(parents=True, exist_ok=True)
-        return str(d)
+        return str(poster_profile_dir(acct_id or None))
 
-    def _do_login(self):
-        """Login using FacebookLogin engine."""
+    def _profile_is_fresh(self, profile_dir: str) -> bool:
+        """True when the Chrome user-data-dir has not built meaningful state yet."""
+        try:
+            path = Path(profile_dir)
+            for child in path.iterdir():
+                if child.name in {"SingletonCookie", "SingletonLock", "SingletonSocket"}:
+                    continue
+                return False
+            return True
+        except Exception:
+            return False
+
+    def _do_login(self, page=None):
+        """Login using FacebookLogin engine; existing cookies are checked first."""
         from core.fb_login import FacebookLogin
-        tmp = self._context.new_page()
+        tmp = page or self._context.new_page()
         try:
             login = FacebookLogin(tmp, self._account)
             success = login.ensure_logged_in()
             if not success:
-                cookie_str = self._account.get("cookie", "")
-                if cookie_str:
-                    from core.cookie_handler import parse_cookie_string
-                    cookies = parse_cookie_string(cookie_str)
-                    self._inject_cookies_raw(cookies)
-                else:
-                    logger.warning("⚠ Login failed")
+                logger.warning("⚠ Đăng nhập thất bại")
         except Exception as e:
-            logger.warning(f"Login error: {str(e)[:100]}")
+            logger.warning(f"Lỗi đăng nhập: {str(e)[:100]}")
         finally:
-            try:
-                tmp.close()
-            except Exception:
-                pass
+            if page is None:
+                try:
+                    tmp.close()
+                except Exception:
+                    pass
 
-    def _inject_cookies(self):
+    def _inject_cookies(self) -> bool:
         """Inject cookies from account cookie string."""
         cookie_str = self._account.get("cookie", "")
         if cookie_str:
             from core.cookie_handler import parse_cookie_string
             cookies = parse_cookie_string(cookie_str)
-            self._inject_cookies_raw(cookies)
+            return self._inject_cookies_raw(cookies)
+        return False
 
-    def _inject_cookies_raw(self, cookies: dict):
+    def _inject_cookies_raw(self, cookies: dict) -> bool:
         """Inject raw cookie dict via CDP."""
-        if not self._context:
-            return
+        if not self._context or not cookies:
+            return False
         tmp = self._context.new_page()
         try:
             cdp = self._context.new_cdp_session(tmp)
-            cdp.send("Network.clearBrowserCookies")
+            try:
+                existing = cdp.send("Network.getCookies", {
+                    "urls": ["https://www.facebook.com", "https://m.facebook.com"],
+                }).get("cookies", [])
+                for cookie in existing:
+                    try:
+                        cdp.send("Network.deleteCookies", {
+                            "name": cookie["name"],
+                            "domain": cookie.get("domain", ".facebook.com"),
+                            "path": cookie.get("path", "/"),
+                        })
+                    except Exception:
+                        pass
+            except Exception:
+                pass
             for name, value in cookies.items():
                 cdp.send("Network.setCookie", {
                     "name": name, "value": value,
@@ -2507,8 +3585,10 @@ class AutoPoster:
             cdp.detach()
             tmp.goto("https://www.facebook.com/", wait_until="domcontentloaded")
             time.sleep(3)
+            return True
         except Exception as e:
-            logger.error(f"Cookie injection error: {str(e)[:100]}")
+            logger.error(f"Lỗi nạp cookie vào Chrome: {str(e)[:100]}")
+            return False
         finally:
             try:
                 tmp.close()
@@ -2839,6 +3919,7 @@ class AutoPoster:
                         'saved','people','ads','business','privacy','terms',
                         'about','create','composer','manage','reels','fundraisers',
                         'policies','communitystandards','wellbeing',
+                        'profile.php','photo.php',
                     ]);
 
                     const BAD_NAME = [
@@ -2861,7 +3942,13 @@ class AutoPoster:
 
                     function extractPageId(href) {
                         try {
-                            const path = new URL(href).pathname.replace(/\/$/, '');
+                            const u = new URL(href);
+                            const path = u.pathname.replace(/\/$/, '');
+                            if (path === '/profile.php') {
+                                const id = u.searchParams.get('id');
+                                if (id && /^\d{6,}$/.test(id)) return { id, url: href };
+                                return null;
+                            }
                             const pidM = /^\/pages\/[^/]+\/(\d{6,})$/.exec(path);
                             if (pidM) return { id: pidM[1], url: href };
                             const slugM = /^\/([A-Za-z0-9][A-Za-z0-9._-]{1,79})$/.exec(path);
@@ -3009,8 +4096,17 @@ class AutoPoster:
 
                 seen_ids.add(page_id)
 
-                # Normalise URL: strip tracking params, force facebook.com domain
-                clean = href.split("?")[0].split("#")[0].rstrip("/")
+                # Normalise URL: keep profile.php?id=... because that numeric
+                # id is the only stable identifier for pages without a slug.
+                try:
+                    parsed_href = urlparse(href)
+                    if parsed_href.path.rstrip("/") == "/profile.php":
+                        pid = parse_qs(parsed_href.query).get("id", [""])[0]
+                        clean = f"https://www.facebook.com/profile.php?id={pid}" if pid else href
+                    else:
+                        clean = href.split("?")[0].split("#")[0].rstrip("/")
+                except Exception:
+                    clean = href.split("?")[0].split("#")[0].rstrip("/")
                 if not clean.startswith("http"):
                     clean = f"https://www.facebook.com{clean}"
 

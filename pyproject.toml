@@ -1,0 +1,36 @@
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+extend-exclude = [".agent", "Chrome Profiles", "_Skill tools"]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "B"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true
+follow_imports = "skip"
+check_untyped_defs = true
+show_error_codes = true
+pretty = true
+
+[tool.coverage.run]
+branch = true
+source = [
+    "core.database_maintenance",
+    "core.data_cleanup",
+    "core.job_states",
+    "core.post_queue",
+    "core.schedule_service",
+    "web.models",
+    "web.security",
+]
+
+[tool.coverage.report]
+fail_under = 75
+show_missing = true
+skip_covered = true

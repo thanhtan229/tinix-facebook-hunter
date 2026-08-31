@@ -5,6 +5,8 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.coverage
+htmlcov/
 
 # Virtual environments
 .venv/
@@ -12,6 +14,7 @@ venv/
 env/
 
 # Runtime data
+.env
 logs/
 _DOWNLOAD/
 _temp_uploads/
@@ -26,6 +29,7 @@ social_accounts_*.csv
 # Browser profiles and caches
 chrome_profile*/
 chrome_profiles/
+Chrome Profiles/
 
 # Local databases
 *.db
@@ -33,6 +37,7 @@ chrome_profiles/
 *.db-shm
 *.sqlite
 *.sqlite3
+*.pre-secrets-*.bak
 
 # OS/editor noise
 .DS_Store
