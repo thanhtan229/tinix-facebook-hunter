@@ -32,7 +32,9 @@ class ProfileBundleTests(unittest.TestCase):
         html = (root / "index.html").read_text(encoding="utf-8")
         javascript = (root / "app.js").read_text(encoding="utf-8")
         self.assertIn('id="btn-import-profile"', html)
+        self.assertIn('id="btn-export-profile"', html)
         self.assertIn("exportAccountProfile", javascript)
+        self.assertIn("exportSelectedAccountProfile", javascript)
         self.assertIn("/api/accounts/profile/import", javascript)
         self.assertIn("/api/accounts/profile/export", javascript)
 

@@ -955,6 +955,8 @@ async function loadAccounts() {
 function renderAccountsTable() {
   const tbody = document.getElementById("accounts-tbody");
   tbody.innerHTML = "";
+  const exportButton = document.getElementById("btn-export-profile");
+  if (exportButton) exportButton.disabled = state.accounts.length === 0;
 
   state.accounts.forEach(acc => {
     const tr = document.createElement("tr");
@@ -968,7 +970,6 @@ function renderAccountsTable() {
         <div style="display:flex; justify-content:flex-end; gap:6px; flex-wrap:wrap;">
           <button class="btn btn-teal btn-sm" onclick="launchAccountChrome(${Number(acc.id) || 0})">🌐 Mở Chrome</button>
           <button class="btn btn-secondary btn-sm" onclick="closeAccountChrome(${Number(acc.id) || 0})">✕ Đóng Chrome</button>
-          <button class="btn btn-secondary btn-sm" onclick="exportAccountProfile(${Number(acc.id) || 0})">⬆ Export Profile</button>
           <button class="btn btn-danger btn-sm" onclick="deleteAccount(${Number(acc.id) || 0})">🗑 Xóa</button>
         </div>
       </td>
@@ -1035,6 +1036,30 @@ async function exportAccountProfile(accId) {
   } catch (e) {
     showToast("Lỗi kết nối khi Export profile", "error");
   }
+}
+
+async function exportSelectedAccountProfile() {
+  if (!state.accounts.length) {
+    showToast("Chưa có account để Export profile", "warning");
+    return;
+  }
+
+  let account = state.accounts[0];
+  if (state.accounts.length > 1) {
+    const choices = state.accounts
+      .map((item, index) => `${index + 1}. ${item.label || item.username || `Account #${index + 1}`}`)
+      .join("\n");
+    const selected = prompt(`Chọn số thứ tự account cần Export:\n\n${choices}`, "1");
+    if (selected === null) return;
+    const selectedIndex = Number.parseInt(selected.trim(), 10) - 1;
+    if (!Number.isInteger(selectedIndex) || selectedIndex < 0 || selectedIndex >= state.accounts.length) {
+      showToast("Số thứ tự account không hợp lệ", "warning");
+      return;
+    }
+    account = state.accounts[selectedIndex];
+  }
+
+  await exportAccountProfile(account.id);
 }
 
 async function importAccountProfile() {
@@ -1191,6 +1216,8 @@ document.addEventListener("DOMContentLoaded", () => {
   });
 
   document.getElementById("btn-import-profile").addEventListener("click", importAccountProfile);
+  document.getElementById("btn-export-profile").addEventListener("click", exportSelectedAccountProfile);
+
   // Refresh Spy Button
   document.getElementById("btn-refresh-spy").addEventListener("click", loadSpyPosts);
   document.getElementById("btn-delete-spy-pages").addEventListener("click", () => cleanupSpyRepository(false));
