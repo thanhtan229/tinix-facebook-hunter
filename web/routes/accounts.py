@@ -3,6 +3,8 @@ import json
 import subprocess
 import threading
 import urllib.request
+import shutil
+import uuid
 from pathlib import Path
 from fastapi import APIRouter, HTTPException
 from pydantic import Field, HttpUrl
@@ -15,9 +17,15 @@ from core.db_storage import (
     update_account,
     delete_account,
     get_all_managed_pages,
+    get_social_accounts,
+    add_social_account,
+    update_social_account,
+    delete_social_account,
 )
-from utils.chrome_profiles import scraper_profile_dir
+from utils.chrome_profiles import scraper_profile_dir, chrome_profiles_root, project_root
+from utils.profile_bundle import ProfileBundleError, export_bundle, import_bundle_profile, read_bundle
 from utils import config
+from core.version import APP_VERSION
 from web.ws_manager import log_to_web
 from web.models import ApiRequest, model_data
 from websockets.sync.client import connect as websocket_connect
@@ -72,6 +80,14 @@ class LaunchProfileRequest(ApiRequest):
 
 class CloseProfileRequest(ApiRequest):
     account_id: int = Field(gt=0)
+
+
+class ProfileExportRequest(ApiRequest):
+    account_id: int = Field(gt=0)
+
+
+class ProfileImportRequest(ApiRequest):
+    bundle_path: str = Field(min_length=3, max_length=2_000)
 
 
 def _chrome_debug_port(account_id: int) -> int:
@@ -217,6 +233,105 @@ def close_all_chrome_profiles(_req: ApiRequest):
     closed_count = sum(1 for account_id in sorted(account_ids) if _close_managed_chrome(account_id))
     log_to_web(f"Đã đóng {closed_count} cửa sổ Chrome do Tinix quản lý.", "INFO")
     return {"status": "success", "closed_count": closed_count}
+
+
+@router.post("/profile/export")
+def export_account_profile(req: ProfileExportRequest):
+    """Export account metadata and its Chrome session as a portable Tinix bundle."""
+    db_p = get_db_path(config.get("scraper_db_path", ""))
+    account = get_account(db_p, req.account_id)
+    if account is None:
+        raise HTTPException(status_code=404, detail="Không tìm thấy tài khoản")
+    profile_value = str(account.get("profile_dir") or "").strip()
+    profile_dir = (
+        Path(profile_value).expanduser().resolve()
+        if profile_value else (chrome_profiles_root() / f"scraper_{req.account_id}").resolve()
+    )
+    name = str(account.get("label") or account.get("username") or f"Account #{req.account_id}").strip()
+    try:
+        result = export_bundle(
+            profile_dir,
+            project_root() / "exports" / "profiles",
+            {
+                "account_name": name,
+                "platform": "facebook",
+                "username": str(account.get("username") or ""),
+                "source_app": "Tinix FB Down",
+                "source_app_version": APP_VERSION,
+                "source_account_id": str(req.account_id),
+            },
+        )
+    except ProfileBundleError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    log_to_web(f"Đã Export profile “{name}” tới {result['bundle_path']}", "OK")
+    return {"status": "success", **result}
+
+
+@router.post("/profile/import")
+def import_account_profile(req: ProfileImportRequest):
+    """Create a Facebook account from a portable Tinix profile bundle."""
+    try:
+        _, manifest, _ = read_bundle(req.bundle_path)
+    except ProfileBundleError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    platform = str(manifest.get("platform") or "").strip().lower()
+    if platform != "facebook":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Tab Accounts của FB Down hiện chỉ Import Facebook; gói này là {platform or 'không xác định'}.",
+        )
+    name = str(manifest["account_name"]).strip()
+    username = str(manifest.get("username") or "").strip()
+    db_p = get_db_path(config.get("scraper_db_path", ""))
+    used_legacy_usernames = {str(item.get("username") or "") for item in get_all_accounts(db_p)}
+    stored_username = username
+    if not stored_username or stored_username in used_legacy_usernames:
+        stored_username = f"tinix-import-{uuid.uuid4().hex[:8]}"
+    legacy_id = add_account(db_p, label=name, username=stored_username, is_active=1)
+    if legacy_id < 1:
+        raise HTTPException(status_code=409, detail="Không thể tạo account từ gói profile.")
+
+    existing_social = get_social_accounts(db_p, platform="facebook")
+    social_username = stored_username
+    used_usernames = {str(item.get("username") or "") for item in existing_social}
+    if not social_username or social_username in used_usernames:
+        social_username = f"tinix-import-{legacy_id}"
+    social_id = add_social_account(
+        db_p,
+        platform="facebook",
+        label=name,
+        username=social_username,
+        profile_dir="",
+        is_active=1,
+        legacy_fb_id=legacy_id,
+        notes=f"Imported from {manifest.get('source_app') or 'Tinix profile bundle'}",
+    )
+    if social_id < 1:
+        delete_account(db_p, legacy_id)
+        raise HTTPException(status_code=409, detail="Không thể tạo liên kết Chrome profile cho account.")
+
+    destination = (chrome_profiles_root() / f"fb_{social_id}").resolve()
+    try:
+        imported_manifest, result = import_bundle_profile(req.bundle_path, destination)
+        if not update_social_account(db_p, social_id, profile_dir=str(destination)):
+            raise ProfileBundleError("Không thể lưu đường dẫn profile đã Import.")
+    except Exception as exc:
+        delete_social_account(db_p, social_id)
+        delete_account(db_p, legacy_id)
+        if destination.exists():
+            shutil.rmtree(destination)
+        if isinstance(exc, ProfileBundleError):
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        raise
+    log_to_web(f"Đã Import account “{name}” và Chrome profile từ gói Tinix.", "OK")
+    return {
+        "status": "success",
+        "account_id": legacy_id,
+        "account_name": name,
+        "platform": platform,
+        "source_app": imported_manifest.get("source_app"),
+        **result,
+    }
 
 @router.get("/managed-pages")
 def list_managed_pages():
