@@ -968,6 +968,7 @@ function renderAccountsTable() {
         <div style="display:flex; justify-content:flex-end; gap:6px; flex-wrap:wrap;">
           <button class="btn btn-teal btn-sm" onclick="launchAccountChrome(${Number(acc.id) || 0})">🌐 Mở Chrome</button>
           <button class="btn btn-secondary btn-sm" onclick="closeAccountChrome(${Number(acc.id) || 0})">✕ Đóng Chrome</button>
+          <button class="btn btn-secondary btn-sm" onclick="exportAccountProfile(${Number(acc.id) || 0})">⬆ Export Profile</button>
           <button class="btn btn-danger btn-sm" onclick="deleteAccount(${Number(acc.id) || 0})">🗑 Xóa</button>
         </div>
       </td>
@@ -1019,6 +1020,45 @@ async function closeAllAccountChrome() {
   }
 }
 
+async function exportAccountProfile(accId) {
+  const account = state.accounts.find(item => Number(item.id) === Number(accId));
+  const name = account?.label || account?.username || `Account #${accId}`;
+  if (!confirm(`Export account “${name}” cùng Chrome profile? Hãy đóng Chrome của account trước.`)) return;
+  try {
+    const res = await fetch("/api/accounts/profile/export", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ account_id: accId })
+    });
+    const json = await res.json();
+    showToast(res.ok ? `Đã Export: ${json.bundle_path}` : (json.detail || "Không thể Export profile"), res.ok ? "success" : "error");
+  } catch (e) {
+    showToast("Lỗi kết nối khi Export profile", "error");
+  }
+}
+
+async function importAccountProfile() {
+  const bundlePath = prompt("Nhập đường dẫn tuyệt đối tới thư mục gói .tinix-profile:");
+  if (!bundlePath) return;
+  if (!confirm("Tinix sẽ tạo account cùng tên và sao chép Chrome profile từ gói. Chrome nguồn phải được đóng. Tiếp tục?")) return;
+  try {
+    const res = await fetch("/api/accounts/profile/import", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ bundle_path: bundlePath })
+    });
+    const json = await res.json();
+    if (!res.ok) {
+      showToast(json.detail || "Không thể Import profile", "error");
+      return;
+    }
+    await loadAccounts();
+    fetchStats();
+    showToast(`Đã Import account “${json.account_name}”`, "success");
+  } catch (e) {
+    showToast("Lỗi kết nối khi Import profile", "error");
+  }
+}
 async function deleteAccount(accId) {
   if (!confirm(`Bạn có chắc muốn xóa tài khoản #${accId}?`)) return;
   try {
@@ -1150,6 +1190,7 @@ document.addEventListener("DOMContentLoaded", () => {
     `);
   });
 
+  document.getElementById("btn-import-profile").addEventListener("click", importAccountProfile);
   // Refresh Spy Button
   document.getElementById("btn-refresh-spy").addEventListener("click", loadSpyPosts);
   document.getElementById("btn-delete-spy-pages").addEventListener("click", () => cleanupSpyRepository(false));
