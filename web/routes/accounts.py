@@ -30,6 +30,8 @@ from utils.profile_bundle import (
     extracted_profiles_archive,
     import_bundle_profile,
     import_profile_from_directory,
+    cleanup_profiles as cleanup_chrome_profile_data,
+    preview_profiles_cleanup,
     read_bundle,
 )
 from utils import config
@@ -304,6 +306,45 @@ def export_all_account_profiles():
     except ProfileBundleError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     log_to_web(f"Đã Export {result['accounts_exported']} profile vào {result['archive_path']}", "OK")
+    return {"status": "success", **result}
+
+
+def _cleanup_profile_sources(db_p: str) -> list[tuple[Path, str]]:
+    profiles: list[tuple[Path, str]] = []
+    for account in get_all_accounts(db_p):
+        account_id = int(account["id"])
+        profile_value = str(account.get("profile_dir") or "").strip()
+        profile_dir = (
+            Path(profile_value).expanduser().resolve()
+            if profile_value else (chrome_profiles_root() / f"scraper_{account_id}").resolve()
+        )
+        name = str(account.get("label") or account.get("username") or f"Account #{account_id}").strip()
+        profiles.append((profile_dir, name))
+    return profiles
+
+
+@router.get("/profile/cleanup-preview")
+def preview_account_profiles_cleanup():
+    db_p = get_db_path(config.get("scraper_db_path", ""))
+    try:
+        result = preview_profiles_cleanup(_cleanup_profile_sources(db_p))
+    except ProfileBundleError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {"status": "success", **result}
+
+
+@router.post("/profile/cleanup")
+def cleanup_account_profiles():
+    db_p = get_db_path(config.get("scraper_db_path", ""))
+    log_to_web("Bắt đầu dọn cache và dữ liệu tạm của các Chrome profile.", "INFO")
+    try:
+        result = cleanup_chrome_profile_data(_cleanup_profile_sources(db_p))
+    except ProfileBundleError as exc:
+        log_to_web(f"Không thể dọn Chrome profile: {exc}", "ERROR")
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    log_to_web(
+        f"Đã dọn {result['profiles_cleaned']} profile, giải phóng {result['bytes_freed']} byte.", "OK"
+    )
     return {"status": "success", **result}
 
 

@@ -9,10 +9,12 @@ from unittest.mock import patch
 
 from core.db_storage import add_account, add_social_account, get_all_accounts, initialize_database
 from utils.profile_bundle import (
+    cleanup_profiles,
     export_bundle,
     export_profiles_archive,
     extracted_profiles_archive,
     import_bundle_profile,
+    preview_profiles_cleanup,
     read_bundle,
 )
 from web.routes.accounts import (
@@ -30,6 +32,8 @@ def make_profile(path: Path, session: str = "session") -> Path:
     (path / "Default" / "Preferences").write_text("{}", encoding="utf-8")
     (path / "Default" / "Cookies").write_text(session, encoding="utf-8")
     (path / "Default" / "Cache" / "ignored.bin").write_bytes(b"cache")
+    (path / "optimization_guide_model_store").mkdir()
+    (path / "optimization_guide_model_store" / "model.tflite").write_bytes(b"model-cache")
     (path / "SingletonLock").write_text("lock", encoding="utf-8")
     return path
 
@@ -41,6 +45,7 @@ class ProfileBundleTests(unittest.TestCase):
         javascript = (root / "app.js").read_text(encoding="utf-8")
         self.assertIn('id="btn-import-profile"', html)
         self.assertIn('id="btn-export-profile"', html)
+        self.assertIn('id="btn-cleanup-profiles"', html)
         self.assertIn("exportAccountProfile", javascript)
         self.assertIn("exportAllAccountProfiles", javascript)
         self.assertIn("submitProfilesZipImport", javascript)
@@ -71,6 +76,9 @@ class ProfileBundleTests(unittest.TestCase):
             with zipfile.ZipFile(archive) as bundle:
                 manifest = json.loads(bundle.read("manifest.json"))
                 self.assertEqual(manifest["bundle_format"], "tinix-profiles")
+                self.assertEqual(manifest["profile_content"], "session-only-v1")
+                self.assertNotIn("profiles/0001/Default/Cache/ignored.bin", bundle.namelist())
+                self.assertNotIn("profiles/0001/optimization_guide_model_store/model.tflite", bundle.namelist())
             with extracted_profiles_archive(str(archive)) as (manifest, entries):
                 self.assertEqual(manifest["source_app"], "Tinix Social Hub")
                 self.assertEqual({item[0]["platform"] for item in entries}, {"facebook", "youtube"})
@@ -110,6 +118,23 @@ class ProfileBundleTests(unittest.TestCase):
             self.assertEqual(imported_manifest["username"], "demo")
             self.assertEqual(Path(result["profile_path"]), destination)
             self.assertEqual((destination / "Default" / "Cookies").read_text(), "session")
+
+    def test_cleanup_keeps_session_and_storage(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            profile = make_profile(Path(directory) / "fb_1", "keep-session")
+            (profile / "Default" / "Local Storage" / "leveldb").mkdir(parents=True)
+            (profile / "Default" / "Local Storage" / "leveldb" / "state").write_text("keep")
+            profiles = [(profile, "Facebook chính")]
+
+            preview = preview_profiles_cleanup(profiles)
+            self.assertGreater(preview["bytes_removable"], 0)
+            result = cleanup_profiles(profiles)
+
+            self.assertEqual(result["profiles_cleaned"], 1)
+            self.assertFalse((profile / "Default" / "Cache").exists())
+            self.assertFalse((profile / "optimization_guide_model_store").exists())
+            self.assertEqual((profile / "Default" / "Cookies").read_text(), "keep-session")
+            self.assertEqual((profile / "Default" / "Local Storage" / "leveldb" / "state").read_text(), "keep")
 
     def test_accepts_social_hub_manifest(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

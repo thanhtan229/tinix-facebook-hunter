@@ -10,4 +10,6 @@ Mở **Quản Lý Tài Khoản & Chrome Profiles**, đóng Chrome của tất c�
 
 Chọn **Import Profiles ZIP** và dán đường dẫn tuyệt đối tới file ZIP. FB Down tạo toàn bộ account Facebook cùng tên và sao chép từng Chrome profile vào thư mục do app quản lý. Nếu ZIP từ Social Hub có nền tảng khác, FB Down bỏ qua các profile không phải Facebook và báo số lượng.
 
-Định dạng thư mục `.tinix-profile` cũ vẫn được hỗ trợ. File ZIP không lấy mật khẩu, mã 2FA, mật khẩu email hay cookie riêng từ cơ sở dữ liệu ứng dụng. Cache và Chrome lock file bị loại bỏ.
+Định dạng thư mục `.tinix-profile` cũ vẫn được hỗ trợ. File ZIP mới có `profile_content: "session-only-v1"` và chỉ lưu tên account cùng trạng thái cần cho phiên Chrome (Local State, Preferences, cookies, Local/Session Storage, IndexedDB và WebStorage). Mật khẩu, mã 2FA, mật khẩu email, cache, model Chromium và file tạm không được đóng gói.
+
+Nút **Dọn profile** quét trước dung lượng có thể giải phóng rồi xóa cache/model có thể tạo lại của tất cả profile. Phải đóng Chrome trước khi chạy; dữ liệu phiên đăng nhập và thông tin account được giữ nguyên.

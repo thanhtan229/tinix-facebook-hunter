@@ -28,6 +28,17 @@ CACHE_DIRECTORIES = {
     "cache", "code cache", "gpucache", "shadercache", "grshadercache",
     "dawncache", "crashpad", "component_crx_cache",
 }
+CLEANUP_DIRECTORIES = CACHE_DIRECTORIES | {
+    "browsermetrics", "cache_storage", "cachestorage", "crash reports",
+    "media cache", "optimization_guide_model_store", "safe browsing",
+    "wasmttsengine",
+}
+SESSION_ROOT_FILES = {"local state"}
+SESSION_PROFILE_FILES = {
+    "cookies", "cookies-journal", "cookies-shm", "cookies-wal",
+    "preferences", "secure preferences",
+}
+SESSION_PROFILE_DIRECTORIES = {"indexeddb", "local storage", "session storage", "webstorage"}
 LOCK_FILES = {"singletonlock", "singletoncookie", "singletonsocket", "lockfile"}
 REPARSE_POINT = 0x400
 
@@ -101,6 +112,139 @@ def _copy_tree(source: Path, destination: Path) -> tuple[int, int]:
     return files, total
 
 
+def _copy_session_profile(source: Path, destination: Path) -> tuple[int, int]:
+    """Copy only Chrome state needed to carry signed-in web sessions."""
+    files = 0
+    total = 0
+    destination.mkdir(parents=True, exist_ok=False)
+
+    def copy_file(source_file: Path, destination_file: Path) -> None:
+        nonlocal files, total
+        if not source_file.is_file() or _is_reparse(source_file):
+            return
+        destination_file.parent.mkdir(parents=True, exist_ok=True)
+        size = source_file.stat(follow_symlinks=False).st_size
+        shutil.copy2(source_file, destination_file)
+        files += 1
+        total += size
+
+    for item in source.iterdir():
+        if item.is_file() and item.name.lower() in SESSION_ROOT_FILES:
+            copy_file(item, destination / item.name)
+
+    for profile in [source / "Default", *source.glob("Profile *")]:
+        if not profile.is_dir() or _is_reparse(profile):
+            continue
+        target_profile = destination / profile.name
+        target_profile.mkdir(parents=True, exist_ok=True)
+        for item in profile.iterdir():
+            lowered = item.name.lower()
+            if item.is_file() and lowered in SESSION_PROFILE_FILES:
+                copy_file(item, target_profile / item.name)
+            elif item.is_dir() and lowered == "network":
+                for network_file in item.iterdir():
+                    if network_file.is_file() and network_file.name.lower() in SESSION_PROFILE_FILES:
+                        copy_file(network_file, target_profile / item.name / network_file.name)
+            elif item.is_dir() and lowered in SESSION_PROFILE_DIRECTORIES:
+                copied_files, copied_size = _copy_tree(item, target_profile / item.name)
+                files += copied_files
+                total += copied_size
+
+    validate_chrome_profile(destination)
+    return files, total
+
+
+def _cleanup_candidates(profile: Path) -> list[tuple[Path, int, int]]:
+    candidates: list[tuple[Path, int, int]] = []
+
+    def directory_size(path: Path) -> tuple[int, int]:
+        count = 0
+        size = 0
+        for root, directories, filenames in os.walk(path, followlinks=False):
+            directories[:] = [name for name in directories if not _is_reparse(Path(root) / name)]
+            for name in filenames:
+                item = Path(root) / name
+                if _is_reparse(item):
+                    continue
+                try:
+                    size += item.stat(follow_symlinks=False).st_size
+                    count += 1
+                except OSError:
+                    continue
+        return count, size
+
+    def visit(current: Path) -> None:
+        with os.scandir(current) as entries:
+            for entry in entries:
+                if not entry.is_dir(follow_symlinks=False):
+                    continue
+                item = Path(entry.path)
+                if _is_reparse(item):
+                    continue
+                if entry.name.lower() in CLEANUP_DIRECTORIES:
+                    count, size = directory_size(item)
+                    candidates.append((item, count, size))
+                else:
+                    visit(item)
+
+    visit(profile)
+    return candidates
+
+
+def preview_profiles_cleanup(profiles: list[tuple[Path, str]]) -> dict[str, Any]:
+    results = []
+    total_files = 0
+    total_bytes = 0
+    chrome_running = 0
+    for profile, name in profiles:
+        profile = profile.resolve()
+        if not profile.exists():
+            continue
+        validate_chrome_profile(profile)
+        candidates = _cleanup_candidates(profile)
+        files = sum(item[1] for item in candidates)
+        size = sum(item[2] for item in candidates)
+        running = _chrome_uses_path(profile)
+        chrome_running += int(running)
+        total_files += files
+        total_bytes += size
+        results.append({"account_name": name, "files": files, "bytes": size, "chrome_running": running})
+    return {
+        "profiles_scanned": len(results), "chrome_running": chrome_running,
+        "files_removable": total_files, "bytes_removable": total_bytes, "profiles": results,
+    }
+
+
+def cleanup_profiles(profiles: list[tuple[Path, str]]) -> dict[str, Any]:
+    preview = preview_profiles_cleanup(profiles)
+    if preview["chrome_running"]:
+        raise ProfileBundleError("Chrome đang sử dụng một hoặc nhiều profile. Hãy đóng tất cả Chrome trước khi dọn dẹp.")
+    removed_directories = 0
+    removed_files = 0
+    bytes_freed = 0
+    profiles_cleaned = 0
+    for profile, _ in profiles:
+        profile = profile.resolve()
+        if not profile.exists():
+            continue
+        validate_chrome_profile(profile)
+        if _chrome_uses_path(profile):
+            raise ProfileBundleError(f"Chrome đang sử dụng profile “{profile}”; hãy đóng Chrome trước khi dọn dẹp.")
+        candidates = _cleanup_candidates(profile)
+        if candidates:
+            profiles_cleaned += 1
+        for path, files, size in candidates:
+            shutil.rmtree(path)
+            removed_directories += 1
+            removed_files += files
+            bytes_freed += size
+    return {
+        "profiles_scanned": preview["profiles_scanned"], "profiles_cleaned": profiles_cleaned,
+        "directories_removed": removed_directories, "files_removed": removed_files,
+        "bytes_freed": bytes_freed,
+    }
+
+
 def _safe_label(value: str) -> str:
     clean = re.sub(r"[^A-Za-z0-9._-]+", "-", value.strip()).strip("-.")
     return clean[:60] or "profile"
@@ -140,13 +284,14 @@ def export_bundle(source: Path, export_root: Path, manifest: dict[str, Any]) -> 
     destination = export_root / f"{_safe_label(str(manifest['account_name']))}-{timestamp}.tinix-profile"
     staging = Path(tempfile.mkdtemp(prefix=f".{destination.name}-", dir=export_root))
     try:
-        files, size = _copy_tree(source, staging / "chrome-profile")
+        files, size = _copy_session_profile(source, staging / "chrome-profile")
         validate_chrome_profile(staging / "chrome-profile")
         payload = {
             "bundle_format": BUNDLE_FORMAT,
             "format_version": BUNDLE_VERSION,
             **manifest,
             "exported_at": datetime.now(timezone.utc).isoformat(),
+            "profile_content": "session-only-v1",
         }
         (staging / "manifest.json").write_text(
             json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -213,7 +358,7 @@ def export_profiles_archive(
     try:
         for index, (source, metadata) in enumerate(resolved, 1):
             relative = f"profiles/{index:04d}"
-            copied_files, copied_size = _copy_tree(source, staging / relative)
+            copied_files, copied_size = _copy_session_profile(source, staging / relative)
             files += copied_files
             size += copied_size
             accounts.append({**metadata, "profile_path": relative})
@@ -222,6 +367,7 @@ def export_profiles_archive(
             "format_version": COLLECTION_VERSION,
             "source_app": source_app,
             "source_app_version": source_app_version,
+            "profile_content": "session-only-v1",
             "exported_at": datetime.now(timezone.utc).isoformat(),
             "accounts": accounts,
         }
