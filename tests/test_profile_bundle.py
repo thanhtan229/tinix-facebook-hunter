@@ -156,7 +156,11 @@ class ProfileBundleTests(unittest.TestCase):
             root = Path(directory)
             db_path = str(root / "tinix.db")
             initialize_database(db_path)
-            legacy_id = add_account(db_path, label="Tên giữ nguyên", username="demo")
+            legacy_id = add_account(
+                db_path, label="Tên giữ nguyên", username="demo", email="demo@example.com",
+                password="fb-password", secret_2fa="JBSWY3DPEHPK3PXP",
+                email_pass="mail-password", cookie="db-cookie",
+            )
             source = make_profile(root / "profiles" / "fb_source")
             add_social_account(
                 db_path, platform="facebook", label="Tên giữ nguyên", username="demo",
@@ -177,6 +181,11 @@ class ProfileBundleTests(unittest.TestCase):
             accounts = get_all_accounts(db_path)
             imported_account = next(item for item in accounts if item["id"] == imported["account_id"])
             self.assertEqual(imported_account["label"], "Tên giữ nguyên")
+            self.assertEqual(imported_account["email"], "demo@example.com")
+            self.assertEqual(imported_account["password"], "fb-password")
+            self.assertEqual(imported_account["secret_2fa"], "JBSWY3DPEHPK3PXP")
+            self.assertEqual(imported_account["email_pass"], "mail-password")
+            self.assertEqual(imported_account["cookie"], "db-cookie")
             self.assertEqual(imported["platform"], "facebook")
             self.assertTrue(Path(imported["profile_path"]).is_dir())
 

@@ -292,6 +292,7 @@ def export_bundle(source: Path, export_root: Path, manifest: dict[str, Any]) -> 
             **manifest,
             "exported_at": datetime.now(timezone.utc).isoformat(),
             "profile_content": "session-only-v1",
+            "contains_account_secrets": True,
         }
         (staging / "manifest.json").write_text(
             json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -368,6 +369,7 @@ def export_profiles_archive(
             "source_app": source_app,
             "source_app_version": source_app_version,
             "profile_content": "session-only-v1",
+            "contains_account_secrets": True,
             "exported_at": datetime.now(timezone.utc).isoformat(),
             "accounts": accounts,
         }

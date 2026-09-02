@@ -1046,12 +1046,12 @@ async function exportAllAccountProfiles() {
     return;
   }
   const button = document.getElementById("btn-export-profile");
-  const originalLabel = button?.textContent || "⬆ Export All Profiles ZIP";
+  const originalLabel = button?.textContent || "⬆ Export Account & Sessions ZIP";
   if (button) {
     button.disabled = true;
     button.textContent = "⏳ Đang sao chép và nén...";
   }
-  showToast("Đang Export toàn bộ profile. Vui lòng chờ, không đóng app...", "info");
+  showToast("Đang Export thông tin account và phiên Chrome. File ZIP chứa dữ liệu đăng nhập, hãy bảo quản cẩn thận...", "info");
   try {
     const res = await fetch("/api/accounts/profile/export-all", {method: "POST"});
     const json = await res.json();

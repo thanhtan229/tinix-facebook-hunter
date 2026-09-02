@@ -266,6 +266,11 @@ def export_account_profile(req: ProfileExportRequest):
                 "account_name": name,
                 "platform": "facebook",
                 "username": str(account.get("username") or ""),
+                "email": str(account.get("email") or ""),
+                "password": str(account.get("password") or ""),
+                "secret_2fa": str(account.get("secret_2fa") or ""),
+                "email_pass": str(account.get("email_pass") or ""),
+                "cookie": str(account.get("cookie") or ""),
                 "source_app": "Tinix FB Down",
                 "source_app_version": APP_VERSION,
                 "source_account_id": str(req.account_id),
@@ -293,6 +298,11 @@ def export_all_account_profiles():
             "account_name": str(account.get("label") or account.get("username") or f"Account #{account_id}").strip(),
             "platform": "facebook",
             "username": str(account.get("username") or ""),
+            "email": str(account.get("email") or ""),
+            "password": str(account.get("password") or ""),
+            "secret_2fa": str(account.get("secret_2fa") or ""),
+            "email_pass": str(account.get("email_pass") or ""),
+            "cookie": str(account.get("cookie") or ""),
             "source_account_id": str(account_id),
         }))
     log_to_web(f"Bắt đầu Export {len(profiles)} account/profile. Quá trình sao chép và nén có thể mất vài phút.", "INFO")
@@ -355,7 +365,13 @@ def _create_account_from_profile(db_p: str, metadata: dict[str, Any], source_pro
     stored_username = username
     if not stored_username or stored_username in used_legacy_usernames:
         stored_username = f"tinix-import-{uuid.uuid4().hex[:8]}"
-    legacy_id = add_account(db_p, label=name, username=stored_username, is_active=1)
+    legacy_id = add_account(
+        db_p, label=name, username=stored_username,
+        email=str(metadata.get("email") or ""), password=str(metadata.get("password") or ""),
+        secret_2fa=str(metadata.get("secret_2fa") or ""),
+        email_pass=str(metadata.get("email_pass") or ""), cookie=str(metadata.get("cookie") or ""),
+        is_active=1,
+    )
     if legacy_id < 1:
         raise ProfileBundleError(f"Không thể tạo account “{name}”.")
 
@@ -451,7 +467,13 @@ def import_account_profile(req: ProfileImportRequest):
     stored_username = username
     if not stored_username or stored_username in used_legacy_usernames:
         stored_username = f"tinix-import-{uuid.uuid4().hex[:8]}"
-    legacy_id = add_account(db_p, label=name, username=stored_username, is_active=1)
+    legacy_id = add_account(
+        db_p, label=name, username=stored_username,
+        email=str(manifest.get("email") or ""), password=str(manifest.get("password") or ""),
+        secret_2fa=str(manifest.get("secret_2fa") or ""),
+        email_pass=str(manifest.get("email_pass") or ""), cookie=str(manifest.get("cookie") or ""),
+        is_active=1,
+    )
     if legacy_id < 1:
         raise HTTPException(status_code=409, detail="Không thể tạo account từ gói profile.")
 
