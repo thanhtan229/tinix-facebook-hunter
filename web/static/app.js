@@ -957,6 +957,8 @@ function renderAccountsTable() {
   tbody.innerHTML = "";
   const exportButton = document.getElementById("btn-export-profile");
   if (exportButton) exportButton.disabled = state.accounts.length === 0;
+  const cleanupButton = document.getElementById("btn-cleanup-profiles");
+  if (cleanupButton) cleanupButton.disabled = state.accounts.length === 0;
 
   state.accounts.forEach(acc => {
     const tr = document.createElement("tr");
@@ -1064,6 +1066,64 @@ async function exportAllAccountProfiles() {
   }
 }
 
+
+function formatProfileBytes(value) {
+  if (!value) return "0 B";
+  const units = ["B", "KB", "MB", "GB"];
+  const index = Math.min(Math.floor(Math.log(value) / Math.log(1024)), units.length - 1);
+  return `${(value / (1024 ** index)).toFixed(index ? 1 : 0)} ${units[index]}`;
+}
+
+async function previewProfilesCleanup() {
+  try {
+    const res = await fetch("/api/accounts/profile/cleanup-preview");
+    const json = await res.json();
+    if (!res.ok) {
+      showToast(json.detail || "Không thể quét profile", "error");
+      return;
+    }
+    let summary = `Có thể giải phóng khoảng <strong>${formatProfileBytes(json.bytes_removable)}</strong> (${json.files_removable} file) trong ${json.profiles_scanned} profile.`;
+    if (json.chrome_running) summary += `<br><span class="text-danger">Có ${json.chrome_running} profile đang được Chrome sử dụng. Hãy đóng Chrome trước.</span>`;
+    if (!json.bytes_removable) summary += `<br>Hiện không có dữ liệu cần dọn.`;
+    const disabled = json.chrome_running || !json.bytes_removable ? "disabled" : "";
+    openModal("🧹 Dọn dẹp Chrome profile", `
+      <div class="account-editor-form">
+        <p>${summary}</p>
+        <small>Chỉ xóa cache, model và dữ liệu tạm có thể tạo lại. Cookies, phiên đăng nhập, Local Storage, IndexedDB và thông tin account được giữ nguyên.</small>
+      </div>
+    `, `
+      <button class="btn btn-secondary" onclick="closeModal()">Hủy</button>
+      <button class="btn btn-danger" id="confirm-profile-cleanup" onclick="runProfilesCleanup()" ${disabled}>Dọn dẹp ngay</button>
+    `);
+  } catch (e) {
+    showToast("Lỗi kết nối khi quét profile", "error");
+  }
+}
+
+async function runProfilesCleanup() {
+  const button = document.getElementById("confirm-profile-cleanup");
+  if (button) {
+    button.disabled = true;
+    button.textContent = "Đang dọn dẹp...";
+  }
+  try {
+    const res = await fetch("/api/accounts/profile/cleanup", {method: "POST"});
+    const json = await res.json();
+    if (!res.ok) {
+      showToast(json.detail || "Không thể dọn profile", "error");
+      return;
+    }
+    closeModal();
+    showToast(`Đã dọn ${json.profiles_cleaned} profile, giải phóng ${formatProfileBytes(json.bytes_freed)}`, "success");
+  } catch (e) {
+    showToast("Lỗi kết nối khi dọn profile", "error");
+  } finally {
+    if (button) {
+      button.disabled = false;
+      button.textContent = "Dọn dẹp ngay";
+    }
+  }
+}
 function importAccountProfile() {
   openModal("⬇ Import Profiles ZIP", `
     <div class="account-editor-form">
@@ -1241,6 +1301,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
   document.getElementById("btn-import-profile").addEventListener("click", importAccountProfile);
   document.getElementById("btn-export-profile").addEventListener("click", exportAllAccountProfiles);
+  document.getElementById("btn-cleanup-profiles").addEventListener("click", previewProfilesCleanup);
 
   // Refresh Spy Button
   document.getElementById("btn-refresh-spy").addEventListener("click", loadSpyPosts);
