@@ -23,7 +23,15 @@ from core.db_storage import (
     delete_social_account,
 )
 from utils.chrome_profiles import scraper_profile_dir, chrome_profiles_root, project_root
-from utils.profile_bundle import ProfileBundleError, export_bundle, import_bundle_profile, read_bundle
+from utils.profile_bundle import (
+    ProfileBundleError,
+    export_bundle,
+    export_profiles_archive,
+    extracted_profiles_archive,
+    import_bundle_profile,
+    import_profile_from_directory,
+    read_bundle,
+)
 from utils import config
 from core.version import APP_VERSION
 from web.ws_manager import log_to_web
@@ -267,9 +275,123 @@ def export_account_profile(req: ProfileExportRequest):
     return {"status": "success", **result}
 
 
+@router.post("/profile/export-all")
+def export_all_account_profiles():
+    """Export every Facebook account/profile into one cross-app ZIP archive."""
+    db_p = get_db_path(config.get("scraper_db_path", ""))
+    profiles: list[tuple[Path, dict[str, Any]]] = []
+    for account in get_all_accounts(db_p):
+        account_id = int(account["id"])
+        profile_value = str(account.get("profile_dir") or "").strip()
+        profile_dir = (
+            Path(profile_value).expanduser().resolve()
+            if profile_value else (chrome_profiles_root() / f"scraper_{account_id}").resolve()
+        )
+        profiles.append((profile_dir, {
+            "account_name": str(account.get("label") or account.get("username") or f"Account #{account_id}").strip(),
+            "platform": "facebook",
+            "username": str(account.get("username") or ""),
+            "source_account_id": str(account_id),
+        }))
+    try:
+        result = export_profiles_archive(
+            profiles,
+            project_root() / "exports" / "profiles",
+            source_app="Tinix FB Down",
+            source_app_version=APP_VERSION,
+        )
+    except ProfileBundleError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    log_to_web(f"Đã Export {result['accounts_exported']} profile vào {result['archive_path']}", "OK")
+    return {"status": "success", **result}
+
+
+def _create_account_from_profile(db_p: str, metadata: dict[str, Any], source_profile: Path) -> dict[str, Any]:
+    name = str(metadata["account_name"]).strip()
+    username = str(metadata.get("username") or "").strip()
+    used_legacy_usernames = {str(item.get("username") or "") for item in get_all_accounts(db_p)}
+    stored_username = username
+    if not stored_username or stored_username in used_legacy_usernames:
+        stored_username = f"tinix-import-{uuid.uuid4().hex[:8]}"
+    legacy_id = add_account(db_p, label=name, username=stored_username, is_active=1)
+    if legacy_id < 1:
+        raise ProfileBundleError(f"Không thể tạo account “{name}”.")
+
+    social_username = stored_username
+    used_social_usernames = {str(item.get("username") or "") for item in get_social_accounts(db_p, platform="facebook")}
+    if not social_username or social_username in used_social_usernames:
+        social_username = f"tinix-import-{legacy_id}"
+    social_id = add_social_account(
+        db_p,
+        platform="facebook",
+        label=name,
+        username=social_username,
+        profile_dir="",
+        is_active=1,
+        legacy_fb_id=legacy_id,
+        notes=f"Imported from {metadata.get('source_app') or 'Tinix profiles archive'}",
+    )
+    if social_id < 1:
+        delete_account(db_p, legacy_id)
+        raise ProfileBundleError(f"Không thể tạo liên kết Chrome profile cho “{name}”.")
+    destination = (chrome_profiles_root() / f"fb_{social_id}").resolve()
+    try:
+        result = import_profile_from_directory(source_profile, destination)
+        if not update_social_account(db_p, social_id, profile_dir=str(destination)):
+            raise ProfileBundleError("Không thể lưu đường dẫn profile đã Import.")
+    except Exception:
+        delete_social_account(db_p, social_id)
+        delete_account(db_p, legacy_id)
+        if destination.exists():
+            shutil.rmtree(destination)
+        raise
+    return {
+        "account_id": legacy_id,
+        "social_account_id": social_id,
+        "account_name": name,
+        "platform": "facebook",
+        **result,
+    }
+
+
 @router.post("/profile/import")
 def import_account_profile(req: ProfileImportRequest):
-    """Create a Facebook account from a portable Tinix profile bundle."""
+    """Import one legacy bundle or every Facebook profile from a Tinix ZIP."""
+    source_path = Path(os.path.expandvars(os.path.expanduser(req.bundle_path))).resolve()
+    if source_path.is_file():
+        db_p = get_db_path(config.get("scraper_db_path", ""))
+        imported: list[dict[str, Any]] = []
+        try:
+            with extracted_profiles_archive(req.bundle_path) as (archive_manifest, entries):
+                facebook_entries = [(metadata, profile) for metadata, profile in entries if metadata["platform"] == "facebook"]
+                skipped = [metadata["account_name"] for metadata, _ in entries if metadata["platform"] != "facebook"]
+                if not facebook_entries:
+                    raise ProfileBundleError("File ZIP không có profile Facebook để Import vào FB Down.")
+                for metadata, profile in facebook_entries:
+                    imported.append(_create_account_from_profile(
+                        db_p, {**metadata, "source_app": archive_manifest.get("source_app")}, profile
+                    ))
+                result = {
+                    "status": "success",
+                    "accounts_imported": len(imported),
+                    "accounts": imported,
+                    "profiles_skipped": len(skipped),
+                    "skipped_accounts": skipped,
+                    "source_app": archive_manifest.get("source_app"),
+                }
+        except Exception as exc:
+            for account in reversed(imported):
+                profile = Path(str(account.get("profile_path") or ""))
+                delete_social_account(db_p, int(account["social_account_id"]))
+                delete_account(db_p, int(account["account_id"]))
+                if profile.is_dir() and profile.parent == chrome_profiles_root().resolve():
+                    shutil.rmtree(profile)
+            if isinstance(exc, ProfileBundleError):
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            raise
+        log_to_web(f"Đã Import {len(imported)} account/profile Facebook từ một file ZIP.", "OK")
+        return result
+
     try:
         _, manifest, _ = read_bundle(req.bundle_path)
     except ProfileBundleError as exc:

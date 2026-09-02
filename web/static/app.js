@@ -1038,34 +1038,25 @@ async function exportAccountProfile(accId) {
   }
 }
 
-async function exportSelectedAccountProfile() {
+async function exportAllAccountProfiles() {
   if (!state.accounts.length) {
     showToast("Chưa có account để Export profile", "warning");
     return;
   }
-
-  let account = state.accounts[0];
-  if (state.accounts.length > 1) {
-    const choices = state.accounts
-      .map((item, index) => `${index + 1}. ${item.label || item.username || `Account #${index + 1}`}`)
-      .join("\n");
-    const selected = prompt(`Chọn số thứ tự account cần Export:\n\n${choices}`, "1");
-    if (selected === null) return;
-    const selectedIndex = Number.parseInt(selected.trim(), 10) - 1;
-    if (!Number.isInteger(selectedIndex) || selectedIndex < 0 || selectedIndex >= state.accounts.length) {
-      showToast("Số thứ tự account không hợp lệ", "warning");
-      return;
-    }
-    account = state.accounts[selectedIndex];
+  if (!confirm("Đóng Chrome của TẤT CẢ account trước khi Export. File ZIP sẽ chứa toàn bộ phiên đăng nhập. Tiếp tục?")) return;
+  try {
+    const res = await fetch("/api/accounts/profile/export-all", {method: "POST"});
+    const json = await res.json();
+    showToast(res.ok ? `Đã Export ${json.accounts_exported} profile: ${json.archive_path}` : (json.detail || "Không thể Export profiles"), res.ok ? "success" : "error");
+  } catch (e) {
+    showToast("Lỗi kết nối khi Export profiles", "error");
   }
-
-  await exportAccountProfile(account.id);
 }
 
 async function importAccountProfile() {
-  const bundlePath = prompt("Nhập đường dẫn tuyệt đối tới thư mục gói .tinix-profile:");
+  const bundlePath = prompt("Nhập đường dẫn tuyệt đối tới file .tinix-profiles.zip (vẫn hỗ trợ thư mục .tinix-profile cũ):");
   if (!bundlePath) return;
-  if (!confirm("Tinix sẽ tạo account cùng tên và sao chép Chrome profile từ gói. Chrome nguồn phải được đóng. Tiếp tục?")) return;
+  if (!confirm("Tinix sẽ tạo toàn bộ account Facebook và sao chép các Chrome profile từ file ZIP. Tiếp tục?")) return;
   try {
     const res = await fetch("/api/accounts/profile/import", {
       method: "POST",
@@ -1079,7 +1070,9 @@ async function importAccountProfile() {
     }
     await loadAccounts();
     fetchStats();
-    showToast(`Đã Import account “${json.account_name}”`, "success");
+    const count = json.accounts_imported || 1;
+    const skipped = json.profiles_skipped ? `; bỏ qua ${json.profiles_skipped} profile không phải Facebook` : "";
+    showToast(`Đã Import ${count} account/profile${skipped}`, "success");
   } catch (e) {
     showToast("Lỗi kết nối khi Import profile", "error");
   }
@@ -1216,7 +1209,7 @@ document.addEventListener("DOMContentLoaded", () => {
   });
 
   document.getElementById("btn-import-profile").addEventListener("click", importAccountProfile);
-  document.getElementById("btn-export-profile").addEventListener("click", exportSelectedAccountProfile);
+  document.getElementById("btn-export-profile").addEventListener("click", exportAllAccountProfiles);
 
   // Refresh Spy Button
   document.getElementById("btn-refresh-spy").addEventListener("click", loadSpyPosts);
