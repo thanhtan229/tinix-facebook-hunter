@@ -293,6 +293,7 @@ def export_all_account_profiles():
             "username": str(account.get("username") or ""),
             "source_account_id": str(account_id),
         }))
+    log_to_web(f"Bắt đầu Export {len(profiles)} account/profile. Quá trình sao chép và nén có thể mất vài phút.", "INFO")
     try:
         result = export_profiles_archive(
             profiles,

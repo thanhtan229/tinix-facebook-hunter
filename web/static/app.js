@@ -1043,20 +1043,51 @@ async function exportAllAccountProfiles() {
     showToast("Chưa có account để Export profile", "warning");
     return;
   }
-  if (!confirm("Đóng Chrome của TẤT CẢ account trước khi Export. File ZIP sẽ chứa toàn bộ phiên đăng nhập. Tiếp tục?")) return;
+  const button = document.getElementById("btn-export-profile");
+  const originalLabel = button?.textContent || "⬆ Export All Profiles ZIP";
+  if (button) {
+    button.disabled = true;
+    button.textContent = "⏳ Đang sao chép và nén...";
+  }
+  showToast("Đang Export toàn bộ profile. Vui lòng chờ, không đóng app...", "info");
   try {
     const res = await fetch("/api/accounts/profile/export-all", {method: "POST"});
     const json = await res.json();
     showToast(res.ok ? `Đã Export ${json.accounts_exported} profile: ${json.archive_path}` : (json.detail || "Không thể Export profiles"), res.ok ? "success" : "error");
   } catch (e) {
     showToast("Lỗi kết nối khi Export profiles", "error");
+  } finally {
+    if (button) {
+      button.textContent = originalLabel;
+      button.disabled = state.accounts.length === 0;
+    }
   }
 }
 
-async function importAccountProfile() {
-  const bundlePath = prompt("Nhập đường dẫn tuyệt đối tới file .tinix-profiles.zip (vẫn hỗ trợ thư mục .tinix-profile cũ):");
-  if (!bundlePath) return;
-  if (!confirm("Tinix sẽ tạo toàn bộ account Facebook và sao chép các Chrome profile từ file ZIP. Tiếp tục?")) return;
+function importAccountProfile() {
+  openModal("⬇ Import Profiles ZIP", `
+    <div class="account-editor-form">
+      <label>
+        <span>Đường dẫn file ZIP</span>
+        <input type="text" id="profile-zip-path" placeholder="D:\\...\\Tinix-...-all-profiles.tinix-profiles.zip">
+        <small>FB Down sẽ Import toàn bộ profile Facebook; các nền tảng khác sẽ được bỏ qua.</small>
+      </label>
+    </div>
+  `, `
+    <button class="btn btn-secondary" onclick="closeModal()">Hủy</button>
+    <button class="btn btn-primary" onclick="submitProfilesZipImport()">Bắt đầu Import</button>
+  `);
+  setTimeout(() => document.getElementById("profile-zip-path")?.focus(), 0);
+}
+
+async function submitProfilesZipImport() {
+  const bundlePath = document.getElementById("profile-zip-path")?.value.trim();
+  if (!bundlePath) {
+    showToast("Hãy nhập đường dẫn file .tinix-profiles.zip", "warning");
+    return;
+  }
+  closeModal();
+  showToast("Đang Import các account/profile. Vui lòng chờ...", "info");
   try {
     const res = await fetch("/api/accounts/profile/import", {
       method: "POST",

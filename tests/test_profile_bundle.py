@@ -43,6 +43,9 @@ class ProfileBundleTests(unittest.TestCase):
         self.assertIn('id="btn-export-profile"', html)
         self.assertIn("exportAccountProfile", javascript)
         self.assertIn("exportAllAccountProfiles", javascript)
+        self.assertIn("submitProfilesZipImport", javascript)
+        self.assertIn("Đang sao chép và nén", javascript)
+        self.assertNotIn('confirm("Đóng Chrome của TẤT CẢ account trước khi Export', javascript)
         self.assertIn("/api/accounts/profile/import", javascript)
         self.assertIn("/api/accounts/profile/export-all", javascript)
 
