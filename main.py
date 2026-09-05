@@ -15,6 +15,23 @@ else:
 if _base_dir not in sys.path:
     sys.path.insert(0, _base_dir)
 
+# Under pythonw.exe on Windows, sys.stdout and sys.stderr are None.
+log_dir = os.path.join(_base_dir, "logs")
+os.makedirs(log_dir, exist_ok=True)
+startup_log = os.path.join(log_dir, "server_startup.log")
+
+if sys.stdout is None:
+    try:
+        sys.stdout = open(startup_log, "a", encoding="utf-8", buffering=1)
+    except Exception:
+        sys.stdout = open(os.devnull, "w", encoding="utf-8")
+
+if sys.stderr is None:
+    try:
+        sys.stderr = open(startup_log, "a", encoding="utf-8", buffering=1)
+    except Exception:
+        sys.stderr = open(os.devnull, "w", encoding="utf-8")
+
 from start_webui import main
 
 if __name__ == "__main__":

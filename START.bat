@@ -3,24 +3,41 @@ setlocal enabledelayedexpansion
 cd /d "%~dp0"
 title Tinix-Facebook-Hunter App
 
-REM 1. Dat cac bien moi truong
-set "PYTHONUNBUFFERED=1"
-set "PYTHONIOENCODING=utf-8"
-set "TINIX_NO_BROWSER=1"
+echo ========================================================
+echo   TINIX - FACEBOOK HUNTER (Desktop App Mode)
+echo ========================================================
 
-REM 2. Tim trinh thuc thi Python phu hop (uu tien pythonw.exe de chay ngam khong hien console)
-set "PYTHONW_CMD="
+REM 1. Tim trinh thuc thi Python
 set "PYTHON_CMD="
+set "PYTHONW_CMD="
 
-if exist ".venv\Scripts\pythonw.exe" (
-    set "PYTHONW_CMD=%~dp0.venv\Scripts\pythonw.exe"
+if exist ".venv\Scripts\python.exe" (
     set "PYTHON_CMD=%~dp0.venv\Scripts\python.exe"
+    set "PYTHONW_CMD=%~dp0.venv\Scripts\pythonw.exe"
     goto :found_python
 )
-if exist "venv\Scripts\pythonw.exe" (
-    set "PYTHONW_CMD=%~dp0venv\Scripts\pythonw.exe"
+if exist "venv\Scripts\python.exe" (
     set "PYTHON_CMD=%~dp0venv\Scripts\python.exe"
+    set "PYTHONW_CMD=%~dp0venv\Scripts\pythonw.exe"
     goto :found_python
+)
+
+python -c "import uvicorn" >nul 2>nul
+if not errorlevel 1 (
+    for /f "delims=" %%I in ('python -c "import sys; print(sys.executable)" 2^>nul') do (
+        set "PYTHON_CMD=%%I"
+        set "PYTHONW_CMD=%%~dpIpythonw.exe"
+    )
+    if defined PYTHON_CMD goto :found_python
+)
+
+py -3.11 -c "import uvicorn" >nul 2>nul
+if not errorlevel 1 (
+    for /f "delims=" %%I in ('py -3.11 -c "import sys; print(sys.executable)" 2^>nul') do (
+        set "PYTHON_CMD=%%I"
+        set "PYTHONW_CMD=%%~dpIpythonw.exe"
+    )
+    if defined PYTHON_CMD goto :found_python
 )
 
 for %%D in (
@@ -29,93 +46,88 @@ for %%D in (
     "C:\Python311"
     "C:\Python310"
 ) do (
-    if exist "%%~D\pythonw.exe" (
-        set "PYTHONW_CMD=%%~D\pythonw.exe"
+    if exist "%%~D\python.exe" (
         set "PYTHON_CMD=%%~D\python.exe"
+        set "PYTHONW_CMD=%%~D\pythonw.exe"
         goto :found_python
     )
 )
 
-where pythonw >nul 2>nul
-if not errorlevel 1 (
-    for /f "delims=" %%I in ('where pythonw 2^>nul') do (
-        set "PYTHONW_CMD=%%I"
-        goto :found_pythonw
-    )
-)
-:found_pythonw
-
 where python >nul 2>nul
 if not errorlevel 1 (
-    for /f "delims=" %%I in ('where python 2^>nul') do (
+    for /f "delims=" %%I in ('python -c "import sys; print(sys.executable)" 2^>nul') do (
         set "PYTHON_CMD=%%I"
-        if not defined PYTHONW_CMD set "PYTHONW_CMD=%%I"
+        set "PYTHONW_CMD=%%~dpIpythonw.exe"
         goto :found_python
     )
 )
 
 :found_python
 if not defined PYTHON_CMD (
-    echo [ERROR] Khong tim thay Python tren he thong!
+    echo [LOI] Khong tim thay Python tren he thong!
     echo Vui long cai dat Python 3.10 hoac 3.11 tai https://www.python.org/
     pause
     exit /b 1
 )
-if not defined PYTHONW_CMD (
+if not exist "%PYTHONW_CMD%" (
     set "PYTHONW_CMD=%PYTHON_CMD%"
 )
 
-REM 3. Kiem tra xem Server co dang chay tren port 7866 khong
-"%PYTHON_CMD%" -c "import socket, sys; s = socket.socket(); s.settimeout(0.5); (s.connect(('127.0.0.1', 7866)), s.close(), sys.exit(0))" >nul 2>nul
-if not errorlevel 1 goto :server_ready
+set "TINIX_PORT=7866"
 
-REM Server chua chay, tien hanh don dep phien cu va khoi dong ngam
-"%PYTHON_CMD%" utils\process_cleanup.py --skip-windows >nul 2>nul
-start "" "%PYTHONW_CMD%" "%~dp0main.py"
-
-REM Cho server san sang phan hoi tren port 7866 (cho toi da 15 giay)
-for /L %%i in (1,1,30) do (
-    "%PYTHON_CMD%" -c "import socket, sys; s = socket.socket(); s.settimeout(0.5); (s.connect(('127.0.0.1', 7866)), s.close(), sys.exit(0))" >nul 2>nul
-    if not errorlevel 1 goto :server_ready
-    powershell -NoProfile -Command "Start-Sleep -Milliseconds 500" >nul 2>nul
-)
-
-:server_ready
-REM 4. Tim Chrome hoac Microsoft Edge de khoi chay o che do App Mode (--app=...)
-set "APP_URL=http://127.0.0.1:7866"
-set "BROWSER_BIN="
-
-if exist "%ProgramFiles%\Google\Chrome\Application\chrome.exe" (
-    set "BROWSER_BIN=%ProgramFiles%\Google\Chrome\Application\chrome.exe"
-    goto :launch_app
-)
-if exist "%ProgramFiles(x86)%\Google\Chrome\Application\chrome.exe" (
-    set "BROWSER_BIN=%ProgramFiles(x86)%\Google\Chrome\Application\chrome.exe"
-    goto :launch_app
-)
-if exist "%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe" (
-    set "BROWSER_BIN=%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"
-    goto :launch_app
-)
-if exist "%ProgramFiles(x86)%\Microsoft\Edge\Application\msedge.exe" (
-    set "BROWSER_BIN=%ProgramFiles(x86)%\Microsoft\Edge\Application\msedge.exe"
-    goto :launch_app
-)
-if exist "%ProgramFiles%\Microsoft\Edge\Application\msedge.exe" (
-    set "BROWSER_BIN=%ProgramFiles%\Microsoft\Edge\Application\msedge.exe"
-    goto :launch_app
-)
-
-:launch_app
-if defined BROWSER_BIN (
-    start "" "%BROWSER_BIN%" --app="%APP_URL%"
+REM 2. Kiem tra xem may chu ngam da chay chua
+"%PYTHON_CMD%" -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:%TINIX_PORT%/api/system/health', timeout=1)" >nul 2>nul
+if errorlevel 1 (
+    call :start_background_server
+    if errorlevel 1 exit /b 1
 ) else (
-    start "" "%APP_URL%"
+    echo [Tinix] May chu dang chay san tren port %TINIX_PORT%.
 )
 
-REM 5. Kiem tra va tu dong tao Desktop shortcut neu chua co
+REM 3. Tim Google Chrome hoac Microsoft Edge de mo che do App Mode doc lap
+set "BROWSER_APP_EXE="
+if exist "%ProgramFiles%\Google\Chrome\Application\chrome.exe" set "BROWSER_APP_EXE=%ProgramFiles%\Google\Chrome\Application\chrome.exe"
+if not defined BROWSER_APP_EXE if exist "%ProgramFiles(x86)%\Google\Chrome\Application\chrome.exe" set "BROWSER_APP_EXE=%ProgramFiles(x86)%\Google\Chrome\Application\chrome.exe"
+if not defined BROWSER_APP_EXE if exist "%LocalAppData%\Google\Chrome\Application\chrome.exe" set "BROWSER_APP_EXE=%LocalAppData%\Google\Chrome\Application\chrome.exe"
+if not defined BROWSER_APP_EXE if exist "%ProgramFiles(x86)%\Microsoft\Edge\Application\msedge.exe" set "BROWSER_APP_EXE=%ProgramFiles(x86)%\Microsoft\Edge\Application\msedge.exe"
+if not defined BROWSER_APP_EXE if exist "%ProgramFiles%\Microsoft\Edge\Application\msedge.exe" set "BROWSER_APP_EXE=%ProgramFiles%\Microsoft\Edge\Application\msedge.exe"
+
+echo [Tinix] Dang mo ung dung che do App Mode doc lap...
+if defined BROWSER_APP_EXE (
+    start "" "%BROWSER_APP_EXE%" --app="http://127.0.0.1:%TINIX_PORT%"
+) else (
+    start "" "http://127.0.0.1:%TINIX_PORT%"
+)
+
+REM 4. Tu dong tao Desktop shortcut neu chua ton tai
 if not exist "%USERPROFILE%\Desktop\Tinix-Facebook-Hunter.lnk" (
     start "" /B "%PYTHONW_CMD%" "%~dp0utils\create_shortcut.py" >nul 2>nul
 )
 
 exit /b 0
+
+:start_background_server
+echo [Tinix] Dang kiem tra va don dep phien lam viec cu...
+"%PYTHON_CMD%" utils\process_cleanup.py --skip-windows >nul 2>nul
+
+echo [Tinix] Dang khoi dong may chu ngam (port %TINIX_PORT%)...
+set "TINIX_NO_BROWSER=1"
+set "PYTHONUNBUFFERED=1"
+set "PYTHONIOENCODING=utf-8"
+
+start "" "%PYTHONW_CMD%" "%~dp0main.py"
+
+REM Cho server san sang toi da 15 giay
+for /l %%i in (1,1,15) do (
+    "%PYTHON_CMD%" -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:%TINIX_PORT%/api/system/health', timeout=1)" >nul 2>nul
+    if not errorlevel 1 (
+        echo [Tinix] May chu ngam da san sang!
+        exit /b 0
+    )
+    ping 127.0.0.1 -n 2 >nul
+)
+
+echo [LOI] May chu ngam khong phan hoi sau 15 giay!
+echo Kiem tra log tai: %~dp0logs\server_startup.log
+pause
+exit /b 1
