@@ -3,7 +3,7 @@ setlocal EnableExtensions EnableDelayedExpansion
 cd /d "%~dp0\.."
 chcp 65001 >nul
 
-set "SAFE_DIR=D:/___TOOLS/_Tinix FB Down"
+set "SAFE_DIR=D:/___TOOLS/__TINIX/Tinix-Facebook-Hunter"
 set "TOOLS_DIR=%~dp0"
 set "SCOPE_FILE=%TOOLS_DIR%skill-scope.txt"
 set "PRESET_ROOT=%TOOLS_DIR%presets"

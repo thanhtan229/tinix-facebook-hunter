@@ -23,9 +23,6 @@ branch = true
 source = [
     "core.database_maintenance",
     "core.data_cleanup",
-    "core.job_states",
-    "core.post_queue",
-    "core.schedule_service",
     "web.models",
     "web.security",
 ]

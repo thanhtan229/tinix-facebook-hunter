@@ -32,12 +32,6 @@ def scraper_profile_dir(account_id: int | None = None) -> Path:
     return chrome_profile_dir("scraper")
 
 
-def poster_profile_dir(account_id: int | None = None) -> Path:
-    if account_id:
-        return chrome_profile_dir(f"poster_{int(account_id)}")
-    return chrome_profile_dir("poster")
-
-
 def download_profile_dir(account_id: int | None = None) -> Path:
     if account_id:
         return chrome_profile_dir(f"download_{int(account_id)}")

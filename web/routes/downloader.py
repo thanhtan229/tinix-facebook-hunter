@@ -30,7 +30,16 @@ def _on_stats_update(stats):
 
 def _on_all_complete(success: bool, msg: str):
     log_to_web(f"Hoàn thành tải xuống: {msg}", "OK" if success else "WARNING")
-    progress_to_web("download", 100, 100, "", "completed")
+    stats = orchestrator.stats
+    if success:
+        status = "completed"
+    elif stats.success_posts > 0:
+        status = "partial"
+    else:
+        status = "failed"
+    progress_to_web(
+        "download", stats.completed_posts, stats.total_posts, msg, status
+    )
 
 orchestrator.set_callbacks(
     on_progress=_on_progress_update,
@@ -72,7 +81,7 @@ def start_download(req: DownloadStartRequest):
             max_threads=threads
         )
     else:
-        orchestrator.start_download(
+        orchestrator.start(
             urls_text=req.urls,
             cookie_string=cookies_str,
             output_dir=out_dir,

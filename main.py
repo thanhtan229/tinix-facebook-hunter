@@ -1,5 +1,5 @@
 """
-Tinix FB Studio — Main Entry Point
+Tinix-Facebook-Hunter — Main Entry Point
 Launches the WebUI Studio server and opens the browser.
 """
 

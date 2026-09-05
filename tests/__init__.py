@@ -1,1 +1,1 @@
-"""Tinix FB Studio tests."""
+"""Tinix-Facebook-Hunter tests."""

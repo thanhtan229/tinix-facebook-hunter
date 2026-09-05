@@ -13,12 +13,13 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
 
+from core.page_scraper import is_valid_facebook_page_name
 from utils import logger
 from utils.secure_store import is_protected, protect_secret, reveal_secret
 
 
 ACCOUNT_SECRET_FIELDS = {"password", "secret_2fa", "email_pass", "cookie"}
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 10
 _SCHEMA_LOCK = threading.RLock()
 _SCHEMA_READY: set[str] = set()
 
@@ -74,9 +75,18 @@ def _initialize_schema(db_path: str) -> sqlite3.Connection:
             engagement    INTEGER NOT NULL DEFAULT 0,
             comments      INTEGER NOT NULL DEFAULT 0,
             shares         INTEGER NOT NULL DEFAULT 0,
+            view_count     INTEGER NOT NULL DEFAULT 0,
             caption       TEXT    NOT NULL DEFAULT '',
             url           TEXT    NOT NULL DEFAULT '',
+            media_preview_url TEXT NOT NULL DEFAULT '',
+            media_count   INTEGER NOT NULL DEFAULT 0,
             scraped_at    TEXT    NOT NULL DEFAULT '',
+            downloaded    INTEGER NOT NULL DEFAULT 0,
+            download_path TEXT    NOT NULL DEFAULT '',
+            downloaded_at TEXT    NOT NULL DEFAULT '',
+            download_status TEXT  NOT NULL DEFAULT 'not_downloaded',
+            download_error TEXT   NOT NULL DEFAULT '',
+            rating        INTEGER NOT NULL DEFAULT 0,
             UNIQUE(page_name, post_id)
         )
     """)
@@ -110,9 +120,51 @@ def _initialize_schema(db_path: str) -> sqlite3.Connection:
             last_status              TEXT    NOT NULL DEFAULT 'Chưa quét',
             last_error               TEXT    NOT NULL DEFAULT '',
             created_at               TEXT    NOT NULL DEFAULT '',
-            updated_at               TEXT    NOT NULL DEFAULT ''
+            updated_at               TEXT    NOT NULL DEFAULT '',
+            archive_cursor_post_ids  TEXT    NOT NULL DEFAULT '[]',
+            archive_scanned_count    INTEGER NOT NULL DEFAULT 0,
+            archive_updated_at       TEXT    NOT NULL DEFAULT ''
         )
     """)
+
+    favorite_cols = {row[1] for row in conn.execute("PRAGMA table_info(favorite_pages)").fetchall()}
+    for column, definition in (
+        ("page_uid", "TEXT NOT NULL DEFAULT ''"),
+        ("follower_count", "INTEGER NOT NULL DEFAULT 0"),
+        ("category", "TEXT NOT NULL DEFAULT ''"),
+        ("avatar_url", "TEXT NOT NULL DEFAULT ''"),
+        ("verified", "INTEGER NOT NULL DEFAULT 0"),
+        ("metadata_updated_at", "TEXT NOT NULL DEFAULT ''"),
+        ("archive_cursor_post_ids", "TEXT NOT NULL DEFAULT '[]'"),
+        ("archive_scanned_count", "INTEGER NOT NULL DEFAULT 0"),
+        ("archive_updated_at", "TEXT NOT NULL DEFAULT ''"),
+    ):
+        if column not in favorite_cols:
+            conn.execute(f"ALTER TABLE favorite_pages ADD COLUMN {column} {definition}")
+
+    # --- User-defined groups for favorite pages (many-to-many) ---
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS favorite_page_groups (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            group_name  TEXT    NOT NULL COLLATE NOCASE UNIQUE,
+            color       TEXT    NOT NULL DEFAULT '#0f766e',
+            sort_order  INTEGER NOT NULL DEFAULT 0,
+            created_at  TEXT    NOT NULL DEFAULT '',
+            updated_at  TEXT    NOT NULL DEFAULT ''
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS favorite_page_group_members (
+            group_id     INTEGER NOT NULL,
+            favorite_id  INTEGER NOT NULL,
+            created_at   TEXT    NOT NULL DEFAULT '',
+            PRIMARY KEY (group_id, favorite_id),
+            FOREIGN KEY (group_id) REFERENCES favorite_page_groups(id) ON DELETE CASCADE,
+            FOREIGN KEY (favorite_id) REFERENCES favorite_pages(id) ON DELETE CASCADE
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_favorite_group_members_page ON favorite_page_group_members(favorite_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_favorite_group_members_group ON favorite_page_group_members(group_id)")
 
     # --- Migration: add missing columns for existing DBs ---
     try:
@@ -125,6 +177,27 @@ def _initialize_schema(db_path: str) -> sqlite3.Connection:
             conn.execute("ALTER TABLE posts ADD COLUMN download_path TEXT NOT NULL DEFAULT ''")
         if "downloaded_at" not in cols:
             conn.execute("ALTER TABLE posts ADD COLUMN downloaded_at TEXT NOT NULL DEFAULT ''")
+        if "media_preview_url" not in cols:
+            conn.execute("ALTER TABLE posts ADD COLUMN media_preview_url TEXT NOT NULL DEFAULT ''")
+        if "media_count" not in cols:
+            conn.execute("ALTER TABLE posts ADD COLUMN media_count INTEGER NOT NULL DEFAULT 0")
+        if "download_status" not in cols:
+            conn.execute("ALTER TABLE posts ADD COLUMN download_status TEXT NOT NULL DEFAULT 'not_downloaded'")
+            conn.execute(
+                "UPDATE posts SET download_status = CASE WHEN downloaded = 1 THEN 'downloaded' ELSE 'not_downloaded' END"
+            )
+        if "download_error" not in cols:
+            conn.execute("ALTER TABLE posts ADD COLUMN download_error TEXT NOT NULL DEFAULT ''")
+        if "rating" not in cols:
+            conn.execute("ALTER TABLE posts ADD COLUMN rating INTEGER NOT NULL DEFAULT 0")
+        conn.execute(
+            """
+            UPDATE posts
+            SET download_status = 'failed',
+                download_error = 'Tác vụ tải bị gián đoạn do ứng dụng đã dừng'
+            WHERE download_status = 'downloading'
+            """
+        )
         conn.commit()
     except Exception:
         pass
@@ -146,6 +219,14 @@ def _initialize_schema(db_path: str) -> sqlite3.Connection:
             conn.commit()
         elif "shares" not in post_cols:
             conn.execute("ALTER TABLE posts ADD COLUMN shares INTEGER NOT NULL DEFAULT 0")
+            conn.commit()
+    except Exception:
+        pass
+
+    try:
+        post_cols = [row[1] for row in conn.execute("PRAGMA table_info(posts)").fetchall()]
+        if "view_count" not in post_cols:
+            conn.execute("ALTER TABLE posts ADD COLUMN view_count INTEGER NOT NULL DEFAULT 0")
             conn.commit()
     except Exception:
         pass
@@ -181,6 +262,7 @@ def _initialize_schema(db_path: str) -> sqlite3.Connection:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_posts_page_url_id ON posts(page_url, post_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_posts_date ON posts(date)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_posts_group ON posts(group_name)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_posts_view_count ON posts(view_count)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_pages_group ON pages(group_name)")
 
     # --- Social Post: content_pool ---
@@ -522,7 +604,7 @@ def initialize_database(db_path: str, *, force: bool = False) -> int:
             if version > SCHEMA_VERSION:
                 raise RuntimeError(
                     f"Database schema v{version} is newer than this application supports "
-                    f"(v{SCHEMA_VERSION}). Please update Tinix FB Studio."
+                    f"(v{SCHEMA_VERSION}). Please update Tinix-Facebook-Hunter."
                 )
             return version
 
@@ -535,7 +617,7 @@ def initialize_database(db_path: str, *, force: bool = False) -> int:
         if version > SCHEMA_VERSION:
             raise RuntimeError(
                 f"Database schema v{version} is newer than this application supports "
-                f"(v{SCHEMA_VERSION}). Please update Tinix FB Studio."
+                f"(v{SCHEMA_VERSION}). Please update Tinix-Facebook-Hunter."
             )
 
         if 0 < version < SCHEMA_VERSION:
@@ -661,7 +743,10 @@ def get_favorite_pages(db_path: str, active_only: bool = False) -> List[dict]:
                    f.is_active, f.cursor_post_ids, f.last_attempt_at,
                    f.last_successful_scan_at, f.last_new_posts_count,
                    f.last_status, f.last_error, f.created_at, f.updated_at,
-                   COALESCE(a.label, a.username, '') AS account_label
+                   COALESCE(a.label, a.username, '') AS account_label,
+                   f.page_uid, f.follower_count, f.category, f.avatar_url,
+                   f.verified, f.metadata_updated_at, f.archive_cursor_post_ids,
+                   f.archive_scanned_count, f.archive_updated_at
             FROM favorite_pages f
             LEFT JOIN fb_accounts a ON a.id = f.account_id
         """
@@ -669,12 +754,27 @@ def get_favorite_pages(db_path: str, active_only: bool = False) -> List[dict]:
             sql += " WHERE f.is_active = 1"
         sql += " ORDER BY lower(COALESCE(NULLIF(f.page_name, ''), f.page_url))"
         rows = conn.execute(sql).fetchall()
+        group_rows = conn.execute("""
+            SELECT m.favorite_id, g.id, g.group_name, g.color
+            FROM favorite_page_group_members m
+            JOIN favorite_page_groups g ON g.id = m.group_id
+            ORDER BY g.sort_order, lower(g.group_name)
+        """).fetchall()
+        groups_by_favorite: Dict[int, List[dict]] = {}
+        for favorite_id, group_id, group_name, color in group_rows:
+            groups_by_favorite.setdefault(int(favorite_id), []).append({
+                "id": int(group_id), "name": group_name or "", "color": color or "#0f766e",
+            })
         result = []
         for row in rows:
             try:
                 cursor_ids = [str(value) for value in json.loads(row[6] or "[]") if str(value)]
             except (TypeError, ValueError):
                 cursor_ids = []
+            try:
+                archive_cursor_ids = [str(value) for value in json.loads(row[21] or "[]") if str(value)]
+            except (TypeError, ValueError):
+                archive_cursor_ids = []
             result.append({
                 "id": row[0], "page_url": row[1], "page_name": row[2] or "",
                 "account_id": row[3], "scan_limit": row[4], "is_active": row[5],
@@ -682,7 +782,14 @@ def get_favorite_pages(db_path: str, active_only: bool = False) -> List[dict]:
                 "last_successful_scan_at": row[8] or "", "last_new_posts_count": row[9] or 0,
                 "last_status": row[10] or "Chưa quét", "last_error": row[11] or "",
                 "created_at": row[12] or "", "updated_at": row[13] or "",
-                "account_label": row[14] or "",
+                "account_label": row[14] or "", "page_uid": row[15] or "",
+                "follower_count": row[16] or 0, "category": row[17] or "",
+                "avatar_url": row[18] or "", "verified": bool(row[19]),
+                "metadata_updated_at": row[20] or "",
+                "archive_cursor_post_ids": archive_cursor_ids,
+                "archive_scanned_count": int(row[22] or 0),
+                "archive_updated_at": row[23] or "",
+                "groups": groups_by_favorite.get(int(row[0]), []),
             })
         return result
     finally:
@@ -693,12 +800,127 @@ def get_favorite_page(db_path: str, favorite_id: int) -> Optional[dict]:
     return next((item for item in get_favorite_pages(db_path) if item["id"] == favorite_id), None)
 
 
+def get_favorite_page_groups(db_path: str) -> List[dict]:
+    """Return favorite groups with their current Page counts."""
+    conn = _get_conn(db_path)
+    try:
+        rows = conn.execute("""
+            SELECT g.id, g.group_name, g.color, g.sort_order, g.created_at, g.updated_at,
+                   COUNT(m.favorite_id) AS page_count
+            FROM favorite_page_groups g
+            LEFT JOIN favorite_page_group_members m ON m.group_id = g.id
+            GROUP BY g.id
+            ORDER BY g.sort_order, lower(g.group_name)
+        """).fetchall()
+        return [{
+            "id": int(row[0]), "name": row[1] or "", "color": row[2] or "#0f766e",
+            "sort_order": int(row[3] or 0), "created_at": row[4] or "",
+            "updated_at": row[5] or "", "page_count": int(row[6] or 0),
+        } for row in rows]
+    finally:
+        conn.close()
+
+
+def create_favorite_page_group(db_path: str, name: str, color: str = "#0f766e") -> int:
+    clean_name = " ".join(str(name or "").strip().split())
+    if not clean_name:
+        raise ValueError("Tên nhóm không được để trống")
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    conn = _get_conn(db_path)
+    try:
+        try:
+            cursor = conn.execute(
+                "INSERT INTO favorite_page_groups (group_name, color, created_at, updated_at) VALUES (?, ?, ?, ?)",
+                (clean_name[:80], str(color or "#0f766e")[:20], now, now),
+            )
+            conn.commit()
+            return int(cursor.lastrowid)
+        except sqlite3.IntegrityError as exc:
+            raise ValueError("Tên nhóm đã tồn tại") from exc
+    finally:
+        conn.close()
+
+
+def update_favorite_page_group(db_path: str, group_id: int, name: str, color: str = "#0f766e") -> bool:
+    clean_name = " ".join(str(name or "").strip().split())
+    if not clean_name:
+        raise ValueError("Tên nhóm không được để trống")
+    conn = _get_conn(db_path)
+    try:
+        try:
+            updated = conn.execute("""
+                UPDATE favorite_page_groups SET group_name = ?, color = ?, updated_at = ? WHERE id = ?
+            """, (
+                clean_name[:80], str(color or "#0f766e")[:20],
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S"), int(group_id),
+            )).rowcount
+            conn.commit()
+            return bool(updated)
+        except sqlite3.IntegrityError as exc:
+            raise ValueError("Tên nhóm đã tồn tại") from exc
+    finally:
+        conn.close()
+
+
+def delete_favorite_page_group(db_path: str, group_id: int) -> bool:
+    """Delete only the group; member Pages and their scan history are preserved."""
+    conn = _get_conn(db_path)
+    try:
+        deleted = conn.execute("DELETE FROM favorite_page_groups WHERE id = ?", (int(group_id),)).rowcount
+        conn.commit()
+        return bool(deleted)
+    finally:
+        conn.close()
+
+
+def update_favorite_group_members(
+    db_path: str, group_id: int, favorite_ids: List[int], action: str = "add",
+) -> int:
+    """Add or remove a deduplicated set of favorite Pages from one group."""
+    ids = list(dict.fromkeys(int(value) for value in favorite_ids if int(value) > 0))
+    conn = _get_conn(db_path)
+    try:
+        if not conn.execute("SELECT 1 FROM favorite_page_groups WHERE id = ?", (int(group_id),)).fetchone():
+            raise ValueError("Không tìm thấy nhóm Fanpage")
+        if not ids:
+            return 0
+        placeholders = ",".join("?" for _ in ids)
+        existing = {int(row[0]) for row in conn.execute(
+            f"SELECT id FROM favorite_pages WHERE id IN ({placeholders})", ids
+        ).fetchall()}
+        if len(existing) != len(ids):
+            raise ValueError("Có Fanpage yêu thích không tồn tại")
+        if action == "remove":
+            cursor = conn.execute(
+                f"DELETE FROM favorite_page_group_members WHERE group_id = ? AND favorite_id IN ({placeholders})",
+                [int(group_id), *ids],
+            )
+            changed = int(cursor.rowcount or 0)
+        else:
+            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            before = conn.total_changes
+            conn.executemany(
+                "INSERT OR IGNORE INTO favorite_page_group_members (group_id, favorite_id, created_at) VALUES (?, ?, ?)",
+                [(int(group_id), favorite_id, now) for favorite_id in ids],
+            )
+            changed = conn.total_changes - before
+        conn.commit()
+        return changed
+    finally:
+        conn.close()
+
+
 def save_favorite_page(
     db_path: str,
     page_url: str,
     page_name: str = "",
     account_id: Optional[int] = None,
     scan_limit: int = 100,
+    page_uid: str = "",
+    follower_count: int = 0,
+    category: str = "",
+    avatar_url: str = "",
+    verified: bool = False,
 ) -> int:
     """Add or update a favorite page while preserving its successful scan cursor."""
     canonical = normalize_page_url(page_url)
@@ -711,15 +933,26 @@ def save_favorite_page(
         resolved_name = str(page_name or (existing[0] if existing else "")).strip()
         conn.execute("""
             INSERT INTO favorite_pages
-                (page_url, page_name, account_id, scan_limit, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?)
+                (page_url, page_name, account_id, scan_limit, created_at, updated_at,
+                 page_uid, follower_count, category, avatar_url, verified, metadata_updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(page_url) DO UPDATE SET
                 page_name = CASE WHEN excluded.page_name != '' THEN excluded.page_name ELSE favorite_pages.page_name END,
                 account_id = excluded.account_id,
                 scan_limit = excluded.scan_limit,
                 is_active = 1,
+                page_uid = CASE WHEN excluded.page_uid != '' THEN excluded.page_uid ELSE favorite_pages.page_uid END,
+                follower_count = CASE WHEN excluded.follower_count > 0 THEN excluded.follower_count ELSE favorite_pages.follower_count END,
+                category = CASE WHEN excluded.category != '' THEN excluded.category ELSE favorite_pages.category END,
+                avatar_url = CASE WHEN excluded.avatar_url != '' THEN excluded.avatar_url ELSE favorite_pages.avatar_url END,
+                verified = CASE WHEN excluded.verified > 0 THEN excluded.verified ELSE favorite_pages.verified END,
+                metadata_updated_at = CASE WHEN excluded.metadata_updated_at != '' THEN excluded.metadata_updated_at ELSE favorite_pages.metadata_updated_at END,
                 updated_at = excluded.updated_at
-        """, (canonical, resolved_name, account_id, max(5, min(int(scan_limit), 2000)), now, now))
+        """, (
+            canonical, resolved_name, account_id, max(5, min(int(scan_limit), 2000)), now, now,
+            str(page_uid or "")[:100], max(0, int(follower_count or 0)), str(category or "")[:200],
+            str(avatar_url or "")[:2000], int(bool(verified)), now if any((page_uid, follower_count, category, avatar_url, verified)) else "",
+        ))
         row = conn.execute("SELECT id FROM favorite_pages WHERE page_url = ?", (canonical,)).fetchone()
         conn.commit()
         return int(row[0])
@@ -728,26 +961,90 @@ def save_favorite_page(
 
 
 def delete_favorite_page(db_path: str, favorite_id: int) -> bool:
+    return delete_favorite_pages(db_path, [favorite_id]) > 0
+
+
+def delete_favorite_pages(db_path: str, favorite_ids: List[int]) -> int:
+    ids = [int(v) for v in favorite_ids if int(v) > 0]
+    if not ids:
+        return 0
     conn = _get_conn(db_path)
     try:
-        deleted = conn.execute("DELETE FROM favorite_pages WHERE id = ?", (favorite_id,)).rowcount
+        placeholders = ",".join("?" for _ in ids)
+        deleted = conn.execute(f"DELETE FROM favorite_pages WHERE id IN ({placeholders})", ids).rowcount
         conn.commit()
-        return bool(deleted)
+        return int(deleted)
     finally:
         conn.close()
 
 
 def reset_favorite_cursor(db_path: str, favorite_id: int) -> bool:
+    return reset_favorite_cursors(db_path, [favorite_id]) > 0
+
+
+def reset_favorite_cursors(db_path: str, favorite_ids: List[int]) -> int:
+    ids = [int(v) for v in favorite_ids if int(v) > 0]
+    if not ids:
+        return 0
     conn = _get_conn(db_path)
     try:
-        updated = conn.execute("""
+        placeholders = ",".join("?" for _ in ids)
+        updated = conn.execute(f"""
             UPDATE favorite_pages
             SET cursor_post_ids = '[]', last_status = 'Đã đặt lại mốc',
                 last_error = '', updated_at = ?
-            WHERE id = ?
-        """, (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), favorite_id)).rowcount
+            WHERE id IN ({placeholders})
+        """, [datetime.now().strftime("%Y-%m-%d %H:%M:%S")] + ids).rowcount
         conn.commit()
-        return bool(updated)
+        return int(updated)
+    finally:
+        conn.close()
+
+
+def get_page_archive_cursor(db_path: str, page_url: str, limit: int = 20) -> List[str]:
+    """Return stable IDs around the oldest stored edge for historical continuation."""
+    canonical = normalize_page_url(page_url)
+    conn = _get_conn(db_path)
+    try:
+        rows = conn.execute(
+            "SELECT post_id FROM posts WHERE page_url = ? ORDER BY id DESC LIMIT ?",
+            (canonical, max(1, min(int(limit), 50))),
+        ).fetchall()
+        if not rows:
+            page = conn.execute("SELECT page_name FROM pages WHERE page_url = ?", (canonical,)).fetchone()
+            if page:
+                rows = conn.execute(
+                    "SELECT post_id FROM posts WHERE page_name = ? ORDER BY id DESC LIMIT ?",
+                    (page[0], max(1, min(int(limit), 50))),
+                ).fetchall()
+        return [str(row[0]) for row in reversed(rows) if str(row[0] or "")]
+    finally:
+        conn.close()
+
+
+def finish_favorite_archive_scan(
+    db_path: str, favorite_id: int, *, status: str, saved_posts: int,
+    cursor_post_ids: Optional[List[str]] = None, successful: bool = False,
+    error: str = "", page_name: str = "",
+) -> None:
+    """Persist a historical scan without changing the new-post cursor."""
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    fields = ["last_status = ?", "last_new_posts_count = ?", "last_error = ?", "updated_at = ?"]
+    values: list = [status, int(saved_posts), str(error or "")[:1000], now]
+    if page_name:
+        fields.append("page_name = ?")
+        values.append(page_name)
+    if successful:
+        fields.extend((
+            "archive_cursor_post_ids = ?", "archive_scanned_count = archive_scanned_count + ?",
+            "archive_updated_at = ?",
+        ))
+        values.extend((json.dumps((cursor_post_ids or [])[-20:], ensure_ascii=False), int(saved_posts), now))
+    values.append(int(favorite_id))
+    conn = _get_conn(db_path)
+    try:
+        conn.execute(f"UPDATE favorite_pages SET {', '.join(fields)} WHERE id = ?", values)
+        conn.commit()
     finally:
         conn.close()
 
@@ -776,6 +1073,7 @@ def finish_favorite_scan(
     page_name: str = "",
     cursor_post_ids: Optional[List[str]] = None,
     successful: bool = False,
+    follower_count: int = 0,
 ) -> None:
     """Persist one scan result; advance the cursor only for a complete scan."""
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -789,6 +1087,9 @@ def finish_favorite_scan(
     if successful:
         fields.extend(("last_successful_scan_at = ?", "cursor_post_ids = ?"))
         values.extend((now, json.dumps((cursor_post_ids or [])[:20], ensure_ascii=False)))
+    if follower_count > 0:
+        fields.extend(("follower_count = ?", "metadata_updated_at = ?"))
+        values.extend((int(follower_count), now))
     values.append(favorite_id)
     conn = _get_conn(db_path)
     try:
@@ -874,6 +1175,25 @@ def save_posts(
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     saved = 0
 
+    # Facebook occasionally returns a navigation label (for example
+    # "Thông tin liên hệ") in place of the Page name. Never let that overwrite
+    # a valid name already recorded for the same canonical URL.
+    if canonical and not is_valid_facebook_page_name(page_name):
+        try:
+            row = conn.execute(
+                "SELECT page_name FROM pages WHERE page_url = ?", (canonical,)
+            ).fetchone()
+            registered_name = str(row[0] or "").strip() if row else ""
+            if is_valid_facebook_page_name(registered_name):
+                rejected_name = str(page_name or "")[:80]
+                page_name = registered_name
+                logger.warning(
+                    f"Bỏ qua tên Fanpage không hợp lệ '{rejected_name}'; "
+                    f"giữ tên đã lưu '{registered_name[:80]}'"
+                )
+        except Exception:
+            pass
+
     # Auto-preserve existing group: if no group specified, look up the page's
     # current group from DB so it doesn't get wiped on re-scrape
     if not group_name and canonical:
@@ -896,8 +1216,9 @@ def save_posts(
             conn.execute("""
                 INSERT INTO posts
                     (page_name, page_url, group_name, post_id, date, post_type,
-                     engagement, comments, shares, caption, url, scraped_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     engagement, comments, shares, view_count, caption, url,
+                     media_preview_url, media_count, scraped_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(page_name, post_id) DO UPDATE SET
                     page_url = excluded.page_url,
                     group_name = excluded.group_name,
@@ -906,8 +1227,17 @@ def save_posts(
                     engagement = excluded.engagement,
                     comments = excluded.comments,
                     shares = excluded.shares,
+                    view_count = CASE WHEN excluded.view_count > posts.view_count THEN excluded.view_count ELSE posts.view_count END,
                     caption = excluded.caption,
                     url = excluded.url,
+                    media_preview_url = CASE
+                        WHEN excluded.media_preview_url != '' THEN excluded.media_preview_url
+                        ELSE posts.media_preview_url
+                    END,
+                    media_count = CASE
+                        WHEN excluded.media_count > posts.media_count THEN excluded.media_count
+                        ELSE posts.media_count
+                    END,
                     scraped_at = excluded.scraped_at
             """, (
                 page_name,
@@ -919,8 +1249,11 @@ def save_posts(
                 getattr(post, 'engagement', 0),
                 getattr(post, 'comments', 0),
                 getattr(post, 'shares', 0),
+                getattr(post, 'view_count', 0),
                 getattr(post, 'caption', ''),
                 post_url,
+                getattr(post, 'media_preview_url', ''),
+                max(0, int(getattr(post, 'media_count', 0) or 0)),
                 now,
             ))
             saved += 1
@@ -976,7 +1309,7 @@ def get_posts_by_page(db_path: str, page_name: str) -> List[dict]:
         conn = _get_conn(db_path)
         cursor = conn.execute("""
             SELECT post_id, date, post_type, engagement, comments,
-                   views, caption, url, scraped_at
+                   shares, view_count, caption, url, scraped_at
             FROM posts
             WHERE page_name = ?
             ORDER BY scraped_at DESC, date DESC
@@ -988,10 +1321,11 @@ def get_posts_by_page(db_path: str, page_name: str) -> List[dict]:
                 "post_type": row[2],
                 "engagement": row[3],
                 "comments": row[4],
-                "views": row[5],
-                "caption": row[6],
-                "url": row[7],
-                "scraped_at": row[8],
+                "shares": row[5],
+                "view_count": row[6],
+                "caption": row[7],
+                "url": row[8],
+                "scraped_at": row[9],
             }
             for row in cursor.fetchall()
         ]
@@ -1021,6 +1355,24 @@ def get_db_stats(db_path: str) -> dict:
 
 # ─── Post Spy Queries ────────────────────────────────────────────────────────
 
+def _local_media_preview(download_path: str) -> tuple[str, str, int]:
+    """Return first local preview, its kind, and media count for a downloaded post."""
+    if not download_path:
+        return "", "", 0
+    root = Path(download_path).expanduser()
+    try:
+        files = [root] if root.is_file() else [item for item in root.iterdir() if item.is_file()]
+    except (OSError, ValueError):
+        return "", "", 0
+    media_files = [item for item in files if item.suffix.lower() in MEDIA_DOWNLOAD_EXTS]
+    if not media_files:
+        return "", "", 0
+    image_exts = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
+    media_files.sort(key=lambda item: (item.suffix.lower() not in image_exts, item.name.lower()))
+    first = media_files[0]
+    kind = "image" if first.suffix.lower() in image_exts else "video"
+    return str(first.resolve()), kind, len(media_files)
+
 def query_posts_for_spy(
     db_path: str,
     page_names: List[str],
@@ -1028,6 +1380,8 @@ def query_posts_for_spy(
     limit: int = 0,
     post_type_filter: str = "Tất cả",
     download_status: str = "Tất cả",
+    sort_by: str = "",
+    sort_order: str = "desc",
 ) -> List[dict]:
     """Query posts for Post Spy Manager.
 
@@ -1040,7 +1394,7 @@ def query_posts_for_spy(
 
     Returns:
         List of post dicts with group_name, page_name, post_id, date, post_type,
-        engagement, comments, shares, caption, url, downloaded.
+        engagement, comments, shares, view_count, caption, url, downloaded.
     """
     if not page_names:
         return []
@@ -1055,21 +1409,49 @@ def query_posts_for_spy(
             where += " AND post_type = ?"
             params.append(post_type_filter)
 
-        if download_status == "Chưa tải":
-            where += " AND downloaded = 0"
-        elif download_status == "Đã tải":
-            where += " AND downloaded = 1"
+        status_filters = {
+            "Chưa tải": "not_downloaded",
+            "Đang tải": "downloading",
+            "Tải lỗi": "failed",
+            "Đã tải": "downloaded",
+        }
+        if download_status in status_filters:
+            where += " AND download_status = ?"
+            params.append(status_filters[download_status])
 
-        if mode == "top_engagement":
-            order = "(engagement + comments + shares) DESC"
-        else:
-            order = "date DESC, scraped_at DESC"
+        date_expr = "CASE WHEN length(date) = 10 THEN substr(date, 7, 4) || substr(date, 4, 2) || substr(date, 1, 2) ELSE date END"
+        sort_columns = {
+            "date": date_expr,
+            "page_name": "page_name COLLATE NOCASE",
+            "post_type": "post_type COLLATE NOCASE",
+            "engagement": "engagement",
+            "comments": "comments",
+            "shares": "shares",
+            "total_engagement": "(engagement + comments + shares)",
+            "downloaded": "CASE download_status WHEN 'downloading' THEN 1 WHEN 'failed' THEN 2 WHEN 'downloaded' THEN 3 ELSE 0 END",
+            "view_count": "view_count",
+        }
+        if not sort_by:
+            legacy_modes = {
+                "newest": ("date", "desc"), "oldest": ("date", "asc"),
+                "top_engagement": ("total_engagement", "desc"),
+                "top_reactions": ("engagement", "desc"),
+                "top_comments": ("comments", "desc"),
+                "top_shares": ("shares", "desc"), "top_views": ("view_count", "desc"),
+            }
+            sort_by, sort_order = legacy_modes.get(mode, legacy_modes["newest"])
+        direction = "ASC" if str(sort_order).lower() == "asc" else "DESC"
+        expression = sort_columns.get(sort_by, date_expr)
+        unknown_last = "(view_count = 0) ASC, " if sort_by == "view_count" else ""
+        order = f"{unknown_last}{expression} {direction}, {date_expr} DESC, scraped_at DESC, post_id DESC"
 
         limit_clause = f"LIMIT {int(limit)}" if limit > 0 else ""
 
         sql = f"""
             SELECT group_name, page_name, post_id, date, post_type,
-                   engagement, comments, shares, caption, url, downloaded
+                   engagement, comments, shares, view_count, caption, url, downloaded,
+                   download_path, media_preview_url, media_count, id,
+                   download_status, download_error, rating
             FROM posts
             WHERE {where}
             ORDER BY {order}
@@ -1077,21 +1459,63 @@ def query_posts_for_spy(
         """
 
         cursor = conn.execute(sql, params)
-        posts = [
-            {
+        posts = []
+        for r in cursor.fetchall():
+            preview_path, preview_kind, local_media_count = _local_media_preview(r[12] or "")
+            posts.append({
                 "group_name": r[0], "page_name": r[1], "post_id": r[2],
                 "date": r[3], "post_type": r[4], "engagement": r[5] or 0,
                 "comments": r[6] or 0, "shares": r[7] or 0,
-                "caption": r[8] or "", "url": r[9] or "",
-                "downloaded": r[10] or 0,
-            }
-            for r in cursor.fetchall()
-        ]
+                "view_count": r[8] or 0, "caption": r[9] or "", "url": r[10] or "",
+                "downloaded": r[11] or 0,
+                "download_path": r[12] or "",
+                "preview_path": preview_path,
+                "preview_kind": preview_kind or ("video" if r[4] == "Video" else "image"),
+                "media_preview_url": r[13] or "",
+                "media_count": max(int(r[14] or 0), local_media_count),
+                "id": int(r[15]),
+                "download_status": r[16] or ("downloaded" if r[11] else "not_downloaded"),
+                "download_error": r[17] or "",
+                "rating": max(0, min(5, int(r[18] or 0))),
+            })
         conn.close()
         return posts
     except Exception as e:
         logger.error(f"Post spy query error: {str(e)[:200]}")
         return []
+
+
+def get_spy_post_by_row_id(db_path: str, row_id: int) -> Optional[dict]:
+    """Return one post row for the downloaded-post detail view."""
+    try:
+        conn = _get_conn(db_path)
+        row = conn.execute(
+            """
+            SELECT id, group_name, page_name, post_id, date, post_type,
+                   engagement, comments, shares, view_count, caption, url,
+                   downloaded, download_path, downloaded_at, download_status, download_error, rating
+            FROM posts WHERE id = ?
+            """,
+            (int(row_id),),
+        ).fetchone()
+        conn.close()
+        if not row:
+            return None
+        return {
+            "id": int(row[0]), "group_name": row[1] or "", "page_name": row[2] or "",
+            "post_id": row[3] or "", "date": row[4] or "", "post_type": row[5] or "",
+            "engagement": row[6] or 0, "comments": row[7] or 0,
+            "shares": row[8] or 0, "view_count": row[9] or 0,
+            "caption": row[10] or "", "url": row[11] or "",
+            "downloaded": bool(row[12]), "download_path": row[13] or "",
+            "downloaded_at": row[14] or "",
+            "download_status": row[15] or ("downloaded" if row[12] else "not_downloaded"),
+            "download_error": row[16] or "",
+            "rating": max(0, min(5, int(row[17] or 0))),
+        }
+    except Exception as exc:
+        logger.error(f"Get spy post detail error: {str(exc)[:200]}")
+        return None
 
 
 def mark_posts_downloaded(db_path: str, post_ids: List[str], folder_path: str = "") -> int:
@@ -1104,7 +1528,8 @@ def mark_posts_downloaded(db_path: str, post_ids: List[str], folder_path: str = 
         updated = 0
         for pid in post_ids:
             cur = conn.execute("""
-                UPDATE posts SET downloaded = 1, download_path = ?, downloaded_at = ?
+                UPDATE posts SET downloaded = 1, download_path = ?, downloaded_at = ?,
+                                 download_status = 'downloaded', download_error = ''
                 WHERE post_id = ?
             """, (folder_path, now, pid))
             updated += cur.rowcount
@@ -1114,6 +1539,90 @@ def mark_posts_downloaded(db_path: str, post_ids: List[str], folder_path: str = 
     except Exception as e:
         logger.error(f"Mark downloaded error: {str(e)[:200]}")
         return 0
+
+
+def set_post_rating(db_path: str, row_id: int, rating: int) -> bool:
+    """Persist a 0–5 star rating for one exact post row."""
+    normalized = int(rating)
+    if normalized < 0 or normalized > 5:
+        raise ValueError("Rating must be between 0 and 5")
+    conn = _get_conn(db_path)
+    try:
+        cursor = conn.execute(
+            "UPDATE posts SET rating = ? WHERE id = ?",
+            (normalized, int(row_id)),
+        )
+        conn.commit()
+        return cursor.rowcount > 0
+    finally:
+        conn.close()
+
+
+def mark_posts_download_status(
+    db_path: str,
+    post_ids: List[str],
+    status: str,
+    *,
+    error: str = "",
+    folder_path: str = "",
+) -> int:
+    """Persist a post download lifecycle state for all matching post identifiers."""
+    allowed = {"not_downloaded", "downloading", "failed", "downloaded"}
+    if status not in allowed:
+        raise ValueError(f"Unsupported download status: {status}")
+    clean_ids = list(dict.fromkeys(str(pid or "").strip() for pid in post_ids if str(pid or "").strip()))
+    if not clean_ids:
+        return 0
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    conn = _get_conn(db_path)
+    try:
+        placeholders = ",".join("?" for _ in clean_ids)
+        if status == "downloaded":
+            cursor = conn.execute(
+                f"""
+                UPDATE posts
+                SET downloaded = 1, download_status = 'downloaded', download_error = '',
+                    download_path = ?, downloaded_at = ?
+                WHERE post_id IN ({placeholders})
+                """,
+                [folder_path, now, *clean_ids],
+            )
+        else:
+            cursor = conn.execute(
+                f"""
+                UPDATE posts
+                SET downloaded = 0, download_status = ?, download_error = ?,
+                    download_path = CASE WHEN ? = 'failed' THEN '' ELSE download_path END,
+                    downloaded_at = CASE WHEN ? = 'failed' THEN '' ELSE downloaded_at END
+                WHERE post_id IN ({placeholders})
+                """,
+                [status, str(error or "")[:1000], status, status, *clean_ids],
+            )
+        conn.commit()
+        return int(cursor.rowcount)
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def recover_interrupted_downloads(db_path: str) -> int:
+    """Turn stale in-progress rows into failures when the application starts."""
+    conn = _get_conn(db_path)
+    try:
+        cursor = conn.execute(
+            """
+            UPDATE posts
+            SET downloaded = 0, download_status = 'failed',
+                download_error = 'Tác vụ tải bị gián đoạn do ứng dụng đã dừng'
+            WHERE download_status = 'downloading'
+            """
+        )
+        conn.commit()
+        return int(cursor.rowcount)
+    finally:
+        conn.close()
 
 
 def get_downloaded_posts_by_ids(db_path: str, post_ids: List[str]) -> Dict[str, dict]:
@@ -1178,6 +1687,8 @@ def sync_downloaded_posts_from_folder(db_path: str, output_dir: str) -> int:
             cur = conn.execute("""
                 UPDATE posts
                 SET downloaded = 1,
+                    download_status = 'downloaded',
+                    download_error = '',
                     download_path = CASE WHEN download_path = '' THEN ? ELSE download_path END,
                     downloaded_at = CASE WHEN downloaded_at = '' THEN ? ELSE downloaded_at END
                 WHERE post_id = ? AND downloaded = 0
@@ -1220,6 +1731,54 @@ def bulk_delete_posts(db_path: str, post_ids: List[str]) -> dict:
     except Exception as e:
         logger.error(f"Bulk delete error: {str(e)[:200]}")
         return {"deleted": 0, "paths": []}
+
+
+def bulk_delete_post_rows(db_path: str, row_ids: List[int]) -> dict:
+    """Delete exact post rows and refresh the affected Page counters."""
+    normalized_ids = list(dict.fromkeys(int(value) for value in row_ids if int(value) > 0))
+    if not normalized_ids:
+        return {"deleted": 0, "paths": []}
+    conn = _get_conn(db_path)
+    try:
+        page_urls: set[str] = set()
+        paths: set[str] = set()
+        deleted = 0
+        for offset in range(0, len(normalized_ids), 500):
+            chunk = normalized_ids[offset:offset + 500]
+            placeholders = ",".join("?" for _ in chunk)
+            rows = conn.execute(
+                f"SELECT DISTINCT page_url, download_path FROM posts WHERE id IN ({placeholders})",
+                chunk,
+            ).fetchall()
+            page_urls.update(row[0] for row in rows if row[0])
+            paths.update(row[1] for row in rows if row[1])
+            deleted += conn.execute(
+                f"DELETE FROM posts WHERE id IN ({placeholders})", chunk
+            ).rowcount
+        for page_url in page_urls:
+            conn.execute(
+                """
+                UPDATE pages
+                SET post_count = (SELECT COUNT(*) FROM posts WHERE posts.page_url = pages.page_url)
+                WHERE page_url = ?
+                """,
+                (page_url,),
+            )
+        paths = {
+            path for path in paths
+            if conn.execute(
+                "SELECT 1 FROM posts WHERE download_path = ? LIMIT 1", (path,)
+            ).fetchone() is None
+        }
+        conn.commit()
+        logger.info(f"🗑 Đã xóa {deleted} bài viết được chọn khỏi database")
+        return {"deleted": int(deleted), "paths": sorted(paths)}
+    except Exception as e:
+        conn.rollback()
+        logger.error(f"Bulk delete post rows error: {str(e)[:200]}")
+        raise
+    finally:
+        conn.close()
 
 # ─── Facebook Account CRUD ───────────────────────────────────────────────────
 
@@ -2149,663 +2708,7 @@ def update_page_avatar(db_path: str, fb_page_id: str, avatar_path: str) -> bool:
         return False
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# SOCIAL POST — content_pool & post_history
-# ═══════════════════════════════════════════════════════════════════════════
 
-def save_content_pool(db_path: str, items: List[dict]) -> int:
-    """
-    Upsert content_pool entries.
-    Each item: {folder_name, folder_path, caption}
-    Returns number of saved items.
-    """
-    from datetime import datetime
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    saved = 0
-    try:
-        conn = _get_conn(db_path)
-        for item in items:
-            conn.execute("""
-                INSERT INTO content_pool
-                    (folder_name, folder_path, caption, title, keywords, created_at)
-                VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT(folder_name) DO UPDATE SET
-                    folder_path = excluded.folder_path,
-                    caption = excluded.caption,
-                    title = excluded.title,
-                    keywords = excluded.keywords,
-                    created_at = excluded.created_at
-            """, (
-                item["folder_name"],
-                item["folder_path"],
-                item.get("caption", ""),
-                item.get("title", ""),
-                item.get("keywords", ""),
-                now,
-            ))
-            saved += 1
-        conn.commit()
-        conn.close()
-    except Exception as e:
-        logger.error(f"save_content_pool error: {str(e)[:200]}")
-    return saved
-
-
-def get_all_content_pool(db_path: str) -> List[dict]:
-    """Get all content_pool entries with posting status summary."""
-    try:
-        conn = _get_conn(db_path)
-        rows = conn.execute("""
-            SELECT c.content_id, c.folder_name, c.folder_path, c.caption,
-                   c.title, c.keywords, c.created_at
-            FROM content_pool c
-            ORDER BY c.created_at DESC
-        """).fetchall()
-
-        result = []
-        for r in rows:
-            cid = r[0]
-            # Get posting history for this content
-            history = conn.execute("""
-                SELECT page_name, status FROM post_history WHERE content_id = ?
-            """, (cid,)).fetchall()
-            status_parts = []
-            for h in history:
-                icon = "✅" if h[1] == "Success" else ("🕒" if h[1] in ("Pending", "Scheduled") else "❌")
-                status_parts.append(f"{h[0]}: {icon}")
-            status_str = " | ".join(status_parts) if status_parts else "—"
-
-            result.append({
-                "content_id": cid,
-                "folder_name": r[1],
-                "folder_path": r[2],
-                "caption": r[3],
-                "title": r[4],
-                "keywords": r[5],
-                "created_at": r[6],
-                "post_status": status_str,
-            })
-        conn.close()
-        return result
-    except Exception as e:
-        logger.error(f"get_all_content_pool error: {str(e)[:200]}")
-        return []
-
-
-def delete_content_pool(db_path: str, content_ids: List[int]) -> int:
-    """Delete content_pool entries by IDs."""
-    try:
-        conn = _get_conn(db_path)
-        placeholders = ",".join("?" * len(content_ids))
-        conn.execute(f"DELETE FROM post_history WHERE content_id IN ({placeholders})", content_ids)
-        cur = conn.execute(f"DELETE FROM content_pool WHERE content_id IN ({placeholders})", content_ids)
-        conn.commit()
-        deleted = cur.rowcount
-        conn.close()
-        return deleted
-    except Exception as e:
-        logger.error(f"delete_content_pool error: {str(e)[:200]}")
-        return 0
-
-
-def update_content_caption(db_path: str, content_id: int, new_caption: str) -> bool:
-    """Update caption for a single content_pool entry. Returns True on success."""
-    try:
-        conn = _get_conn(db_path)
-        conn.execute(
-            "UPDATE content_pool SET caption = ? WHERE content_id = ?",
-            (new_caption, content_id),
-        )
-        conn.commit()
-        conn.close()
-        return True
-    except Exception as e:
-        logger.error(f"update_content_caption error: {str(e)[:200]}")
-        return False
-
-
-def bulk_insert_schedule(db_path: str, records: List[dict]) -> int:
-    """
-    Insert multiple post_history records in a single transaction.
-    Each record: {content_id, account_id, page_name, scheduled_time, status}
-    Returns number of inserted records.
-    """
-    if not records:
-        return 0
-    try:
-        conn = _get_conn(db_path)
-        conn.execute("BEGIN TRANSACTION")
-        count = 0
-        for rec in records:
-            conn.execute("""
-                INSERT INTO post_history
-                    (content_id, account_id, page_name, scheduled_time, status, scheduling_method)
-                VALUES (?, ?, ?, ?, ?, ?)
-            """, (
-                rec["content_id"],
-                rec.get("account_id", ""),
-                rec["page_name"],
-                rec["scheduled_time"],
-                rec.get("status", "Pending"),
-                rec.get("scheduling_method", "App"),
-            ))
-            count += 1
-        conn.commit()
-        conn.close()
-        return count
-    except Exception as e:
-        logger.error(f"bulk_insert_schedule error: {str(e)[:200]}")
-        return 0
-
-
-def check_duplicate_schedule(
-    db_path: str, content_id: int, page_name: str, scheduled_time: str,
-) -> bool:
-    """Check if this content is already scheduled for this page at this time."""
-    try:
-        conn = _get_conn(db_path)
-        row = conn.execute("""
-            SELECT COUNT(*) FROM post_history
-            WHERE content_id = ? AND page_name = ? AND scheduled_time = ?
-              AND status IN ('Pending', 'Scheduled', 'Success')
-        """, (content_id, page_name, scheduled_time)).fetchone()
-        conn.close()
-        return row[0] > 0 if row else False
-    except Exception:
-        return False
-
-
-def bulk_insert_video_jobs(db_path: str, records: List[dict]) -> int:
-    """Insert multi-platform video post jobs, skipping duplicate rows."""
-    if not records:
-        return 0
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    try:
-        conn = _get_conn(db_path)
-        conn.execute("BEGIN TRANSACTION")
-        inserted = 0
-        for rec in records:
-            target_key = rec.get("target_uid", "") or rec.get("target_name", "")
-            exists = conn.execute("""
-                SELECT 1 FROM video_post_jobs
-                WHERE content_id = ? AND platform = ? AND target_uid = ?
-                  AND scheduled_time = ? AND status IN
-                      ('Pending', 'Running', 'Scheduled', 'Success', 'Unsupported')
-                LIMIT 1
-            """, (
-                rec["content_id"],
-                rec.get("platform", ""),
-                target_key,
-                rec.get("scheduled_time", ""),
-            )).fetchone()
-            if exists:
-                continue
-            cur = conn.execute("""
-                INSERT OR IGNORE INTO video_post_jobs
-                    (content_id, platform, account_id, target_id, target_name, target_uid,
-                     scheduled_time, mode, status, error_log, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                rec["content_id"],
-                rec.get("platform", ""),
-                int(rec.get("account_id") or 0),
-                int(rec.get("target_id") or 0),
-                rec.get("target_name", ""),
-                target_key,
-                rec.get("scheduled_time", ""),
-                rec.get("mode", "schedule"),
-                rec.get("status", "Pending"),
-                rec.get("error_log", ""),
-                now,
-                now,
-            ))
-            inserted += cur.rowcount
-        conn.commit()
-        conn.close()
-        return inserted
-    except Exception as e:
-        logger.error(f"bulk_insert_video_jobs error: {str(e)[:200]}")
-        return 0
-
-
-def get_video_post_jobs_filtered(
-    db_path: str,
-    platform: str = "",
-    status: str = "",
-    date_from: str = "",
-    date_to: str = "",
-    account_id: Optional[int] = None,
-) -> List[dict]:
-    """Fetch video post jobs joined with content and social account info."""
-    try:
-        conn = _get_conn(db_path)
-        sql = """
-            SELECT j.job_id, j.content_id, j.platform, j.account_id, j.target_id,
-                   j.target_name, j.target_uid, j.scheduled_time, j.mode, j.status,
-                   j.error_log, j.created_at, j.updated_at,
-                   c.folder_name, c.folder_path, c.caption, c.title, c.keywords,
-                   COALESCE(NULLIF(sa.label,''), NULLIF(sa.username,''), NULLIF(sa.email,''), '') as account_label,
-                   sa.profile_dir
-            FROM video_post_jobs j
-            JOIN content_pool c ON c.content_id = j.content_id
-            LEFT JOIN social_accounts sa ON sa.id = j.account_id
-            WHERE 1=1
-        """
-        params = []
-        if platform:
-            sql += " AND j.platform = ?"
-            params.append(platform)
-        if status:
-            sql += " AND j.status = ?"
-            params.append(status)
-        if date_from:
-            sql += " AND j.scheduled_time >= ?"
-            params.append(date_from)
-        if date_to:
-            sql += " AND j.scheduled_time <= ?"
-            params.append(date_to + " 23:59:59")
-        if account_id is not None:
-            sql += " AND j.account_id = ?"
-            params.append(account_id)
-        sql += " ORDER BY j.scheduled_time, j.job_id"
-        rows = conn.execute(sql, params).fetchall()
-        conn.close()
-        return [
-            {
-                "job_id": r[0], "content_id": r[1], "platform": r[2],
-                "account_id": r[3], "target_id": r[4], "target_name": r[5],
-                "target_uid": r[6], "scheduled_time": r[7], "mode": r[8],
-                "status": r[9], "error_log": r[10], "created_at": r[11],
-                "updated_at": r[12], "folder_name": r[13], "folder_path": r[14],
-                "caption": r[15], "title": r[16], "keywords": r[17],
-                "account_label": r[18], "profile_dir": r[19],
-            }
-            for r in rows
-        ]
-    except Exception as e:
-        logger.error(f"get_video_post_jobs_filtered error: {str(e)[:200]}")
-        return []
-
-
-def get_video_post_jobs_by_ids(db_path: str, job_ids: List[int]) -> List[dict]:
-    if not job_ids:
-        return []
-    try:
-        conn = _get_conn(db_path)
-        placeholders = ",".join("?" * len(job_ids))
-        rows = conn.execute(f"""
-            SELECT j.job_id, j.content_id, j.platform, j.account_id, j.target_id,
-                   j.target_name, j.target_uid, j.scheduled_time, j.mode, j.status,
-                   j.error_log, j.created_at, j.updated_at,
-                   c.folder_name, c.folder_path, c.caption, c.title, c.keywords,
-                   COALESCE(NULLIF(sa.label,''), NULLIF(sa.username,''), NULLIF(sa.email,''), '') as account_label,
-                   sa.profile_dir
-            FROM video_post_jobs j
-            JOIN content_pool c ON c.content_id = j.content_id
-            LEFT JOIN social_accounts sa ON sa.id = j.account_id
-            WHERE j.job_id IN ({placeholders})
-            ORDER BY j.scheduled_time, j.job_id
-        """, job_ids).fetchall()
-        conn.close()
-        return [
-            {
-                "job_id": r[0], "content_id": r[1], "platform": r[2],
-                "account_id": r[3], "target_id": r[4], "target_name": r[5],
-                "target_uid": r[6], "scheduled_time": r[7], "mode": r[8],
-                "status": r[9], "error_log": r[10], "created_at": r[11],
-                "updated_at": r[12], "folder_name": r[13], "folder_path": r[14],
-                "caption": r[15], "title": r[16], "keywords": r[17],
-                "account_label": r[18], "profile_dir": r[19],
-            }
-            for r in rows
-        ]
-    except Exception as e:
-        logger.error(f"get_video_post_jobs_by_ids error: {str(e)[:200]}")
-        return []
-
-
-def get_video_post_jobs_for_records(db_path: str, records: List[dict]) -> List[dict]:
-    """Fetch persisted video jobs matching generated record keys."""
-    if not records:
-        return []
-    found_ids = []
-    try:
-        conn = _get_conn(db_path)
-        for rec in records:
-            row = conn.execute("""
-                SELECT job_id FROM video_post_jobs
-                WHERE content_id = ? AND platform = ? AND account_id = ?
-                  AND target_uid = ? AND scheduled_time = ?
-            """, (
-                rec["content_id"],
-                rec.get("platform", ""),
-                int(rec.get("account_id") or 0),
-                rec.get("target_uid", "") or rec.get("target_name", ""),
-                rec.get("scheduled_time", ""),
-            )).fetchone()
-            if row:
-                found_ids.append(row[0])
-        conn.close()
-    except Exception as e:
-        logger.error(f"get_video_post_jobs_for_records error: {str(e)[:200]}")
-        return []
-    return get_video_post_jobs_by_ids(db_path, found_ids)
-
-
-def update_video_post_job_status(
-    db_path: str, job_id: int, status: str, error_log: str = ""
-) -> bool:
-    try:
-        conn = _get_conn(db_path)
-        conn.execute("""
-            UPDATE video_post_jobs
-            SET status = ?, error_log = ?, updated_at = ?
-            WHERE job_id = ?
-        """, (status, error_log, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), job_id))
-        conn.commit()
-        conn.close()
-        return True
-    except Exception as e:
-        logger.error(f"update_video_post_job_status error: {str(e)[:200]}")
-        return False
-
-
-def update_video_post_job_time(db_path: str, job_id: int, scheduled_time: str) -> bool:
-    try:
-        conn = _get_conn(db_path)
-        conn.execute("""
-            UPDATE video_post_jobs
-            SET scheduled_time = ?, status = 'Pending', error_log = '', updated_at = ?
-            WHERE job_id = ?
-        """, (scheduled_time, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), job_id))
-        conn.commit()
-        conn.close()
-        return True
-    except Exception as e:
-        logger.error(f"update_video_post_job_time error: {str(e)[:200]}")
-        return False
-
-
-def delete_video_post_jobs(db_path: str, job_ids: List[int]) -> int:
-    if not job_ids:
-        return 0
-    try:
-        conn = _get_conn(db_path)
-        placeholders = ",".join("?" * len(job_ids))
-        cur = conn.execute(f"DELETE FROM video_post_jobs WHERE job_id IN ({placeholders})", job_ids)
-        conn.commit()
-        deleted = cur.rowcount
-        conn.close()
-        return deleted
-    except Exception as e:
-        logger.error(f"delete_video_post_jobs error: {str(e)[:200]}")
-        return 0
-
-
-def retry_video_post_jobs(db_path: str, job_ids: List[int]) -> int:
-    if not job_ids:
-        return 0
-    try:
-        conn = _get_conn(db_path)
-        placeholders = ",".join("?" * len(job_ids))
-        cur = conn.execute(f"""
-            UPDATE video_post_jobs
-            SET status = 'Pending', error_log = '', updated_at = ?
-            WHERE job_id IN ({placeholders}) AND status IN ('Failed', 'Unsupported', 'Skipped')
-        """, [datetime.now().strftime("%Y-%m-%d %H:%M:%S")] + job_ids)
-        conn.commit()
-        changed = cur.rowcount
-        conn.close()
-        return changed
-    except Exception as e:
-        logger.error(f"retry_video_post_jobs error: {str(e)[:200]}")
-        return 0
-
-
-def reset_pending_schedule(db_path: str, page_name: str = "") -> int:
-    """
-    Delete all 'Pending' records from post_history.
-    If page_name given, only delete for that page.
-    Returns number of deleted records.
-    """
-    try:
-        conn = _get_conn(db_path)
-        if page_name:
-            cur = conn.execute(
-                "DELETE FROM post_history WHERE status = 'Pending' AND page_name = ?",
-                (page_name,),
-            )
-        else:
-            cur = conn.execute("DELETE FROM post_history WHERE status = 'Pending'")
-        conn.commit()
-        deleted = cur.rowcount
-        conn.close()
-        return deleted
-    except Exception as e:
-        logger.error(f"reset_pending_schedule error: {str(e)[:200]}")
-        return 0
-
-
-# ─── V15.0: Advanced Schedule History Functions ─────────────────────────────
-
-def update_history_status_with_error(
-    db_path: str, history_id: int, status: str, error_log: str = ""
-) -> bool:
-    """Update post_history status and optionally record an error message."""
-    from core.job_states import POST_JOB_STATUSES
-
-    if status not in POST_JOB_STATUSES:
-        raise ValueError(f"Unsupported post job status: {status}")
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    try:
-        conn = _get_conn(db_path)
-        conn.execute(
-            "UPDATE post_history SET status = ?, error_log = ?, last_retry_at = ? WHERE history_id = ?",
-            (status, error_log, now if error_log else "", history_id),
-        )
-        conn.commit()
-        conn.close()
-        return True
-    except Exception as e:
-        logger.error(f"update_history_status_with_error: {str(e)[:100]}")
-        return False
-
-
-def get_missed_app_posts(db_path: str) -> List[dict]:
-    """
-    Return Pending App-mode posts whose scheduled_time has already passed.
-    These are posts the app was supposed to handle but missed (e.g. app was closed).
-    """
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    try:
-        conn = _get_conn(db_path)
-        rows = conn.execute("""
-            SELECT h.history_id, h.content_id, h.page_name, h.scheduled_time,
-                   h.account_id, h.scheduling_method,
-                   c.folder_name, c.folder_path, c.caption
-            FROM post_history h
-            JOIN content_pool c ON h.content_id = c.content_id
-            WHERE h.status = 'Pending'
-              AND h.scheduling_method = 'App'
-              AND h.scheduled_time < ?
-            ORDER BY h.scheduled_time
-        """, (now,)).fetchall()
-        conn.close()
-        return [
-            {
-                "history_id": r[0], "content_id": r[1], "page_name": r[2],
-                "scheduled_time": r[3], "account_id": r[4], "scheduling_method": r[5],
-                "folder_name": r[6], "folder_path": r[7], "caption": r[8],
-            }
-            for r in rows
-        ]
-    except Exception as e:
-        logger.error(f"get_missed_app_posts error: {str(e)[:200]}")
-        return []
-
-
-def get_schedule_history_filtered(
-    db_path: str,
-    page_name: str = "",
-    date_from: str = "",
-    date_to: str = "",
-    status: str = "",
-    scheduling_method: str = "",
-) -> List[dict]:
-    """Fetch post_history records with optional filters, joined with content info."""
-    try:
-        conn = _get_conn(db_path)
-        sql = """
-            SELECT h.history_id, h.content_id, h.page_name, h.scheduled_time,
-                   h.status, h.scheduling_method, h.error_log, h.is_duplicate,
-                   h.last_retry_at, h.account_id,
-                   c.folder_name, c.folder_path, c.caption
-            FROM post_history h
-            JOIN content_pool c ON h.content_id = c.content_id
-            WHERE 1=1
-        """
-        params: list = []
-        if page_name:
-            sql += " AND h.page_name = ?"
-            params.append(page_name)
-        if date_from:
-            sql += " AND h.scheduled_time >= ?"
-            params.append(date_from)
-        if date_to:
-            sql += " AND h.scheduled_time <= ?"
-            params.append(date_to + " 23:59:59")
-        if status:
-            sql += " AND h.status = ?"
-            params.append(status)
-        if scheduling_method:
-            sql += " AND h.scheduling_method = ?"
-            params.append(scheduling_method)
-        sql += " ORDER BY h.scheduled_time DESC"
-        rows = conn.execute(sql, params).fetchall()
-        conn.close()
-        return [
-            {
-                "history_id": r[0], "content_id": r[1], "page_name": r[2],
-                "scheduled_time": r[3], "status": r[4], "scheduling_method": r[5],
-                "error_log": r[6] or "", "is_duplicate": bool(r[7]),
-                "last_retry_at": r[8] or "", "account_id": r[9],
-                "folder_name": r[10], "folder_path": r[11], "caption": r[12],
-            }
-            for r in rows
-        ]
-    except Exception as e:
-        logger.error(f"get_schedule_history_filtered error: {str(e)[:200]}")
-        return []
-
-
-def duplicate_history_record(db_path: str, history_id: int, new_scheduled_time: str) -> int:
-    """
-    Clone a post_history record with a new scheduled time and status='Pending'.
-    Returns new history_id, or -1 on error.
-    """
-    try:
-        conn = _get_conn(db_path)
-        row = conn.execute(
-            "SELECT content_id, account_id, page_name, scheduling_method "
-            "FROM post_history WHERE history_id = ?",
-            (history_id,),
-        ).fetchone()
-        if not row:
-            conn.close()
-            return -1
-        cur = conn.execute("""
-            INSERT INTO post_history
-                (content_id, account_id, page_name, scheduled_time, status,
-                 scheduling_method, is_duplicate, error_log, last_retry_at)
-            VALUES (?, ?, ?, ?, 'Pending', ?, 1, '', '')
-        """, (row[0], row[1], row[2], new_scheduled_time, row[3]))
-        new_id = cur.lastrowid
-        conn.commit()
-        conn.close()
-        return new_id
-    except Exception as e:
-        logger.error(f"duplicate_history_record error: {str(e)[:200]}")
-        return -1
-
-
-def update_history_scheduled_time(db_path: str, history_id: int, new_time: str) -> bool:
-    """Update scheduled_time for a single post_history record. Returns True on success."""
-    try:
-        conn = _get_conn(db_path)
-        conn.execute(
-            "UPDATE post_history SET scheduled_time = ? WHERE history_id = ?",
-            (new_time, history_id),
-        )
-        conn.commit()
-        conn.close()
-        return True
-    except Exception as e:
-        logger.error(f"update_history_scheduled_time error: {str(e)[:200]}")
-        return False
-
-
-def delete_history_records(db_path: str, history_ids: List[int]) -> int:
-    """Delete post_history records by id. Returns number deleted."""
-    if not history_ids:
-        return 0
-    try:
-        conn = _get_conn(db_path)
-        placeholders = ",".join("?" * len(history_ids))
-        cur = conn.execute(
-            f"DELETE FROM post_history WHERE history_id IN ({placeholders})",
-            history_ids,
-        )
-        conn.commit()
-        conn.close()
-        return cur.rowcount
-    except Exception as e:
-        logger.error(f"delete_history_records error: {str(e)[:200]}")
-        return 0
-
-
-def retry_failed_posts(db_path: str, history_ids: List[int]) -> int:
-    """
-    Reset status to 'Pending' for given history_ids so they can be retried.
-    Only affects records that currently have status='Failed'.
-    Returns number of updated rows.
-    """
-    if not history_ids:
-        return 0
-    try:
-        conn = _get_conn(db_path)
-        placeholders = ",".join("?" * len(history_ids))
-        cur = conn.execute(
-            f"UPDATE post_history "
-            f"SET status = 'Pending', error_log = '', last_retry_at = '' "
-            f"WHERE history_id IN ({placeholders}) AND status = 'Failed'",
-            history_ids,
-        )
-        conn.commit()
-        conn.close()
-        return cur.rowcount
-    except Exception as e:
-        logger.error(f"retry_failed_posts error: {str(e)[:200]}")
-        return 0
-
-
-def recover_interrupted_webui_jobs(db_path: str) -> int:
-    """Return WebUI jobs left Running by a previous crash to Pending."""
-    try:
-        conn = _get_conn(db_path)
-        cur = conn.execute("""
-            UPDATE post_history
-            SET status = 'Pending',
-                error_log = 'Khôi phục sau khi ứng dụng bị đóng trong lúc xử lý',
-                last_retry_at = ?
-            WHERE status = 'Running' AND scheduling_method = 'WebUI'
-        """, (datetime.now().strftime("%Y-%m-%d %H:%M:%S"),))
-        conn.commit()
-        changed = cur.rowcount
-        conn.close()
-        return changed
-    except Exception as e:
-        logger.error(f"recover_interrupted_webui_jobs error: {str(e)[:200]}")
-        return 0
 
 
 # ─── Page Spy Manager: Scraped Pages CRUD ────────────────────────────────────

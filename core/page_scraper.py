@@ -6,12 +6,15 @@ from AJAX calls triggered by scrolling.
 """
 
 import json
+import random
 import re
 import time
 import threading
 import subprocess
 import sys
 import os
+import urllib.request
+import urllib.parse
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -30,9 +33,12 @@ class ScrapedPost:
     engagement: int = 0
     comments: int = 0
     shares: int = 0
+    view_count: int = 0
     caption: str = ""
     page_name: str = ""
     url: str = ""
+    media_preview_url: str = ""
+    media_count: int = 0
 
 
 CHROME_PATHS = [
@@ -41,7 +47,20 @@ CHROME_PATHS = [
     os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
 ]
 
-CDP_PORT_BASE = 9300  # Base port; actual = base + account_id
+CDP_PORT_BASE = 9400  # Keep in sync with Account Manager's dedicated Chrome ports.
+
+GENERIC_FACEBOOK_PAGE_NAMES = {
+    "chi tiết", "details", "xem thêm", "see more", "bài viết", "post",
+    "ảnh", "photos", "video", "videos", "reels", "trang", "page",
+    "facebook", "thông báo", "notifications", "đoạn chat", "chats",
+    "thông tin liên hệ", "contact info", "giới thiệu", "about",
+}
+
+
+def is_valid_facebook_page_name(value: object) -> bool:
+    """Reject navigation/dialog labels that Facebook sometimes exposes as the page title."""
+    name = re.sub(r"\s+", " ", str(value or "")).strip()
+    return 1 < len(name) <= 300 and name.casefold() not in GENERIC_FACEBOOK_PAGE_NAMES
 
 
 def _find_chrome() -> Optional[str]:
@@ -89,6 +108,34 @@ def _parse_abbreviated_number(s: str) -> int:
     try:
         return int(float(s) * mul)
     except (ValueError, TypeError):
+        return 0
+
+
+def _parse_metric_number(value) -> int:
+    """Parse localized compact metrics such as 1,2K, 2.5M or 12 nghìn."""
+    if isinstance(value, (int, float)):
+        return max(0, int(value))
+    text = str(value or "").strip().lower()
+    match = re.search(
+        r"([\d.,]+)\s*(k|m|b|n|nghìn|ngàn|triệu|tỷ)?", text, re.IGNORECASE
+    )
+    if not match:
+        return 0
+    number = match.group(1)
+    suffix = (match.group(2) or "").lower()
+    multiplier = {
+        "k": 1_000, "n": 1_000, "nghìn": 1_000, "ngàn": 1_000,
+        "m": 1_000_000, "triệu": 1_000_000,
+        "b": 1_000_000_000, "tỷ": 1_000_000_000,
+    }.get(suffix, 1)
+    try:
+        if multiplier > 1:
+            normalized = number.replace(".", "").replace(",", ".")
+            if number.count(".") == 1 and "," not in number:
+                normalized = number
+            return max(0, round(float(normalized) * multiplier))
+        return max(0, int(re.sub(r"[.,]", "", number)))
+    except (TypeError, ValueError):
         return 0
 
 
@@ -214,6 +261,8 @@ class _PostCollector:
                             existing["comments"] = post["comments"]
                         if post.get("shares", 0) > existing.get("shares", 0):
                             existing["shares"] = post["shares"]
+                        if post.get("view_count", 0) > existing.get("view_count", 0):
+                            existing["view_count"] = post["view_count"]
                         # Merge empty text fields
                         if post.get("date") and not existing.get("date"):
                             existing["date"] = post["date"]
@@ -221,6 +270,10 @@ class _PostCollector:
                             existing["caption"] = post["caption"]
                         if post.get("url") and (not existing.get("url") or existing["url"] == f"https://www.facebook.com/{pid}"):
                             existing["url"] = post["url"]
+                        if post.get("media_preview_url") and not existing.get("media_preview_url"):
+                            existing["media_preview_url"] = post["media_preview_url"]
+                        if post.get("media_count", 0) > existing.get("media_count", 0):
+                            existing["media_count"] = post["media_count"]
                         # Update post_type if previously Text
                         if existing.get("post_type") == "Text" and post.get("post_type") in ("Ảnh", "Video"):
                             existing["post_type"] = post["post_type"]
@@ -417,6 +470,10 @@ class _PostCollector:
 
         # --- Post type ---
         post_type = self._detect_post_type(node)
+        media_preview_url, media_count = self._extract_media_metadata(node)
+
+        # --- Video/Reels views ---
+        view_count = self._extract_view_count(node)
 
         # --- URL ---
         url = f"https://www.facebook.com/{post_id}"
@@ -429,14 +486,14 @@ class _PostCollector:
             url = url_match.group(1).replace("\\/", "/")
 
         # Only return if we have meaningful data
-        if not date_str and not caption and not engagement:
+        if not date_str and not caption and not engagement and not view_count:
             return None
 
         # Debug: log final values for first few posts
         if len(self._posts) < 5:
             logger.debug(
                 f"[DEBUG] Post {post_id} FINAL: date={date_str}, engagement={engagement}, "
-                f"comments={comments}, shares={shares}, type={post_type}"
+                f"comments={comments}, shares={shares}, views={view_count}, type={post_type}"
             )
 
         return {
@@ -446,8 +503,11 @@ class _PostCollector:
             "engagement": engagement,
             "comments": comments,
             "shares": shares,
+            "view_count": view_count,
             "caption": caption,
             "url": url,
+            "media_preview_url": media_preview_url,
+            "media_count": media_count,
         }
 
     def _deep_find(self, obj, key: str):
@@ -465,6 +525,124 @@ class _PostCollector:
                 if result is not None:
                     return result
         return None
+
+    @staticmethod
+    def _valid_preview_url(value: object) -> str:
+        """Allow only Facebook CDN image URLs suitable for an <img> preview."""
+        url = str(value or "").replace("\\/", "/").strip()
+        try:
+            parsed = urllib.parse.urlsplit(url)
+        except ValueError:
+            return ""
+        host = (parsed.hostname or "").lower()
+        if parsed.scheme != "https" or not (host == "fbcdn.net" or host.endswith(".fbcdn.net")):
+            return ""
+        return url
+
+    def _extract_media_metadata(self, node: dict) -> tuple[str, int]:
+        """Extract one safe preview image and a conservative attachment count."""
+        media: list[tuple[str, str]] = []
+        seen_media: set[str] = set()
+
+        def best_image(value: object, allow_any_fbcdn: bool) -> str:
+            candidates: list[tuple[int, str]] = []
+
+            def collect(obj: object, path: tuple[str, ...] = ()) -> None:
+                if isinstance(obj, dict):
+                    width = int(obj.get("width", 0) or 0) if str(obj.get("width", "")).isdigit() else 0
+                    height = int(obj.get("height", 0) or 0) if str(obj.get("height", "")).isdigit() else 0
+                    path_text = ".".join(path).lower()
+                    for key, child in obj.items():
+                        child_path = (*path, str(key))
+                        if key in {"uri", "url", "src"} and isinstance(child, str):
+                            preview = self._valid_preview_url(child)
+                            looks_like_image = (
+                                any(token in path_text for token in (
+                                    "image", "thumbnail", "photo", "poster", "preview", "cover"
+                                ))
+                                or re.search(r"\.(?:jpe?g|png|webp|gif)(?:\?|$)", preview, re.IGNORECASE)
+                            )
+                            excluded = any(token in path_text for token in (
+                                "actor", "author", "avatar", "profile_picture", "profile_pic",
+                                "badge", "emoji", "icon", "logo", "sprite", "sticker",
+                            ))
+                            if preview and not excluded and (allow_any_fbcdn or looks_like_image):
+                                # Prefer an actual preview/thumbnail around 640px instead of a
+                                # full-resolution attachment. No file is downloaded here.
+                                longest_side = max(width, height)
+                                if 240 <= longest_side <= 960:
+                                    size_score = 400_000_000 - abs(longest_side - 640) * 100_000
+                                elif longest_side > 0:
+                                    size_score = max(1, 100_000_000 - abs(longest_side - 640) * 10_000)
+                                else:
+                                    size_score = 10_000_000
+                                score = size_score
+                                if "preferred_thumbnail" in path_text or "thumbnail" in path_text or "poster" in path_text:
+                                    score += 3_000_000_000
+                                elif "preview" in path_text or "image" in path_text or "photo" in path_text:
+                                    score += 1_000_000_000
+                                candidates.append((score, preview))
+                        elif isinstance(child, (dict, list)):
+                            collect(child, child_path)
+                elif isinstance(obj, list):
+                    for index, child in enumerate(obj):
+                        collect(child, (*path, str(index)))
+
+            collect(value)
+            return max(candidates, default=(0, ""), key=lambda item: item[0])[1]
+
+        def visit(obj: object) -> None:
+            if isinstance(obj, dict):
+                typename = str(obj.get("__typename", ""))
+                if typename in {"Photo", "Video"}:
+                    preview = best_image(obj, allow_any_fbcdn=typename == "Photo")
+                    identity = str(obj.get("id") or obj.get("video_id") or preview)
+                    if identity and identity not in seen_media:
+                        seen_media.add(identity)
+                        media.append((preview, typename))
+                    return
+                for child in obj.values():
+                    if isinstance(child, (dict, list)):
+                        visit(child)
+            elif isinstance(obj, list):
+                for child in obj:
+                    visit(child)
+
+        content = node.get("comet_sections", {}).get("content", {})
+        visit(content)
+        preview = next((url for url, _kind in media if url), "")
+        if not preview:
+            preview = best_image(content, allow_any_fbcdn=False)
+        count = len(media) if media else (1 if preview else 0)
+        return preview, count
+
+    def _extract_view_count(self, obj) -> int:
+        """Find the strongest explicit video/Reels view or play count in GraphQL data."""
+        keys = {
+            "view_count", "video_view_count", "video_views", "video_play_count",
+            "play_count", "plays_count", "total_video_views", "view_count_text",
+            "video_view_count_text", "play_count_text",
+        }
+        candidates = []
+
+        def visit(value):
+            if isinstance(value, dict):
+                for key, child in value.items():
+                    if str(key).lower() in keys:
+                        if isinstance(child, dict):
+                            for inner_key in ("count", "value", "text", "total_count"):
+                                if inner_key in child:
+                                    candidates.append(_parse_metric_number(child[inner_key]))
+                        else:
+                            candidates.append(_parse_metric_number(child))
+                    if isinstance(child, (dict, list)):
+                        visit(child)
+            elif isinstance(value, list):
+                for child in value:
+                    visit(child)
+
+        visit(obj)
+        return max(candidates or [0])
 
     def _detect_post_type(self, node: dict) -> str:
         """Detect post type (Video/Ảnh/Text) via JSON traversal of media attachments."""
@@ -558,6 +736,17 @@ class _PostCollector:
             has_photo = '"__typename":"Photo"' in block
             post_type = "Video" if has_video else ("Ảnh" if has_photo else "Text")
 
+            media_preview_url = ""
+            preview_match = re.search(
+                r'"(?:uri|url)":\s*"(https:\\/\\/[^" ]*?fbcdn\.net[^" ]*)"',
+                block,
+                re.IGNORECASE,
+            )
+            if preview_match:
+                candidate = _decode_unicode_escapes(preview_match.group(1)).replace("\\/", "/")
+                if re.search(r"\.(?:jpe?g|png|webp|gif)(?:\?|$)", candidate, re.IGNORECASE):
+                    media_preview_url = self._valid_preview_url(candidate)
+
             engagement = 0
             react_m = re.search(r'"reaction_count":\s*\{"count":\s*(\d+)', block)
             if react_m:
@@ -589,15 +778,26 @@ class _PostCollector:
                 if share_m3:
                     shares = int(share_m3.group(1))
 
+            view_count = 0
+            for view_pattern in (
+                r'"(?:video_)?view_count":\s*(\d+)',
+                r'"(?:video_)?play_count":\s*(\d+)',
+                r'"(?:video_)?view_count(?:_text)?":\s*"([\d.,]+\s*(?:K|M|B|N|nghìn|triệu|tỷ)?)',
+                r'([\d.,]+\s*(?:K|M|B|N|nghìn|triệu|tỷ)?)\s*(?:lượt xem|views?|plays?)',
+            ):
+                view_match = re.search(view_pattern, block, re.IGNORECASE)
+                if view_match:
+                    view_count = max(view_count, _parse_metric_number(view_match.group(1)))
+
             # Debug: show extracted values for first posts
             if self.count < 5:
                 logger.debug(
                     f"[TEXT-POST] pid={pid}: date={date_str}, "
-                    f"engage={engagement}, cmt={comments}, shares={shares}, "
+                    f"engage={engagement}, cmt={comments}, shares={shares}, views={view_count}, "
                     f"type={post_type}, caption_len={len(caption)}"
                 )
 
-            if not date_str and not caption and not engagement:
+            if not date_str and not caption and not engagement and not view_count:
                 continue
 
             with self._lock:
@@ -609,8 +809,11 @@ class _PostCollector:
                         "engagement": engagement,
                         "comments": comments,
                         "shares": shares,
+                        "view_count": view_count,
                         "caption": _safe_str(caption),
                         "url": f"https://www.facebook.com/{pid}",
+                        "media_preview_url": media_preview_url,
+                        "media_count": 1 if media_preview_url else 0,
                     }
                     new_count += 1
                 else:
@@ -622,12 +825,18 @@ class _PostCollector:
                         existing["comments"] = comments
                     if shares > existing.get("shares", 0):
                         existing["shares"] = shares
+                    if view_count > existing.get("view_count", 0):
+                        existing["view_count"] = view_count
                     if date_str and not existing.get("date"):
                         existing["date"] = date_str
                     if caption and not existing.get("caption"):
                         existing["caption"] = _safe_str(caption)
                     if existing.get("post_type") == "Text" and post_type in ("Ảnh", "Video"):
                         existing["post_type"] = post_type
+                    if media_preview_url and not existing.get("media_preview_url"):
+                        existing["media_preview_url"] = media_preview_url
+                    if media_preview_url and existing.get("media_count", 0) < 1:
+                        existing["media_count"] = 1
 
         return new_count
 
@@ -656,16 +865,18 @@ class PageScraper:
             self._cdp_port = cdp_port
         else:
             acct_id = self._account.get("id", 0) or 0
-            self._cdp_port = CDP_PORT_BASE + int(acct_id)
+            self._cdp_port = CDP_PORT_BASE + (int(acct_id) % 400)
         self._stop_event = threading.Event()
         self._chrome_process = None
         self._browser = None
         self._context = None
         self._pw_instance = None
+        self._reused_browser = False
         self.last_follower_count = 0  # populated after scrape_page
         self.last_observed_post_ids: List[str] = []
         self.last_scan_stop_reason = ""
         self.last_scan_complete = False
+        self.last_archive_boundary_found = False
 
     def _get_profile_dir(self) -> str:
         """Get per-account Chrome profile directory."""
@@ -691,32 +902,36 @@ class PageScraper:
             acct_label = self._account.get("label") or self._account.get("username") or "default"
             logger.info(f"🚀 Chrome profile: {acct_label}")
 
-            chrome_cmd = [
-                chrome_path,
-                f"--remote-debugging-port={self._cdp_port}",
-                f"--user-data-dir={profile_dir}",
-                "--no-first-run",
-                "--no-default-browser-check",
-                "--disable-popup-blocking",
-                "--disable-gpu",
-                "--window-size=1280,900",
-                "--disable-blink-features=AutomationControlled",
-            ]
+            self._reused_browser = self._cdp_is_ready()
+            if self._reused_browser:
+                logger.info(f"Kết nối Chrome đang mở (port {self._cdp_port})...")
+            else:
+                chrome_cmd = [
+                    chrome_path,
+                    f"--remote-debugging-port={self._cdp_port}",
+                    f"--user-data-dir={profile_dir}",
+                    "--no-first-run",
+                    "--no-default-browser-check",
+                    "--disable-popup-blocking",
+                    "--disable-gpu",
+                    "--window-size=1280,900",
+                    "--disable-blink-features=AutomationControlled",
+                ]
 
-            logger.info(f"Đang khởi động Chrome (port {self._cdp_port})...")
-            self._chrome_process = subprocess.Popen(
-                chrome_cmd,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                creationflags=(
-                    subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
-                ),
-            )
-            time.sleep(4)
+                logger.info(f"Đang khởi động Chrome (port {self._cdp_port})...")
+                self._chrome_process = subprocess.Popen(
+                    chrome_cmd,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    creationflags=(
+                        subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+                    ),
+                )
+                time.sleep(4)
 
             self._pw_instance = sync_playwright().start()
             self._browser = self._pw_instance.chromium.connect_over_cdp(
-                f"http://localhost:{self._cdp_port}",
+                f"http://127.0.0.1:{self._cdp_port}",
                 timeout=15000,
             )
 
@@ -738,6 +953,15 @@ class PageScraper:
         except Exception as e:
             logger.error(f"Lỗi khởi động Chrome: {str(e)[:200]}")
             self.stop()
+            return False
+
+    def _cdp_is_ready(self) -> bool:
+        try:
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{self._cdp_port}/json/version", timeout=1.5
+            ) as response:
+                return response.status == 200
+        except Exception:
             return False
 
     def _do_account_login(self) -> None:
@@ -771,7 +995,7 @@ class PageScraper:
         """Shutdown browser."""
         self._stop_event.set()
         try:
-            if self._browser:
+            if self._browser and not self._reused_browser:
                 self._browser.close()
         except Exception:
             pass
@@ -794,6 +1018,7 @@ class PageScraper:
         self._context = None
         self._chrome_process = None
         self._pw_instance = None
+        self._reused_browser = False
 
     def _inject_cookies_cdp(self) -> None:
         """Inject cookies via CDP for reliable authentication in Chrome.
@@ -951,6 +1176,8 @@ class PageScraper:
         on_progress: Optional[Callable] = None,
         known_post_ids: Optional[set] = None,
         stop_post_ids: Optional[set] = None,
+        archive_after_post_ids: Optional[set] = None,
+        delay_profile: Optional[dict] = None,
     ) -> List[ScrapedPost]:
         """Scrape up to max_posts from a Facebook Page.
         
@@ -966,6 +1193,7 @@ class PageScraper:
         self.last_observed_post_ids = []
         self.last_scan_stop_reason = ""
         self.last_scan_complete = False
+        self.last_archive_boundary_found = False
         url = self._normalize_page_url(page_url)
         logger.info(f"Đang tải: {url}")
         if known_post_ids:
@@ -1032,14 +1260,20 @@ class PageScraper:
                 pass
 
             boundary_ids = stop_post_ids if stop_post_ids is not None else known_post_ids
-            initial_ids = {str(item.get("post_id") or "") for item in collector.get_posts()}
-            if boundary_ids and initial_ids.intersection(boundary_ids):
-                self.last_scan_stop_reason = "boundary"
-                logger.info("🆕 Đã gặp mốc quét trước trong dữ liệu ban đầu")
-            else:
-                self.last_scan_stop_reason = self._scroll_for_posts(
-                    page, collector, max_posts, on_progress, boundary_ids
+            if archive_after_post_ids is not None:
+                self.last_scan_stop_reason = self._scroll_for_archive_posts(
+                    page, collector, max_posts, on_progress,
+                    known_post_ids or set(), archive_after_post_ids, delay_profile,
                 )
+            else:
+                initial_ids = {str(item.get("post_id") or "") for item in collector.get_posts()}
+                if boundary_ids and initial_ids.intersection(boundary_ids):
+                    self.last_scan_stop_reason = "boundary"
+                    logger.info("🆕 Đã gặp mốc quét trước trong dữ liệu ban đầu")
+                else:
+                    self.last_scan_stop_reason = self._scroll_for_posts(
+                        page, collector, max_posts, on_progress, boundary_ids, delay_profile
+                    )
 
             self.last_observed_post_ids = [
                 str(item.get("post_id") or "")
@@ -1059,7 +1293,13 @@ class PageScraper:
             self._enrich_engagement_from_dom(page, collector)
 
             # Build final results
-            posts = self._build_results(collector, page_name, max_posts, known_post_ids)
+            posts = self._build_results(
+                collector, page_name, max_posts, known_post_ids,
+                archive_after_post_ids=archive_after_post_ids,
+            )
+            if archive_after_post_ids is not None:
+                self.last_observed_post_ids = [post.post_id for post in posts if post.post_id]
+                self.last_scan_complete = self.last_archive_boundary_found and self.last_scan_stop_reason in {"limit", "exhausted"}
 
             logger.info(
                 f"Hoàn thành: {len(posts)} bài viết từ '{page_name}'"
@@ -1084,6 +1324,7 @@ class PageScraper:
         max_posts: int,
         on_progress: Optional[Callable],
         known_post_ids: Optional[set] = None,
+        delay_profile: Optional[dict] = None,
     ) -> str:
         """Scroll the page to trigger GraphQL data loading.
         
@@ -1096,6 +1337,7 @@ class PageScraper:
         no_new_count = 0
         prev_count = collector.count
         max_scrolls = max(max_posts * 3, 50)
+        last_pause_bucket = 0
 
         for i in range(max_scrolls):
             if self._stop_event.is_set():
@@ -1129,6 +1371,7 @@ class PageScraper:
                 )
                 if on_progress:
                     on_progress(min(current, max_posts), f"{current}/{max_posts}")
+                self._enrich_previews_from_dom(page, collector)
 
                 # Stop as soon as one stable marker from the previous successful scan appears.
                 if known_post_ids:
@@ -1139,6 +1382,10 @@ class PageScraper:
                         logger.info("🆕 Đã gặp mốc quét trước — dừng quét bài mới")
                         return "boundary"
 
+                last_pause_bucket = self._maybe_rest_after_batch(
+                    current, max_posts, last_pause_bucket, delay_profile, on_progress
+                )
+
                 prev_count = current
             else:
                 no_new_count += 1
@@ -1148,6 +1395,148 @@ class PageScraper:
                 logger.info("Không còn bài mới")
                 return "exhausted"
         return "exhausted"
+
+    @staticmethod
+    def _archive_candidates(raw: List[dict], known_ids: set, boundary_ids: set) -> tuple[bool, List[dict]]:
+        """Return unknown posts occurring after the oldest matched archive marker."""
+        if not boundary_ids:
+            return True, [item for item in raw if str(item.get("post_id") or "") not in known_ids]
+        matched = [
+            index for index, item in enumerate(raw)
+            if str(item.get("post_id") or "") in boundary_ids
+        ]
+        if not matched:
+            return False, []
+        edge = max(matched)
+        return True, [
+            item for item in raw[edge + 1:]
+            if str(item.get("post_id") or "") and str(item.get("post_id") or "") not in known_ids
+        ]
+
+    def _scroll_for_archive_posts(
+        self, page, collector: _PostCollector, max_posts: int,
+        on_progress: Optional[Callable], known_ids: set, boundary_ids: set,
+        delay_profile: Optional[dict],
+    ) -> str:
+        """Seek the oldest saved boundary, then collect the next historical batch."""
+        no_new_count = 0
+        previous_total = collector.count
+        last_pause_bucket = 0
+        max_scrolls = max(min((len(known_ids) + max_posts) * 3, 6000), 100)
+
+        for index in range(max_scrolls):
+            if self._stop_event.is_set():
+                return "stopped"
+            boundary_found, candidates = self._archive_candidates(
+                collector.get_posts(), known_ids, boundary_ids
+            )
+            self.last_archive_boundary_found = boundary_found
+            if boundary_found and len(candidates) >= max_posts:
+                logger.info(f"Đã lấy đủ {max_posts} bài cũ sau mốc lưu")
+                return "limit"
+
+            page.evaluate("""() => {
+                window.scrollBy(0, 1200);
+                const sv = document.getElementById('scrollview');
+                if (sv) { sv.scrollTop += 1200; sv.dispatchEvent(new Event('scroll', {bubbles: true})); }
+            }""")
+            time.sleep(2.0)
+            current_total = collector.count
+            if current_total > previous_total:
+                no_new_count = 0
+                previous_total = current_total
+                boundary_found, candidates = self._archive_candidates(
+                    collector.get_posts(), known_ids, boundary_ids
+                )
+                self.last_archive_boundary_found = boundary_found
+                self._enrich_previews_from_dom(page, collector)
+                if on_progress:
+                    message = f"Đã gặp mốc · {len(candidates)}/{max_posts}" if boundary_found else "Đang tìm mốc bài cũ nhất…"
+                    on_progress(min(len(candidates), max_posts), message)
+                if boundary_found:
+                    last_pause_bucket = self._maybe_rest_after_batch(
+                        len(candidates), max_posts, last_pause_bucket, delay_profile, on_progress
+                    )
+            else:
+                no_new_count += 1
+            if no_new_count >= 12:
+                return "exhausted"
+        return "exhausted"
+
+    def _maybe_rest_after_batch(
+        self, count: int, target: int, previous_bucket: int,
+        profile: Optional[dict], on_progress: Optional[Callable],
+    ) -> int:
+        if not profile or count >= target:
+            return previous_bucket
+        batch_size = max(1, int(profile.get("batch_size", 100)))
+        bucket = count // batch_size
+        if bucket <= previous_bucket:
+            return previous_bucket
+        long_every = max(batch_size, int(profile.get("long_break_every", 500)))
+        is_long = count > 0 and count % long_every < batch_size
+        low, high = (
+            (profile.get("long_delay_min", 90), profile.get("long_delay_max", 180))
+            if is_long else (profile.get("delay_min", 20), profile.get("delay_max", 40))
+        )
+        seconds = random.uniform(max(0, float(low)), max(float(low), float(high)))
+        logger.info(f"⏳ Nghỉ {seconds:.0f} giây sau {count} bài")
+        if on_progress:
+            on_progress(count, f"Đang nghỉ {seconds:.0f} giây sau {count} bài")
+        deadline = time.time() + seconds
+        while time.time() < deadline and not self._stop_event.is_set():
+            time.sleep(min(0.5, deadline - time.time()))
+        return bucket
+
+    def _enrich_previews_from_dom(self, page, collector: _PostCollector) -> int:
+        """Merge already-rendered post thumbnails without fetching full-size media."""
+        try:
+            previews = page.evaluate("""() => {
+                const results = [];
+                const extractPostId = href => {
+                    const match = String(href || '').match(/(?:posts|videos|permalink)\/?(\d{10,})|(pfbid[A-Za-z0-9]+)|facebook\.com\/(\d{15,})/);
+                    return match ? (match[1] || match[2] || match[3] || '') : '';
+                };
+                for (const article of document.querySelectorAll('[role="article"]')) {
+                    let postId = '';
+                    for (const link of article.querySelectorAll('a[href]')) {
+                        postId = extractPostId(link.href);
+                        if (postId) break;
+                    }
+                    if (!postId) continue;
+                    let best = null;
+                    for (const element of article.querySelectorAll('video[poster], img[src], img[srcset]')) {
+                        const url = element.tagName === 'VIDEO'
+                            ? (element.poster || '') : (element.currentSrc || element.src || '');
+                        if (!/^https:\/\/[^/]*fbcdn\.net\//i.test(url)) continue;
+                        const description = `${element.alt || ''} ${element.getAttribute('aria-label') || ''}`.toLowerCase();
+                        if (/(avatar|ảnh đại diện|profile picture|emoji|icon|logo|sticker)/i.test(description)) continue;
+                        const width = Number(element.naturalWidth || element.videoWidth || element.clientWidth || 0);
+                        const height = Number(element.naturalHeight || element.videoHeight || element.clientHeight || 0);
+                        if ((width && width < 160) || (height && height < 90)) continue;
+                        const score = (element.tagName === 'VIDEO' ? 1000000000 : 0) + Math.max(1, width * height);
+                        if (!best || score > best.score) best = {url, score};
+                    }
+                    if (best) results.push({postId, url: best.url});
+                }
+                return results;
+            }""")
+            merged = 0
+            with collector._lock:
+                for item in previews or []:
+                    post_id = str(item.get("postId") or "")
+                    preview = collector._valid_preview_url(item.get("url"))
+                    post = collector._posts.get(post_id)
+                    if post and preview and not post.get("media_preview_url"):
+                        post["media_preview_url"] = preview
+                        post["media_count"] = max(1, int(post.get("media_count", 0) or 0))
+                        merged += 1
+            if merged:
+                logger.debug(f"[DOM] Bổ sung thumbnail cho {merged} bài đang hiển thị")
+            return merged
+        except Exception as exc:
+            logger.debug(f"DOM preview enrichment skipped: {str(exc)[:120]}")
+            return 0
 
     def _enrich_engagement_from_dom(self, page, collector: _PostCollector) -> None:
         """Enrich posts with engagement data AND dates from visible DOM.
@@ -1165,10 +1554,13 @@ class PageScraper:
                 // Helper: parse a number string with K/M/N suffix
                 function parseNum(s) {
                     if (!s) return 0;
-                    let n = s.toUpperCase().replace(/,/g, '').replace('N', 'K');
+                    let n = s.toUpperCase().trim().replace('N', 'K');
                     let mul = 1;
                     if (n.endsWith('K')) { mul = 1000; n = n.slice(0, -1); }
                     else if (n.endsWith('M')) { mul = 1000000; n = n.slice(0, -1); }
+                    else if (n.endsWith('B')) { mul = 1000000000; n = n.slice(0, -1); }
+                    if (mul > 1) n = n.replace(',', '.');
+                    else n = n.replace(/[.,]/g, '');
                     return Math.round(parseFloat(n) * mul) || 0;
                 }
                 
@@ -1272,7 +1664,7 @@ class PageScraper:
                     }
                     
                     // Extract engagement
-                    let comments = 0, shares = 0, reactions = 0;
+                    let comments = 0, shares = 0, reactions = 0, views = 0;
                     
                     const cmtM = text.match(/([\d,.]+[KkMmNn]?)\s*(?:bình luận|comments?)/i);
                     if (cmtM) comments = parseNum(cmtM[1]);
@@ -1282,14 +1674,44 @@ class PageScraper:
                     
                     const reactM = text.match(/([\d,.]+[KkMmNn]?)\s*(?:lượt thích|likes?|reactions?)/i);
                     if (reactM) reactions = parseNum(reactM[1]);
+
+                    const viewM = text.match(/([\d,.]+[KkMmBbNn]?)\s*(?:lượt xem|views?|plays?)/i);
+                    if (viewM) views = parseNum(viewM[1]);
+
+                    // Reuse an already-rendered thumbnail. Reading currentSrc/poster
+                    // does not open the post or download the full-size attachment.
+                    let mediaPreviewUrl = '';
+                    let bestPreviewScore = -1;
+                    const mediaNodes = [
+                        ...article.querySelectorAll('video[poster]'),
+                        ...article.querySelectorAll('img[src], img[srcset]')
+                    ];
+                    for (const mediaNode of mediaNodes) {
+                        const candidate = mediaNode.tagName === 'VIDEO'
+                            ? (mediaNode.poster || '')
+                            : (mediaNode.currentSrc || mediaNode.src || '');
+                        if (!candidate || !/^https:\/\/[^/]*fbcdn\.net\//i.test(candidate)) continue;
+                        const description = `${mediaNode.alt || ''} ${mediaNode.getAttribute('aria-label') || ''}`.toLowerCase();
+                        if (/(avatar|ảnh đại diện|profile picture|emoji|icon|logo|sticker)/i.test(description)) continue;
+                        const width = Number(mediaNode.naturalWidth || mediaNode.videoWidth || mediaNode.clientWidth || 0);
+                        const height = Number(mediaNode.naturalHeight || mediaNode.videoHeight || mediaNode.clientHeight || 0);
+                        if ((width && width < 160) || (height && height < 90)) continue;
+                        const score = (mediaNode.tagName === 'VIDEO' ? 1000000000 : 0) + Math.max(1, width * height);
+                        if (score > bestPreviewScore) {
+                            bestPreviewScore = score;
+                            mediaPreviewUrl = candidate;
+                        }
+                    }
                     
-                    if (comments > 0 || shares > 0 || reactions > 0 || dateStr) {
+                    if (comments > 0 || shares > 0 || reactions > 0 || views > 0 || dateStr || mediaPreviewUrl) {
                         results.push({
                             postId: postId,
                             comments: comments,
                             shares: shares,
                             reactions: reactions,
+                            views: views,
                             date: dateStr,
+                            mediaPreviewUrl: mediaPreviewUrl,
                         });
                     }
                 }
@@ -1335,8 +1757,16 @@ class PageScraper:
                     if item.get("reactions", 0) > 0 and post.get("engagement", 0) == 0:
                         post["engagement"] = item["reactions"]
                         changed = True
+                    if item.get("views", 0) > post.get("view_count", 0):
+                        post["view_count"] = item["views"]
+                        changed = True
                     if item.get("date") and not post.get("date"):
                         post["date"] = item["date"]
+                        changed = True
+                    dom_preview = self._valid_preview_url(item.get("mediaPreviewUrl"))
+                    if dom_preview and not post.get("media_preview_url"):
+                        post["media_preview_url"] = dom_preview
+                        post["media_count"] = max(1, int(post.get("media_count", 0) or 0))
                         changed = True
                     if changed:
                         enriched += 1
@@ -1346,7 +1776,8 @@ class PageScraper:
                                 f"date={item.get('date','')}, "
                                 f"react={item.get('reactions',0)}, "
                                 f"cmt={item.get('comments',0)}, "
-                                f"shares={item.get('shares',0)}"
+                                f"shares={item.get('shares',0)}, "
+                                f"views={item.get('views',0)}"
                             )
 
             if enriched > 0:
@@ -1361,12 +1792,18 @@ class PageScraper:
         page_name: str,
         max_posts: int,
         known_post_ids: Optional[set] = None,
+        archive_after_post_ids: Optional[set] = None,
     ) -> List[ScrapedPost]:
         """Convert collected data to ScrapedPost list, sorted by date.
         
         If known_post_ids is provided, filters out already-known posts.
         """
         raw = collector.get_posts()
+        if archive_after_post_ids is not None:
+            boundary_found, raw = self._archive_candidates(
+                raw, known_post_ids or set(), archive_after_post_ids
+            )
+            self.last_archive_boundary_found = boundary_found
 
         posts = []
         skipped = 0
@@ -1383,8 +1820,11 @@ class PageScraper:
                 engagement=item.get("engagement", 0),
                 comments=item.get("comments", 0),
                 shares=item.get("shares", 0),
+                view_count=item.get("view_count", 0),
                 caption=item.get("caption", ""),
                 url=item.get("url", ""),
+                media_preview_url=item.get("media_preview_url", ""),
+                media_count=item.get("media_count", 0),
                 page_name=page_name,
             )
             posts.append(post)
@@ -1452,11 +1892,21 @@ class PageScraper:
         try:
             name = page.evaluate(
                 """() => {
+                const genericLabels = new Set([
+                    'chi tiết', 'details', 'xem thêm', 'see more', 'bài viết', 'post',
+                    'ảnh', 'photos', 'video', 'videos', 'reels', 'trang', 'page',
+                    'facebook', 'thông báo', 'notifications', 'đoạn chat', 'chats',
+                    'thông tin liên hệ', 'contact info', 'giới thiệu', 'about'
+                ]);
+                const validName = value => {
+                    const name = String(value || '').replace(/\s+/g, ' ').trim();
+                    return name.length > 1 && name.length <= 300 && !genericLabels.has(name.toLocaleLowerCase('vi'));
+                };
                 // 1. Best: og:title meta tag
                 let og = document.querySelector('meta[property="og:title"]');
                 if (og && og.content) {
                     let t = og.content.trim();
-                    if (t && t !== 'Facebook' && t.length > 1) return t;
+                    if (validName(t)) return t;
                 }
 
                 // 2. Title tag (cleaned)
@@ -1465,7 +1915,7 @@ class PageScraper:
                              .replace(/\\s*-\\s*Facebook.*$/i, '')
                              .replace(/Facebook$/, '')
                              .trim();
-                if (title && title.length > 1 && title !== 'Facebook') return title;
+                if (validName(title)) return title;
 
                 // 3. Try specific Facebook page name selectors
                 // Profile/Page name is usually in a prominent h1 inside main content
@@ -1474,7 +1924,7 @@ class PageScraper:
                     let mainH1 = mainContent.querySelector('h1');
                     if (mainH1) {
                         let t = mainH1.innerText.trim();
-                        if (t && t.length > 1) return t;
+                        if (validName(t)) return t;
                     }
                 }
 
@@ -1484,7 +1934,7 @@ class PageScraper:
                     let label = profileImg.getAttribute('aria-label') || '';
                     let alt = profileImg.closest('svg')?.getAttribute('aria-label') || '';
                     let t = (label || alt).trim();
-                    if (t && t.length > 1) return t;
+                    if (validName(t)) return t;
                 }
 
                 // 5. Fallback: h1 but skip known FB UI labels
@@ -1503,7 +1953,7 @@ class PageScraper:
                 let allH1 = document.querySelectorAll('h1');
                 for (let h of allH1) {
                     let t = h.innerText.trim();
-                    if (t && !skipLabels.includes(t) && t.length > 1) return t;
+                    if (validName(t) && !skipLabels.includes(t)) return t;
                 }
 
                 // 6. Try h2 inside main content only
@@ -1511,14 +1961,14 @@ class PageScraper:
                     let h2 = mainContent.querySelector('h2');
                     if (h2) {
                         let t = h2.innerText.trim();
-                        if (t && !skipLabels.includes(t) && t.length > 1) return t;
+                        if (validName(t) && !skipLabels.includes(t)) return t;
                     }
                 }
 
                 return '';
             }"""
             )
-            if name:
+            if is_valid_facebook_page_name(name):
                 return name
         except Exception:
             pass
@@ -1542,7 +1992,7 @@ class PageScraper:
                 return '';
             }"""
             )
-            if name_from_json:
+            if is_valid_facebook_page_name(name_from_json):
                 return name_from_json
         except Exception:
             pass

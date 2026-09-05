@@ -25,6 +25,7 @@ ghost_sessions/
 history.json
 config.json
 social_accounts_*.csv
+exports/
 
 # Browser profiles and caches
 chrome_profile*/

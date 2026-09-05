@@ -1,8 +1,9 @@
 """
-Tinix FB Studio — WebUI Launcher
+Tinix-Facebook-Hunter — WebUI Launcher
 Starts FastAPI on an available localhost port beginning at 7866 and opens the browser.
 """
 
+import os
 import sys
 import time
 import socket
@@ -36,7 +37,7 @@ def find_available_port(start_port: int = DEFAULT_PORT) -> int:
 
 def open_browser(url: str):
     time.sleep(1.2)
-    print(f"🚀 Opening Tinix FB Studio in your browser: {url}")
+    print(f"🚀 Opening Tinix-Facebook-Hunter in your browser: {url}")
     webbrowser.open(url)
 
 
@@ -45,12 +46,14 @@ def main():
     url = f"http://{HOST}:{port}"
 
     print("=" * 60)
-    print(f"  ⚡ Tinix FB Studio (Modern WebUI Hub) is starting...")
+    print(f"  ⚡ Tinix-Facebook-Hunter (Modern WebUI Hub) is starting...")
     print(f"  🌐 URL: {url}")
     print("=" * 60)
 
-    # Launch browser in a background thread
-    threading.Thread(target=open_browser, args=(url,), daemon=True).start()
+    # Launch browser in a background thread unless disabled
+    no_browser = bool(os.environ.get("TINIX_NO_BROWSER")) or ("--no-browser" in sys.argv)
+    if not no_browser:
+        threading.Thread(target=open_browser, args=(url,), daemon=True).start()
 
     # Start Uvicorn ASGI Server
     uvicorn.run(

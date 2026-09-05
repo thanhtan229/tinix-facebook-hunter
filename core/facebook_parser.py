@@ -995,8 +995,40 @@ class BrowserManager:
                     except Exception:
                         result["has_video"] = True  # fallback: trust the video element
 
-            # Only extract video URL if we confirmed video exists in DOM
-            # Otherwise page source may contain mp4 URLs from ads/related content
+            # Facebook often lazy-loads the player, so the post can be a video even
+            # when no <video> element has been rendered yet. Look for video delivery
+            # data close to this post/video id before giving up.
+            if not result["has_video"]:
+                try:
+                    result["has_video"] = bool(page.evaluate(r"""(videoId) => {
+                        const html = document.documentElement.innerHTML;
+                        const signals = [
+                            'videoDeliveryLegacyFields', 'videoDeliveryResponseFragment',
+                            'dash_manifest', 'playable_url', 'browser_native_hd_url',
+                            'video_redirect', 'video_id'
+                        ];
+                        if (!videoId) return signals.some(signal => html.includes(signal));
+                        const anchors = [
+                            `"video_id":"${videoId}"`, `"video_id": "${videoId}"`,
+                            `"post_id":"${videoId}"`, `"post_id": "${videoId}"`,
+                            `/${videoId}`
+                        ];
+                        for (const anchor of anchors) {
+                            let pos = html.indexOf(anchor);
+                            while (pos >= 0) {
+                                const nearby = html.slice(Math.max(0, pos - 120000), pos + 120000);
+                                if (signals.some(signal => nearby.includes(signal))) return true;
+                                pos = html.indexOf(anchor, pos + anchor.length);
+                            }
+                        }
+                        return false;
+                    }""", video_id))
+                    if result["has_video"]:
+                        logger.info(f"Video detected from page data (video_id={video_id or 'unknown'})")
+                except Exception as exc:
+                    logger.debug(f"Video page-data detection error: {exc}")
+
+            # Only extract a scoped mp4 URL after confirming video indicators.
             if not result["has_video"]:
                 return result
 
@@ -1108,15 +1140,6 @@ class BrowserManager:
                     return result
             except Exception as e:
                 logger.info(f"Error extracting video URL: {e}")
-
-            # Check HTML for video indicators
-            if not result["has_video"]:
-                try:
-                    html_content = page.content()[:80000]
-                    if any(kw in html_content for kw in ["dash_manifest", "videoDelivery", "video_redirect"]):
-                        result["has_video"] = True
-                except Exception:
-                    pass
 
         except Exception:
             pass

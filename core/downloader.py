@@ -21,8 +21,8 @@ from core.url_handler import (
 from core.cookie_handler import parse_cookie_string, validate_cookies
 from core.facebook_parser import BrowserManager, PostData
 from core.media_downloader import save_text_content, download_image, download_video, download_video_direct
-from core.db_storage import get_db_path, mark_posts_downloaded
-from utils.chrome_profiles import download_profile_dir
+from core.db_storage import get_db_path, mark_posts_downloaded, mark_posts_download_status
+from utils.chrome_profiles import chrome_profile_dir, download_profile_dir
 from utils import config
 from utils import logger
 
@@ -277,17 +277,16 @@ class DownloadOrchestrator:
             logger.info("🚀 Bắt đầu tải...")
             logger.info("=" * 50)
 
-            # Start browser
-            self._browser = BrowserManager()
-            if not self._browser.start(self._cookies):
-                logger.error("Không thể khởi động trình duyệt!")
-                if self._on_all_complete:
-                    self._on_all_complete(False, "Lỗi trình duyệt")
-                return
-
             if self._max_threads > 1:
                 self._run_parallel(urls)
             else:
+                # Sync Playwright must be started and used in this same pipeline thread.
+                self._browser = BrowserManager()
+                if not self._browser.start(self._cookies):
+                    logger.error("Không thể khởi động trình duyệt!")
+                    if self._on_all_complete:
+                        self._on_all_complete(False, "Lỗi trình duyệt")
+                    return
                 self._run_sequential(urls)
 
             # Final summary
@@ -295,7 +294,12 @@ class DownloadOrchestrator:
                 logger.info("⏹ Download đã bị dừng bởi người dùng")
             else:
                 logger.info("=" * 50)
-                logger.info("✅ HOÀN THÀNH!")
+                if self.stats.success_posts == self.stats.total_posts:
+                    logger.info("✅ HOÀN THÀNH!")
+                elif self.stats.success_posts > 0:
+                    logger.warning("⚠️ HOÀN THÀNH MỘT PHẦN!")
+                else:
+                    logger.error("❌ TẢI THẤT BẠI!")
                 logger.info(
                     f"   Thành công: {self.stats.success_posts}/{self.stats.total_posts} posts"
                 )
@@ -306,8 +310,12 @@ class DownloadOrchestrator:
                 logger.info("=" * 50)
 
             if self._on_all_complete:
-                has_success = self.stats.success_posts > 0
-                self._on_all_complete(has_success, "Hoàn thành")
+                all_success = self.stats.total_posts > 0 and self.stats.success_posts == self.stats.total_posts
+                summary = (
+                    f"{self.stats.success_posts}/{self.stats.total_posts} bài thành công; "
+                    f"{self.stats.failed_posts} bài thất bại"
+                )
+                self._on_all_complete(all_success, summary)
 
         except Exception as e:
             logger.error(f"Pipeline error: {str(e)[:300]}")
@@ -375,14 +383,24 @@ class DownloadOrchestrator:
                 logger.info("⏹ Download đã bị dừng bởi người dùng")
             else:
                 logger.info("=" * 50)
-                logger.info("✅ HOÀN THÀNH!")
+                if self.stats.success_posts == self.stats.total_posts:
+                    logger.info("✅ HOÀN THÀNH!")
+                elif self.stats.success_posts > 0:
+                    logger.warning("⚠️ HOÀN THÀNH MỘT PHẦN!")
+                else:
+                    logger.error("❌ TẢI THẤT BẠI!")
                 logger.info(f"   Thành công: {self.stats.success_posts}/{self.stats.total_posts} posts")
                 if self.stats.failed_posts > 0:
                     logger.warning(f"   Thất bại: {self.stats.failed_posts} posts")
                 logger.info("=" * 50)
 
             if self._on_all_complete:
-                self._on_all_complete(self.stats.success_posts > 0, "Hoàn thành")
+                all_success = self.stats.total_posts > 0 and self.stats.success_posts == self.stats.total_posts
+                summary = (
+                    f"{self.stats.success_posts}/{self.stats.total_posts} bài thành công; "
+                    f"{self.stats.failed_posts} bài thất bại"
+                )
+                self._on_all_complete(all_success, summary)
         except Exception as e:
             logger.error(f"Multi-account pipeline error: {str(e)[:300]}")
             if self._on_all_complete:
@@ -411,27 +429,54 @@ class DownloadOrchestrator:
             self._process_single_post(url, i + 1)
 
     def _run_parallel(self, urls: List[str]) -> None:
-        """Process URLs with thread pool."""
-        with ThreadPoolExecutor(max_workers=self._max_threads) as executor:
+        """Process URL chunks with one thread-owned Playwright browser per worker."""
+        worker_count = max(1, min(self._max_threads, len(urls)))
+        chunks: List[List[tuple[int, str]]] = [[] for _ in range(worker_count)]
+        for index, url in enumerate(urls, start=1):
+            chunks[(index - 1) % worker_count].append((index, url))
+
+        def worker(worker_index: int, items: List[tuple[int, str]]) -> None:
+            browser = BrowserManager(
+                profile_dir=str(chrome_profile_dir(f"download_cookie_{worker_index}")),
+                cdp_port=9300 + worker_index,
+                headless=True,
+            )
+            with self._lock:
+                self._browsers.append(browser)
+            try:
+                if not browser.start(self._cookies):
+                    logger.error(f"Không thể khởi động trình duyệt tải #{worker_index}!")
+                    for index, url in items:
+                        self._notify_post_failed(url, index, "Không thể khởi động trình duyệt")
+                        self._update_stats(failed=True)
+                    return
+                for index, url in items:
+                    if self._stop_event.is_set():
+                        break
+                    self._pause_event.wait()
+                    if self._stop_event.is_set():
+                        break
+                    self._process_single_post(
+                        url, index, browser=browser, cookies=self._cookies,
+                        account_label=f"Luồng {worker_index}",
+                    )
+            finally:
+                browser.stop()
+                with self._lock:
+                    if browser in self._browsers:
+                        self._browsers.remove(browser)
+
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
             self._executor = executor
-            futures: List[Future] = []
-
-            for i, url in enumerate(urls):
-                if self._stop_event.is_set():
-                    break
-                future = executor.submit(self._process_single_post, url, i + 1)
-                futures.append(future)
-
-            # Wait for all futures
+            futures: List[Future] = [
+                executor.submit(worker, worker_index, items)
+                for worker_index, items in enumerate(chunks, start=1)
+            ]
             for future in futures:
-                if self._stop_event.is_set():
-                    executor.shutdown(wait=False, cancel_futures=True)
-                    break
                 try:
                     future.result(timeout=600)
                 except Exception as e:
-                    logger.error(f"Thread error: {str(e)[:100]}")
-
+                    logger.error(f"Thread error: {str(e)[:200]}")
             self._executor = None
 
     def _process_single_post(
@@ -468,6 +513,7 @@ class DownloadOrchestrator:
         try:
             # Extract post ID for folder naming
             post_id = extract_post_id(url)
+            self._mark_post_download_status(url, "downloading")
 
             # Fetch and parse using browser
             if not active_browser:
@@ -509,7 +555,24 @@ class DownloadOrchestrator:
                 save_text_content(post_data.text.strip(), post_dir / "caption.txt")
 
             if post_data.media_count <= 0:
-                error_msg = "Không tìm thấy ảnh/video để tải trong bài viết"
+                logger.warning(
+                    "Không thấy media trong DOM; thử nhận diện và tải video trực tiếp bằng yt-dlp..."
+                )
+                video_success = download_video(
+                    get_original_url(url), post_dir, active_cookies
+                )
+                if video_success and self._post_dir_has_media(post_dir):
+                    with self._lock:
+                        downloaded = [p for p in post_dir.iterdir() if p.is_file() and p.suffix.lower() in MEDIA_FILE_EXTS]
+                        self.stats.downloaded_media += len(downloaded)
+                        self.stats.total_media += len(downloaded)
+                        self.stats.total_bytes += sum(p.stat().st_size for p in downloaded)
+                    self._mark_post_downloaded(post_data, post_dir, url)
+                    self._update_stats(failed=False)
+                    logger.info(f"✅ Post {index} hoàn thành bằng yt-dlp → {post_dir.name}")
+                    return
+                error_msg = "Không tìm thấy ảnh/video và yt-dlp không tải được video"
+                self._cleanup_failed_post_dir(post_dir)
                 logger.error(f"❌ Post {index} thất bại — {error_msg}")
                 self._notify_post_failed(url, index, error_msg)
                 self._update_stats(failed=True)
@@ -595,6 +658,7 @@ class DownloadOrchestrator:
                     logger.info(f"✅ Post {index} hoàn thành → {post_dir.name}")
                 else:
                     error_msg = "Không tải được video sau khi thử browser session, direct HTTP và yt-dlp"
+                    self._cleanup_failed_post_dir(post_dir)
                     logger.error(f"❌ Post {index} thất bại — {error_msg}")
                     self._notify_post_failed(url, index, error_msg)
                     self._update_stats(failed=True)
@@ -640,6 +704,23 @@ class DownloadOrchestrator:
                 logger.info(f"Đã đánh dấu {updated} bài là Đã tải trong Post Spy.")
         except Exception as e:
             logger.error(f"Không cập nhật trạng thái đã tải: {str(e)[:200]}")
+
+    @staticmethod
+    def _post_id_candidates(url: str) -> List[str]:
+        """Build stable database identifiers from a Facebook post URL."""
+        candidates = {str(extract_post_id(url) or "").strip()}
+        candidates |= {re.sub(r"\D", "", value) for value in list(candidates) if value}
+        return [value for value in candidates if value and value != "unknown"]
+
+    def _mark_post_download_status(self, url: str, status: str, error: str = "") -> None:
+        post_ids = self._post_id_candidates(url)
+        if not post_ids:
+            return
+        try:
+            db_path = get_db_path(config.get("scraper_db_path", ""))
+            mark_posts_download_status(db_path, post_ids, status, error=error)
+        except Exception as exc:
+            logger.error(f"Không cập nhật trạng thái tải: {str(exc)[:200]}")
 
     def _handle_existing_post(self, post_dir: Path, folder_name: str, url: str) -> str:
         """Ask the GUI what to do when a post folder already contains media."""
@@ -687,6 +768,22 @@ class DownloadOrchestrator:
             logger.info(f"Đã xóa bản tải cũ để tải lại: {resolved_post.name}")
         except Exception as e:
             logger.error(f"Không xóa được bản tải cũ: {str(e)[:200]}")
+
+    def _cleanup_failed_post_dir(self, post_dir: Path) -> None:
+        """Remove a folder created by this run when it contains no completed media."""
+        try:
+            resolved_output = self._output_dir.resolve()
+            resolved_post = post_dir.resolve()
+            if resolved_post == resolved_output or resolved_output not in resolved_post.parents:
+                logger.error(f"Refuse to clean unsafe failed path: {resolved_post}")
+                return
+            if self._post_dir_has_media(resolved_post):
+                return
+            if resolved_post.is_dir():
+                shutil.rmtree(resolved_post)
+                logger.info(f"Đã dọn thư mục tải chưa hoàn tất: {resolved_post.name}")
+        except Exception as exc:
+            logger.warning(f"Không dọn được thư mục tải chưa hoàn tất: {str(exc)[:200]}")
 
     @staticmethod
     def _parse_date(timestamp: str) -> str:
@@ -779,6 +876,7 @@ class DownloadOrchestrator:
 
     def _notify_post_failed(self, url: str, index: int, error: str) -> None:
         """Send per-link failure details to GUI."""
+        self._mark_post_download_status(url, "failed", error)
         if not self._on_post_failed:
             return
         try:

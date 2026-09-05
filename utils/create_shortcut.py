@@ -10,23 +10,25 @@ import sys
 def create_desktop_shortcut() -> bool:
     try:
         base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        run_bat = os.path.join(base_dir, "Run.bat")
+        start_bat = os.path.join(base_dir, "START.bat")
+        target_bat = start_bat if os.path.exists(start_bat) else os.path.join(base_dir, "Run.bat")
         icon_ico = os.path.join(base_dir, "assets", "icon.ico")
         desktop_dir = os.path.join(os.environ.get("USERPROFILE", ""), "Desktop")
 
         if not os.path.exists(desktop_dir):
             desktop_dir = os.path.expanduser("~/Desktop")
 
-        shortcut_path = os.path.join(desktop_dir, "Tinix FB Studio.lnk")
+        shortcut_path = os.path.join(desktop_dir, "Tinix-Facebook-Hunter.lnk")
 
-        # Use PowerShell script
+        # Use PowerShell script with WindowStyle = 7 (Minimized) so command window doesn't flash
         ps_script = f"""
 $ws = New-Object -ComObject WScript.Shell
 $s = $ws.CreateShortcut('{shortcut_path}')
-$s.TargetPath = '{run_bat}'
+$s.TargetPath = '{target_bat}'
 $s.WorkingDirectory = '{base_dir}'
 $s.IconLocation = '{icon_ico},0'
-$s.Description = 'Tinix FB Studio'
+$s.Description = 'Tinix-Facebook-Hunter (App Mode)'
+$s.WindowStyle = 7
 $s.Save()
 """
         subprocess.run(

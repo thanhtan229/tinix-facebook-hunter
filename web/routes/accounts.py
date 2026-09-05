@@ -271,7 +271,7 @@ def export_account_profile(req: ProfileExportRequest):
                 "secret_2fa": str(account.get("secret_2fa") or ""),
                 "email_pass": str(account.get("email_pass") or ""),
                 "cookie": str(account.get("cookie") or ""),
-                "source_app": "Tinix FB Down",
+                "source_app": "Tinix-Facebook-Hunter",
                 "source_app_version": APP_VERSION,
                 "source_account_id": str(req.account_id),
             },
@@ -310,7 +310,7 @@ def export_all_account_profiles():
         result = export_profiles_archive(
             profiles,
             project_root() / "exports" / "profiles",
-            source_app="Tinix FB Down",
+            source_app="Tinix-Facebook-Hunter",
             source_app_version=APP_VERSION,
         )
     except ProfileBundleError as exc:

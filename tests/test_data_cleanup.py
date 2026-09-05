@@ -10,9 +10,10 @@ from starlette.testclient import TestClient
 from core.data_cleanup import cleanup_scraped_data, preview_scraped_cleanup
 from core.db_storage import (
     _get_conn, add_account, get_all_accounts, get_favorite_pages,
-    get_scraped_pages_full, save_favorite_page,
+    bulk_delete_post_rows, get_scraped_pages_full, query_posts_for_spy,
+    save_favorite_page,
 )
-from web.routes.spy import CleanupRequest, cleanup_repository
+from web.routes.spy import CleanupRequest, DeletePostsRequest, cleanup_repository, delete_posts
 from web.app import app
 
 
@@ -53,6 +54,57 @@ def seed_scraped_data(db_path: str, output_root: Path, outside_root: Path) -> di
 
 
 class ScrapedCleanupTest(unittest.TestCase):
+    def test_selected_post_delete_is_exact_updates_counts_and_preserves_media(self):
+        with tempfile.TemporaryDirectory() as temp_dir, tempfile.TemporaryDirectory() as outside_dir:
+            root = Path(temp_dir)
+            output_root = root / "output"
+            output_root.mkdir()
+            db_path = str(root / "selected-posts.db")
+            media = seed_scraped_data(db_path, output_root, Path(outside_dir))
+            posts = query_posts_for_spy(db_path, ["Page A", "Page B"])
+            row_ids = [post["id"] for post in posts if post["post_id"] in {"a-1", "b-1"}]
+
+            result = bulk_delete_post_rows(db_path, row_ids)
+
+            self.assertEqual(result["deleted"], 2)
+            remaining = query_posts_for_spy(db_path, ["Page A", "Page B"])
+            self.assertEqual({post["post_id"] for post in remaining}, {"a-2", "a-3"})
+            page_counts = {page["page_name"]: page["post_count"] for page in get_scraped_pages_full(db_path)}
+            self.assertEqual(page_counts, {"Page A": 2, "Page B": 0})
+            self.assertTrue(media["page_a"].exists())
+            self.assertTrue(media["page_b"].exists())
+
+    def test_selected_post_delete_endpoint_refuses_while_download_is_running(self):
+        request = DeletePostsRequest(post_row_ids=[1])
+        with patch("web.routes.spy.download_is_running", return_value=True):
+            with self.assertRaises(HTTPException) as context:
+                delete_posts(request)
+        self.assertEqual(context.exception.status_code, 409)
+
+    def test_single_post_delete_removes_only_unreferenced_media_inside_output(self):
+        with tempfile.TemporaryDirectory() as temp_dir, tempfile.TemporaryDirectory() as outside_dir:
+            root = Path(temp_dir)
+            output_root = root / "output"
+            output_root.mkdir()
+            db_path = str(root / "single-delete.db")
+            media = seed_scraped_data(db_path, output_root, Path(outside_dir))
+            posts = query_posts_for_spy(db_path, ["Page A", "Page B"])
+            row_ids = [post["id"] for post in posts if post["post_id"] in {"a-1", "b-1"}]
+            values = {"scraper_db_path": db_path, "output_dir": str(output_root)}
+
+            with patch("web.routes.spy.scrape_is_running", return_value=False), patch(
+                "web.routes.spy.download_is_running", return_value=False
+            ), patch(
+                "web.routes.spy.config.get", side_effect=lambda key, default=None: values.get(key, default)
+            ):
+                result = delete_posts(DeletePostsRequest(post_row_ids=row_ids, delete_media=True))
+
+            self.assertEqual(result["data"]["deleted"], 2)
+            self.assertEqual(result["data"]["media_deleted"], 1)
+            self.assertFalse(media["page_a"].exists())
+            self.assertTrue(media["page_b"].exists(), "shared media must remain while another post references it")
+            self.assertTrue(media["outside"].exists())
+
     def test_scoped_cleanup_backs_up_and_preserves_unselected_data(self):
         with tempfile.TemporaryDirectory() as temp_dir, tempfile.TemporaryDirectory() as outside_dir:
             root = Path(temp_dir)

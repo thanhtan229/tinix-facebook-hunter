@@ -1,7 +1,7 @@
-# Tinix FB Studio
+# Tinix-Facebook-Hunter
 
-Ứng dụng WebUI chạy cục bộ để tải media Facebook, quét fanpage, quản lý tài
-khoản và chuẩn bị lịch đăng bài.
+Ứng dụng WebUI chạy cục bộ để tải media Facebook, quét fanpage và quản lý tài
+khoản.
 
 Tab Quét Page hỗ trợ lưu Fanpage yêu thích, gán Chrome profile, quét tuần tự và
 chỉ lưu các bài mới kể từ mốc của lần quét thành công gần nhất. Danh sách yêu
@@ -75,19 +75,12 @@ python manage_database.py restore --file "D:\backup\tinix.db.backup-YYYYMMDD_HHM
 Restore luôn tạo thêm một bản backup của database hiện tại trước khi ghi đè.
 Backup vẫn là dữ liệu nhạy cảm và không được commit hoặc gửi qua kênh công khai.
 
-## Hàng đợi đăng bài
-
-Lịch xác nhận trong WebUI được lưu vào SQLite và xuất hiện lại sau khi khởi
-động ứng dụng. Trong tab **Đăng Tự Động**, có thể chạy các job `Pending`, dừng
-hàng đợi, retry job `Failed` hoặc xóa job chưa hoàn thành. Khi dừng, những job
-chưa được xử lý vẫn giữ trạng thái `Pending`.
-
 ## Dọn Kho Dữ Liệu
 
 Trong tab **Kho Dữ Liệu**, chọn Page rồi dùng **Xóa Pages đã chọn**, hoặc dùng
 **Dọn toàn bộ kho** để xóa mọi dữ liệu scraper. Mỗi thao tác hiển thị cửa sổ xác
-nhận cuối cùng và tự tạo/verify backup database trước khi xóa. Tài khoản, token,
-fanpage quản lý và lịch đăng không thuộc phạm vi dọn kho.
+nhận cuối cùng và tự tạo/verify backup database trước khi xóa. Tài khoản, token
+và fanpage quản lý không thuộc phạm vi dọn kho.
 
 Tùy chọn **Xóa cả thư mục media đã tải** mặc định tắt. Khi bật, ứng dụng chỉ xóa
 đường dẫn nằm bên dưới thư mục output đã cấu hình, không xóa output root, không

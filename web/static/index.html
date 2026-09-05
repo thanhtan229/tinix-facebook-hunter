@@ -3,9 +3,14 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Tinix FB Studio — All-in-One Facebook Hub</title>
-  <link rel="stylesheet" href="/static/hubspot.css?v=1.3.0">
-  <link rel="stylesheet" href="/static/styles.css?v=1.3.0">
+  <title>Tinix-Facebook-Hunter — All-in-One Facebook Hub</title>
+  <link rel="shortcut icon" href="/static/favicon.ico" type="image/x-icon">
+  <link rel="icon" type="image/x-icon" href="/static/favicon.ico">
+  <link rel="icon" type="image/png" sizes="32x32" href="/static/favicon-32x32.png">
+  <link rel="icon" type="image/png" sizes="16x16" href="/static/favicon-16x16.png">
+  <link rel="apple-touch-icon" sizes="180x180" href="/static/icon.png">
+  <link rel="stylesheet" href="/static/hubspot.css?v=1.21.0">
+  <link rel="stylesheet" href="/static/styles.css?v=1.21.0">
 </head>
 <body>
 
@@ -13,10 +18,11 @@
   <!-- Sidebar Navigation -->
   <aside class="sidebar">
     <div class="sidebar-header">
-      <div class="stat-icon" style="background: var(--orange-light); color: var(--orange-primary); font-size: 22px;">⚡</div>
+      <img src="/static/icon.png" alt="Tinix Logo" class="sidebar-logo">
       <div class="sidebar-brand">
-        <span class="sidebar-title">Tinix FB Studio</span>
-        <span class="sidebar-subtitle">HubSpot Edition</span>
+        <span class="sidebar-brand-tag">TINIX</span>
+        <span class="sidebar-title">Facebook Hunter</span>
+        <span class="badge badge-teal sidebar-version-badge" id="app-version-badge" title="Phiên bản ứng dụng">v...</span>
       </div>
     </div>
 
@@ -36,19 +42,19 @@
         <span class="icon">📊</span>
         <span>Kho Dữ Liệu</span>
       </div>
-      <div class="nav-item" data-tab="tab-poster">
-        <span class="nav-index">4</span>
-        <span class="icon">🚀</span>
-        <span>Đăng Tự Động</span>
-      </div>
       <div class="nav-item" data-tab="tab-accounts">
-        <span class="nav-index">5</span>
+        <span class="nav-index">4</span>
         <span class="icon">👥</span>
         <span>Tài Khoản</span>
       </div>
     </nav>
 
     <div class="sidebar-footer">
+      <label class="sidebar-output-label" for="sidebar-output-dir">Thư mục tải về</label>
+      <div class="sidebar-output-row">
+        <input type="text" id="sidebar-output-dir" placeholder="Nhập đường dẫn thư mục" title="Đường dẫn thư mục tải về">
+        <button class="btn btn-secondary btn-sm sidebar-folder-picker" id="btn-select-output-dir" title="Chọn thư mục" aria-label="Chọn thư mục">…</button>
+      </div>
       <button class="btn btn-secondary btn-sm" style="width: 100%;" id="btn-open-output-dir">
         📂 Mở thư mục tải về
       </button>
@@ -64,7 +70,6 @@
       </div>
       <div class="header-actions">
         <span class="badge badge-green" id="ws-badge">🟢 Realtime Connected</span>
-        <button class="btn btn-secondary btn-sm" id="btn-settings-modal">⚙️ Cài đặt</button>
       </div>
     </header>
 
@@ -152,54 +157,198 @@
 
       <!-- TAB 2: PAGE SCRAPER -->
       <div class="tab-panel" id="tab-scraper">
-        <div class="studio-card">
-          <h3 style="font-size: 15px; margin-bottom: 12px;">Quét nhanh Fanpage Facebook</h3>
-          
-          <div style="display: flex; gap: 12px; margin-bottom: 12px; flex-wrap:wrap;">
-            <input type="text" id="scrape-url" placeholder="Nhập URL hoặc Username Fanpage (ví dụ: https://www.facebook.com/tinixpage)" style="flex: 1;">
-            <select id="scrape-mode" style="width: 170px;">
-              <option value="All" selected>Quét tất cả</option>
-              <option value="New Posts">Chỉ bài viết mới</option>
-            </select>
-            <input type="number" id="scrape-limit" value="100" min="5" max="2000" style="width: 100px;" title="Số lượng bài tối đa">
-            <select id="scrape-account" style="min-width:190px;">
-              <option value="">Profile mặc định</option>
-            </select>
+        <div class="studio-card tab2-shared-settings-card">
+          <div class="tab2-shared-settings-header">
+            <div>
+              <h3 style="font-size:15px; margin-bottom:3px;">Thiết lập quét chung</h3>
+              <div class="text-muted" style="font-size:12px;">Áp dụng cho Quét Fanpage, Fanpage yêu thích và Tìm Fanpage.</div>
+            </div>
+            <label class="custom-checkbox tab2-auto-download-toggle">
+              <input type="checkbox" id="scrape-auto-download">
+              <span>Auto Download</span>
+              <span class="badge badge-gray" id="scrape-auto-download-status">Đang tắt</span>
+            </label>
+          </div>
+          <div class="tab2-shared-settings-grid">
+            <label class="tab2-shared-setting tab2-shared-setting-account">
+              <span>Account dùng để quét</span>
+              <select id="scrape-common-account">
+                <option value="auto" selected>Tự chọn Account khả dụng</option>
+                <option value="default">Profile mặc định</option>
+              </select>
+            </label>
+            <label class="tab2-shared-setting">
+              <span>Luồng song song</span>
+              <input type="number" id="scrape-common-concurrency" value="2" min="1" max="8">
+            </label>
+            <label class="tab2-shared-setting">
+              <span>Nhịp quét</span>
+              <select id="scrape-common-delay">
+                <option value="fast">Nhanh · 100 bài</option>
+                <option value="balanced" selected>Cân bằng · 100 bài</option>
+                <option value="cautious">Thận trọng · 50 bài</option>
+              </select>
+            </label>
+            <label class="tab2-shared-setting">
+              <span>Số lượng cần quét</span>
+              <input type="number" id="scrape-common-limit" value="100" min="5" max="2000">
+            </label>
+          </div>
+          <div class="favorite-workers-panel tab2-shared-workers" id="favorite-workers-panel" hidden>
+            <div class="favorite-workers-header">
+              <div>
+                <div style="font-weight:800;">Tiến độ theo Account</div>
+                <div class="text-muted" style="font-size:11.5px;">Mỗi Account xử lý tuần tự hàng đợi Page riêng.</div>
+              </div>
+              <button class="btn btn-danger btn-sm" id="btn-stop-all-favorites">Dừng tất cả</button>
+            </div>
+            <div class="favorite-workers-grid" id="favorite-workers-grid"></div>
+          </div>
+        </div>
+        <div class="studio-card collapsible-card" id="quick-scrape-card" data-panel-key="quick-scrape">
+          <div class="collapsible-card-header">
+            <div>
+              <h3 style="font-size:15px; margin-bottom:4px;">Quét Fanpage</h3>
+              <div class="text-muted" style="font-size:12px;">Luôn quét từ đầu. Mỗi URL hoặc username nằm trên một dòng; các Page được chia theo số luồng chung.</div>
+            </div>
+            <button type="button" class="panel-collapse-toggle" data-collapse-panel="quick-scrape" aria-expanded="true" aria-controls="quick-scrape-body">
+              <span class="panel-collapse-label">Thu gọn</span>
+              <span class="panel-collapse-chevron" aria-hidden="true">▴</span>
+            </button>
+          </div>
+          <div class="collapsible-card-body" id="quick-scrape-body">
+          <div class="quick-scrape-input-row">
+            <textarea id="scrape-url" rows="4" placeholder="Nhập mỗi Fanpage trên một dòng, ví dụ:&#10;https://www.facebook.com/tinixpage&#10;https://www.facebook.com/page-thu-hai"></textarea>
           </div>
 
           <div style="display: flex; gap: 12px; flex-wrap:wrap;">
             <button class="btn btn-primary" id="btn-start-scrape">🔍 Bắt đầu quét</button>
+            <select id="quick-favorite-group" class="favorite-save-group" title="Nhóm dùng khi lưu vào yêu thích">
+              <option value="">Chưa phân nhóm</option>
+            </select>
             <button class="btn btn-secondary" id="btn-save-favorite">⭐ Lưu vào yêu thích</button>
             <button class="btn btn-danger" id="btn-stop-scrape">🛑 Dừng quét</button>
           </div>
+          </div>
         </div>
 
-        <div class="studio-card">
-          <div style="display:flex; justify-content:space-between; align-items:center; gap:12px; margin-bottom:14px; flex-wrap:wrap;">
+        <div class="studio-card collapsible-card" id="favorite-pages-card" data-panel-key="favorite-pages">
+          <div class="collapsible-card-header">
             <div>
               <h3 style="font-size:15px; margin-bottom:4px;">⭐ Fanpage yêu thích</h3>
               <div class="text-muted" style="font-size:12px;">Chỉ lấy post chưa lưu và giữ mốc của lần quét thành công gần nhất.</div>
             </div>
-            <div style="display:flex; gap:8px; flex-wrap:wrap;">
+            <div class="collapsible-card-header-actions">
               <span class="badge badge-teal" id="favorite-scan-summary">0 Fanpage</span>
-              <button class="btn btn-teal btn-sm" id="btn-scan-selected-favorites">Quét Page đã chọn</button>
-              <button class="btn btn-primary btn-sm" id="btn-scan-all-favorites">Quét tất cả yêu thích</button>
+              <button type="button" class="panel-collapse-toggle" data-collapse-panel="favorite-pages" aria-expanded="true" aria-controls="favorite-pages-body">
+                <span class="panel-collapse-label">Thu gọn</span>
+                <span class="panel-collapse-chevron" aria-hidden="true">▴</span>
+              </button>
             </div>
           </div>
-          <div style="overflow-x:auto;">
+          <div class="collapsible-card-body" id="favorite-pages-body">
+            <div class="favorite-bulk-bar">
+              <!-- Dropdown Nhóm thông minh (Lọc & Quản lý nhóm & Gán nhóm) -->
+              <div class="favorite-group-dropdown-wrap" id="favorite-group-dropdown-wrap">
+                <button type="button" class="btn btn-secondary favorite-group-trigger" id="favorite-group-trigger" aria-haspopup="true" aria-expanded="false">
+                  <span id="favorite-group-trigger-label">📁 Tất cả nhóm (0)</span>
+                  <span class="dropdown-chevron">▾</span>
+                </button>
+                <div class="favorite-group-menu" id="favorite-group-menu" hidden>
+                  <div class="favorite-group-assign-hint" id="favorite-group-assign-hint" hidden>
+                    💡 Chọn nhóm bên dưới để gán <strong id="favorite-group-hint-count">0</strong> Page đã chọn
+                  </div>
+                  <div class="favorite-group-menu-list" id="favorite-group-menu-list"></div>
+                  <div class="favorite-group-menu-divider"></div>
+                  <div id="favorite-group-remove-wrap" hidden>
+                    <button type="button" class="favorite-group-remove-btn" id="btn-remove-selected-from-group">
+                      ❌ Bỏ các Page đã chọn khỏi nhóm
+                    </button>
+                    <div class="favorite-group-menu-divider"></div>
+                  </div>
+                  <div class="favorite-group-menu-footer">
+                    <button type="button" class="btn btn-secondary btn-sm" id="btn-create-favorite-group" style="width:100%;">➕ Thêm nhóm mới</button>
+                  </div>
+                </div>
+              </div>
+
+              <!-- Các nút hành động và ô tìm kiếm đặt ngay bên phải dropdown quản lý nhóm -->
+              <button class="btn btn-teal" id="btn-scan-selected-favorites" title="Quét bài mới nhất từ mốc đã lưu">Quét bài mới</button>
+              <button class="btn btn-secondary" id="btn-scan-older-favorites" title="Quét ngược thời gian để lấy thêm bài cũ">Quét bài cũ</button>
+              <button class="btn btn-secondary" id="btn-reset-selected-favorites" title="Đặt lại mốc quét để lần tới quét từ đầu">Quét từ đầu</button>
+              <button class="btn btn-danger" id="btn-delete-selected-favorites" title="Xóa các Fanpage đã chọn khỏi danh sách yêu thích">🗑 Xóa</button>
+
+              <!-- Ô tìm kiếm Fanpage (bên phải nút Xóa) -->
+              <div class="favorite-search-wrap">
+                <input type="search" id="favorite-page-search" placeholder="🔍 Tìm kiếm Fanpage..." aria-label="Tìm Fanpage">
+              </div>
+            </div>
+            <div style="overflow-x:auto;">
             <table style="width:100%; border-collapse:collapse; text-align:left; font-size:12.5px;">
               <thead>
                 <tr style="background:var(--teal-dark); color:#FFFFFF;">
                   <th style="padding:9px 10px; width:34px;"><input type="checkbox" id="favorite-select-all" checked></th>
-                  <th style="padding:9px 10px;">Fanpage</th>
-                  <th style="padding:9px 10px;">Account / Giới hạn</th>
-                  <th style="padding:9px 10px;">Lần quét gần nhất</th>
-                  <th style="padding:9px 10px;">Kết quả</th>
+                  <th style="padding:9px 10px;"><button class="table-sort-button" onclick="setFavoriteSort('page_name')">Fanpage <span data-sort-indicator="favorites:page_name">▲</span></button></th>
+                  <th style="padding:9px 10px;"><button class="table-sort-button" onclick="setFavoriteSort('follower_count')">Follower <span data-sort-indicator="favorites:follower_count">↕</span></button></th>
+                  <th style="padding:9px 10px;"><button class="table-sort-button" onclick="setFavoriteSort('last_successful_scan_at')">Lần quét gần nhất <span data-sort-indicator="favorites:last_successful_scan_at">↕</span></button></th>
+                  <th style="padding:9px 10px;"><button class="table-sort-button" onclick="setFavoriteSort('last_status')">Trạng thái <span data-sort-indicator="favorites:last_status">↕</span></button> / <button class="table-sort-button" onclick="setFavoriteSort('last_new_posts_count')">Bài mới <span data-sort-indicator="favorites:last_new_posts_count">↕</span></button></th>
                   <th style="padding:9px 10px; text-align:right;">Hành động</th>
                 </tr>
               </thead>
               <tbody id="favorite-pages-tbody"></tbody>
             </table>
+            </div>
+          </div>
+        </div>
+
+        <div class="studio-card collapsible-card" id="page-search-card" data-panel-key="page-search">
+          <div class="collapsible-card-header">
+            <div>
+              <h3 style="font-size:15px; margin-bottom:4px;">Tìm Fanpage theo từ khóa</h3>
+              <div class="text-muted" style="font-size:12px;">Tìm trong kết quả Trang của Facebook. Kết quả chỉ được lưu khi bạn đánh dấu ★.</div>
+            </div>
+            <div class="collapsible-card-header-actions">
+              <span class="badge badge-teal" id="page-search-summary">Chưa tìm kiếm</span>
+              <button type="button" class="panel-collapse-toggle" data-collapse-panel="page-search" aria-expanded="true" aria-controls="page-search-body">
+                <span class="panel-collapse-label">Thu gọn</span>
+                <span class="panel-collapse-chevron" aria-hidden="true">▴</span>
+              </button>
+            </div>
+          </div>
+          <div class="collapsible-card-body" id="page-search-body">
+            <div class="page-search-controls">
+              <input type="text" id="page-search-keyword" maxlength="100" placeholder="Nhập từ khóa, ví dụ: nội thất Đà Nẵng">
+              <input type="number" id="page-search-limit" value="30" min="5" max="100" title="Số kết quả tối đa">
+              <input type="number" id="page-search-min-followers" value="0" min="0" max="2000000000" title="Số người theo dõi tối thiểu" placeholder="Follower tối thiểu">
+              <select id="page-search-sort">
+                <option value="relevance">Liên quan nhất</option>
+                <option value="followers">Follower cao nhất</option>
+                <option value="name">Tên A–Z</option>
+              </select>
+            </div>
+            <div style="display:flex; gap:8px; margin-top:10px; flex-wrap:wrap;">
+              <button class="btn btn-primary" id="btn-start-page-search">🔎 Tìm Fanpage</button>
+              <button class="btn btn-danger" id="btn-stop-page-search">Dừng</button>
+              <select id="search-favorite-group" class="favorite-save-group" title="Nhóm dùng khi lưu kết quả tìm kiếm">
+                <option value="">Chưa phân nhóm</option>
+              </select>
+              <button class="btn btn-secondary" id="btn-save-selected-search">★ Lưu Page đã chọn</button>
+            </div>
+            <div id="page-search-results-wrap" style="display:none; overflow-x:auto; margin-top:16px;">
+            <table class="page-search-table">
+              <thead>
+                <tr>
+                  <th><input type="checkbox" id="page-search-select-all"></th>
+                  <th style="width:42px;">★</th>
+                  <th><button class="table-sort-button" onclick="setPageSearchSort('page_name')">Fanpage <span data-sort-indicator="page_search:page_name">↕</span></button></th>
+                  <th><button class="table-sort-button" onclick="setPageSearchSort('follower_count')">Người theo dõi <span data-sort-indicator="page_search:follower_count">↕</span></button></th>
+                  <th><button class="table-sort-button" onclick="setPageSearchSort('category')">Phân loại <span data-sort-indicator="page_search:category">↕</span></button></th>
+                  <th style="text-align:right;">Hành động</th>
+                </tr>
+              </thead>
+              <tbody id="page-search-results-tbody"></tbody>
+            </table>
+            </div>
           </div>
         </div>
       </div>
@@ -211,14 +360,19 @@
           <div style="display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin-bottom: 16px;">
             <input type="text" id="spy-search" placeholder="🔍 Tìm kiếm bài viết theo caption, ID..." style="flex: 1; min-width: 200px;">
             
-            <select id="spy-mode" style="width: 150px;">
+            <select id="spy-mode" style="width: 190px;">
               <option value="newest" selected>Mới nhất</option>
+              <option value="oldest">Cũ nhất</option>
               <option value="top_engagement">Tương tác cao nhất</option>
+              <option value="top_reactions">Lượt thích cao nhất</option>
+              <option value="top_comments">Bình luận cao nhất</option>
+              <option value="top_shares">Chia sẻ cao nhất</option>
+              <option value="top_views">Lượt xem cao nhất</option>
             </select>
 
             <select id="spy-post-type" style="width: 130px;">
               <option value="Tất cả" selected>Tất cả loại</option>
-              <option value="Photo">Ảnh</option>
+              <option value="Ảnh">Ảnh</option>
               <option value="Video">Video</option>
               <option value="Text">Văn bản</option>
             </select>
@@ -226,6 +380,8 @@
             <select id="spy-dl-status" style="width: 130px;">
               <option value="Tất cả" selected>Tất cả trạng thái</option>
               <option value="Chưa tải">Chưa tải</option>
+              <option value="Đang tải">Đang tải</option>
+              <option value="Tải lỗi">Tải lỗi</option>
               <option value="Đã tải">Đã tải</option>
             </select>
 
@@ -255,11 +411,13 @@
 
           <!-- View Toggle -->
           <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
-            <div style="display: flex; gap: 10px; align-items: center;">
+            <div class="spy-post-bulk-actions">
               <label class="custom-checkbox">
                 <input type="checkbox" id="spy-select-all-posts">
                 <span>Chọn tất cả bài</span>
               </label>
+              <button class="btn btn-teal btn-sm" id="btn-download-spy-posts" disabled>⬇ Download đã chọn</button>
+              <button class="btn btn-danger btn-sm" id="btn-delete-spy-posts" disabled>🗑 Xóa đã chọn</button>
               <span class="text-muted" id="spy-selected-counter">0 bài đã chọn</span>
             </div>
             <div style="display: flex; gap: 6px;">
@@ -275,16 +433,23 @@
 
           <!-- Posts Table View (Hidden by default) -->
           <div id="spy-posts-table-wrap" style="display: none; overflow-x: auto; margin-top: 14px;">
-            <table style="width: 100%; border-collapse: collapse; text-align: left; font-size: 13px;">
+            <table class="spy-posts-table">
               <thead>
                 <tr style="background: var(--teal-dark); color: #FFFFFF;">
+                  <th style="padding: 10px 12px;">Chọn</th>
                   <th style="padding: 10px 12px;">STT</th>
-                  <th style="padding: 10px 12px;">Page</th>
-                  <th style="padding: 10px 12px;">Ngày</th>
-                  <th style="padding: 10px 12px;">Loại</th>
-                  <th style="padding: 10px 12px;">Engage</th>
+                  <th style="padding: 10px 12px;">Media</th>
+                  <th style="padding: 10px 12px;"><button class="table-sort-button" onclick="setSpySort('page_name')">Page <span data-sort-indicator="spy:page_name">↕</span></button></th>
+                  <th style="padding: 10px 12px;"><button class="table-sort-button" onclick="setSpySort('date')">Ngày <span data-sort-indicator="spy:date">▼</span></button></th>
+                  <th style="padding: 10px 12px;"><button class="table-sort-button" onclick="setSpySort('post_type')">Loại <span data-sort-indicator="spy:post_type">↕</span></button></th>
+                  <th style="padding: 10px 12px;"><button class="table-sort-button" onclick="setSpySort('engagement')">👍 <span data-sort-indicator="spy:engagement">↕</span></button></th>
+                  <th style="padding: 10px 12px;"><button class="table-sort-button" onclick="setSpySort('comments')">💬 <span data-sort-indicator="spy:comments">↕</span></button></th>
+                  <th style="padding: 10px 12px;"><button class="table-sort-button" onclick="setSpySort('shares')">🔁 <span data-sort-indicator="spy:shares">↕</span></button></th>
+                  <th style="padding: 10px 12px;"><button class="table-sort-button" onclick="setSpySort('view_count')">👁 <span data-sort-indicator="spy:view_count">↕</span></button></th>
+                  <th style="padding: 10px 12px;"><button class="table-sort-button" title="Lượt thích + bình luận + chia sẻ" onclick="setSpySort('total_engagement')">Tổng <span data-sort-indicator="spy:total_engagement">↕</span></button></th>
                   <th style="padding: 10px 12px;">Caption</th>
-                  <th style="padding: 10px 12px;">Trạng thái</th>
+                  <th style="padding: 10px 12px;"><button class="table-sort-button" onclick="setSpySort('downloaded')">Trạng thái <span data-sort-indicator="spy:downloaded">↕</span></button></th>
+                  <th style="padding: 10px 12px;">Hành động</th>
                 </tr>
               </thead>
               <tbody id="spy-posts-tbody"></tbody>
@@ -293,71 +458,7 @@
         </div>
       </div>
 
-      <!-- TAB 4: SOCIAL POSTER STUDIO -->
-      <div class="tab-panel" id="tab-poster">
-        <div class="studio-card">
-          <h3 style="font-size: 15px; margin-bottom: 12px;">Tự Động Đăng Bài & Đặt Lịch Fanpage</h3>
-          
-          <div style="display: flex; gap: 12px; margin-bottom: 16px;">
-            <input type="text" id="poster-folder" placeholder="Nhập đường dẫn thư mục bài viết (chứa các subfolders + caption/media)" style="flex: 1;">
-            <button class="btn btn-teal" id="btn-scan-poster-folder">📂 Quét thư mục</button>
-          </div>
-
-          <!-- Scheduling Settings -->
-          <div class="grid-3" style="margin-bottom: 20px;">
-            <div>
-              <label style="font-size: 12.5px; font-weight: 700; margin-bottom: 6px; display: block;">Ngày bắt đầu:</label>
-              <input type="date" id="poster-start-date">
-            </div>
-            <div>
-              <label style="font-size: 12.5px; font-weight: 700; margin-bottom: 6px; display: block;">Khung giờ đăng:</label>
-              <div style="display: flex; gap: 8px;">
-                <input type="text" id="poster-time-slots" value="08:00, 20:00" placeholder="08:00, 20:00">
-              </div>
-            </div>
-            <div>
-              <label style="font-size: 12.5px; font-weight: 700; margin-bottom: 6px; display: block;">Thao tác:</label>
-              <button class="btn btn-primary" style="width: 100%;" id="btn-generate-schedule">📅 Tạo Lịch & Xem Trước</button>
-            </div>
-          </div>
-
-          <!-- Scanned Items Grid -->
-          <div class="post-cards-grid" id="poster-items-grid"></div>
-        </div>
-
-        <div class="studio-card" style="margin-top: 16px;">
-          <div style="display:flex; justify-content:space-between; align-items:center; gap:12px; margin-bottom:12px;">
-            <div>
-              <h3 style="font-size:15px;">Hàng Đợi Đăng Bài</h3>
-              <div class="text-muted" id="poster-queue-summary" style="font-size:12px;">Đang tải...</div>
-            </div>
-            <div style="display:flex; gap:8px; flex-wrap:wrap;">
-              <button class="btn btn-secondary btn-sm" id="btn-refresh-poster-jobs">↻ Làm mới</button>
-              <button class="btn btn-primary btn-sm" id="btn-run-poster-jobs">▶ Chạy Pending</button>
-              <button class="btn btn-secondary btn-sm" id="btn-retry-poster-jobs">↻ Retry Failed</button>
-              <button class="btn btn-danger btn-sm" id="btn-delete-poster-jobs">🗑 Xóa chọn</button>
-              <button class="btn btn-danger btn-sm" id="btn-stop-poster-jobs">■ Dừng</button>
-            </div>
-          </div>
-          <div style="overflow-x:auto; max-height:340px;">
-            <table style="width:100%; border-collapse:collapse; text-align:left; font-size:12.5px;">
-              <thead>
-                <tr style="background:var(--teal-dark); color:#fff; position:sticky; top:0;">
-                  <th style="padding:8px;"><input type="checkbox" id="poster-jobs-select-all"></th>
-                  <th style="padding:8px;">Nội dung</th>
-                  <th style="padding:8px;">Fanpage</th>
-                  <th style="padding:8px;">Thời gian</th>
-                  <th style="padding:8px;">Trạng thái</th>
-                  <th style="padding:8px;">Lỗi</th>
-                </tr>
-              </thead>
-              <tbody id="poster-jobs-tbody"></tbody>
-            </table>
-          </div>
-        </div>
-      </div>
-
-      <!-- TAB 5: ACCOUNTS -->
+      <!-- TAB 4: ACCOUNTS -->
       <div class="tab-panel" id="tab-accounts">
         <div class="studio-card">
           <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;">
@@ -405,7 +506,7 @@
         <div class="terminal-body" id="terminal-logs">
           <div class="log-row">
             <span class="log-tag OK">[SYSTEM]</span>
-            <span>Tinix FB Studio WebUI đã sẵn sàng kết nối.</span>
+            <span>Tinix-Facebook-Hunter WebUI đã sẵn sàng kết nối.</span>
           </div>
         </div>
       </div>

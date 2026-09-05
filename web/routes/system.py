@@ -40,6 +40,10 @@ class OpenFolderRequest(ApiRequest):
     path: Optional[str] = Field(default=None, max_length=4_096)
 
 
+class SelectFolderRequest(ApiRequest):
+    initial_path: Optional[str] = Field(default=None, max_length=4_096)
+
+
 class SecretMigrationRequest(ApiRequest):
     confirm: bool = False
 
@@ -54,12 +58,64 @@ def update_config(req: ConfigUpdateRequest):
     """Update active configuration."""
     cfg = config.load_config()
     data = model_data(req, exclude_unset=True)
+    if "output_dir" in data and data["output_dir"] is not None:
+        raw_path = os.path.expandvars(os.path.expanduser(data["output_dir"].strip()))
+        if not raw_path:
+            raise HTTPException(status_code=422, detail="Đường dẫn thư mục tải về không được để trống.")
+        output_path = os.path.abspath(raw_path)
+        try:
+            if os.path.exists(output_path) and not os.path.isdir(output_path):
+                raise HTTPException(status_code=422, detail="Đường dẫn tải về không phải là một thư mục.")
+            os.makedirs(output_path, exist_ok=True)
+        except HTTPException:
+            raise
+        except OSError as exc:
+            raise HTTPException(status_code=422, detail=f"Không thể tạo thư mục tải về: {exc}") from exc
+        data["output_dir"] = output_path
     for k, v in data.items():
         if v is not None:
             cfg[k] = v
     config.save_config(cfg)
     log_to_web("Đã lưu cấu hình cài đặt hệ thống.", "OK")
     return {"status": "success", "data": _public_config(cfg)}
+
+
+def _choose_output_folder(initial_path: Optional[str] = None) -> str:
+    """Show the native desktop folder picker and return the selected directory."""
+    import tkinter as tk
+    from tkinter import filedialog
+
+    initial_dir = os.path.abspath(initial_path or config.get("output_dir", "."))
+    if not os.path.isdir(initial_dir):
+        initial_dir = os.path.dirname(initial_dir)
+    if not os.path.isdir(initial_dir):
+        initial_dir = os.getcwd()
+
+    root = tk.Tk()
+    try:
+        root.withdraw()
+        root.attributes("-topmost", True)
+        root.update()
+        return filedialog.askdirectory(
+            parent=root,
+            initialdir=initial_dir,
+            title="Chọn thư mục tải về",
+            mustexist=True,
+        )
+    finally:
+        root.destroy()
+
+
+@router.post("/select-folder")
+def select_folder(req: SelectFolderRequest):
+    """Open a local folder picker after an explicit action from the UI."""
+    try:
+        selected = _choose_output_folder(req.initial_path)
+        if not selected:
+            return {"status": "cancelled"}
+        return {"status": "success", "path": os.path.abspath(selected)}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Không thể mở hộp thoại chọn thư mục: {exc}") from exc
 
 @router.post("/open-folder")
 def open_folder(req: OpenFolderRequest):
