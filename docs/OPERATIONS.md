@@ -4,8 +4,9 @@
 
 Tinix là ứng dụng Windows chạy cục bộ tại `127.0.0.1`. Không đổi host thành
 `0.0.0.0`, không reverse-proxy ra LAN/Internet và không vô hiệu hóa session
-cookie hoặc kiểm tra Origin. API health tại `/api/system/health` yêu cầu phiên
-WebUI hợp lệ và không trả đường dẫn database hay credential.
+cookie, kiểm tra Host hoặc kiểm tra Origin. API health tại
+`/api/system/health` công khai để kiểm tra khởi động, chỉ chấp nhận Host
+loopback và không trả đường dẫn database hay credential.
 
 Các thao tác test/quality không đăng nhập, tải nội dung hay đăng bài thật. Những
 thao tác Facebook chỉ bắt đầu khi người dùng chủ động chạy chức năng tương ứng
@@ -18,12 +19,31 @@ hãy xóa biến trước khi chạy dữ liệu thật.
 ## Khởi động và dừng
 
 1. Chạy `python main.py` hoặc `Start Tinix FB Studio.bat`.
-2. Xác nhận WebUI mở ở port cục bộ bắt đầu từ 7866 và trạng thái Realtime là
-   `Connected`.
-3. Dừng queue/download/scrape đang chạy trước khi đóng cửa sổ terminal.
+2. Xác nhận WebUI mở ở port cục bộ bắt đầu từ 7866, trạng thái Realtime là
+   `Connected` và không có cảnh báo môi trường ở đầu trang.
+   Tinix dùng cố định port 7866; nếu port này đang được ứng dụng khác sử dụng,
+   launcher dừng với thông báo lỗi thay vì tự đổi URL.
+3. Nếu tải/quét bằng Chrome Profile: tạo hoặc chọn account, mở Chrome để đăng
+   nhập Facebook rồi chạy **Check Preflight**. Account không đạt preflight sẽ
+   không nhận Page hoặc bài tải.
+4. Trong **Quét Page**, chọn rõ có cần **Tự tải media bài mới** hay chỉ lưu dữ
+   liệu vào Kho Bài Viết.
+5. Không mở thủ công Chrome của account đang quét/tải/tìm Page. Mỗi profile chỉ
+   có một tác vụ nền sử dụng tại một thời điểm.
+6. Media tự tải từ một lần quét khi downloader đang bận sẽ được lưu vào queue
+   SQLite và tự chạy sau lượt tải hiện tại. **Dừng lượt hiện tại** giữ queue;
+   **Dừng tất cả** hủy cả lượt đang chạy lẫn mọi batch chờ.
+7. Dừng queue/download/scrape đang chạy trước khi đóng cửa sổ terminal.
 
-Nếu ứng dụng bị đóng khi queue đang chạy, lần khởi động tiếp theo tự đưa các job
-WebUI còn `Running` về `Pending`, kèm ghi chú khôi phục.
+Nếu ứng dụng bị đóng khi queue đang chạy, lần khởi động tiếp theo đưa trạng thái
+tải dở về `Tải lỗi`, đánh dấu phiên trong **Hoạt động gần đây** là `Bị gián
+đoạn`, và đưa batch Auto Download dở về queue để tiếp tục theo thứ tự. Lịch sử
+chỉ giữ thống kê và lựa chọn không nhạy cảm, không giữ URL, cookie hoặc
+credential.
+
+Khi khởi động, Tinix cũng chuyển các thư mục media cũ có tên số sang flat
+storage. Nếu một lần chuyển bị ngắt, bài tương ứng được giữ ở trạng thái `Tải
+lỗi` cho đến khi migration hoàn tất; không xóa thủ công file nguồn còn lại.
 
 ## Backup định kỳ
 
@@ -71,7 +91,7 @@ Trong **Cài đặt**, chọn **Mã hóa secrets hiện có** đúng một lần
 ## Dọn dữ liệu scraper
 
 1. Dừng tác vụ Quét Page và Tải xuống.
-2. Mở **Kho Dữ Liệu** và chọn các Page cần xóa, hoặc chọn dọn toàn bộ kho.
+2. Mở **Kho Bài Viết** và chọn các Page cần xóa, hoặc chọn dọn toàn bộ kho.
 3. Chỉ bật xóa media khi chắc chắn không cần các file đã tải.
 4. Kiểm tra số Page/bài/media trong cảnh báo rồi nhấn **Xóa dữ liệu**.
 5. Ghi lại đường dẫn backup được hiển thị trong Terminal Logs.
@@ -89,8 +109,14 @@ khác tham chiếu và output root luôn được bỏ qua.
   database có schema mới hơn phiên bản đang chạy.
 - **Health chrome=false:** cài Google Chrome ở vị trí chuẩn hoặc thêm Chrome vào
   `PATH`.
-- **Job Failed:** xem `error_log`, sửa tài khoản/page/time rồi dùng Retry. Không
-  xóa job `Running`; hãy dừng queue trước.
+- **Account không sẵn sàng:** mở Chrome Profile tương ứng, đăng nhập lại hoặc
+  xử lý checkpoint rồi chạy **Check Preflight**. Không chạy lại hàng đợi trước
+   khi account đạt trạng thái sẵn sàng.
+- **Chrome Profile đang được dùng:** chờ tác vụ đang dùng account kết thúc hoặc
+  dừng tác vụ đó trước khi mở profile/check preflight.
+- **Tác vụ bị gián đoạn:** xem **Hoạt động gần đây** để biết loại tác vụ và số
+  mục đã xử lý, sau đó chạy lại đầu vào cần thiết. Lịch sử không lưu lại URL để
+  tránh giữ dữ liệu riêng tư.
 - **Database integrity khác ok:** dừng ứng dụng, giữ nguyên file lỗi, verify các
   backup và restore bản gần nhất đạt kiểm tra.
 

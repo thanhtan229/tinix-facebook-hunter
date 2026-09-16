@@ -54,7 +54,14 @@ def get_env(key: str, default: str = "") -> str:
 
 # Default configuration values
 DEFAULTS = {
-    "max_threads": 1,
+    # Download defaults deliberately favour account safety over raw throughput.
+    "max_threads": 3,
+    "download_use_accounts": True,
+    "download_delay_min": 2.0,
+    "download_delay_max": 5.0,
+    "download_batch_size": 25,
+    "download_batch_rest_min": 30.0,
+    "download_batch_rest_max": 90.0,
     "output_dir": str(Path.home() / "Downloads" / "Tinix FB Down"),
     "auto_open_folder": False,
     "save_cookies": False,
@@ -101,6 +108,7 @@ def load_config() -> dict:
     config = DEFAULTS.copy()
     config_path = _get_config_path()
 
+    migrated_download_safety = False
     if config_path.exists():
         try:
             with open(config_path, "r", encoding="utf-8") as f:
@@ -108,12 +116,28 @@ def load_config() -> dict:
             for key in _SECRET_CONFIG_KEYS:
                 if key in saved:
                     saved[key] = reveal_secret(saved[key])
+            # Apply the safer download defaults exactly once to older installs.
+            # Subsequent user-selected values are preserved by the marker.
+            if not saved.get("_download_safety_defaults_v1"):
+                try:
+                    saved["max_threads"] = min(max(1, int(saved.get("max_threads", 3))), 3)
+                except (TypeError, ValueError):
+                    saved["max_threads"] = 3
+                for key in (
+                    "download_use_accounts", "download_delay_min", "download_delay_max",
+                    "download_batch_size", "download_batch_rest_min", "download_batch_rest_max",
+                ):
+                    saved[key] = DEFAULTS[key]
+                saved["_download_safety_defaults_v1"] = True
+                migrated_download_safety = True
             config.update(saved)
         except (json.JSONDecodeError, IOError) as e:
             # If config is corrupted, use defaults
             print(f"[WARN] Could not load config: {e}. Using defaults.")
 
     _config_cache = config
+    if migrated_download_safety:
+        save_config(config)
     return config
 
 

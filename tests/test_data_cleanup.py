@@ -170,7 +170,7 @@ class ScrapedCleanupTest(unittest.TestCase):
             db_path = str(root / "api-cleanup.db")
             seed_scraped_data(db_path, output_root, Path(outside_dir))
             with patch.dict("os.environ", {"TINIX_DB_PATH": db_path}):
-                with TestClient(app) as client:
+                with TestClient(app, base_url="http://127.0.0.1") as client:
                     client.get("/")
                     response = client.post(
                         "/api/spy/cleanup",

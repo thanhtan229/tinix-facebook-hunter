@@ -8,6 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from fastapi import HTTPException
 from starlette.testclient import TestClient
 
 from core.db_storage import (
@@ -16,28 +17,37 @@ from core.db_storage import (
     add_account,
     add_social_account,
     create_favorite_page_group,
+    create_task_run,
     delete_favorite_page_group,
     get_all_accounts,
     get_db_path,
     get_db_stats,
+    normalize_escaped_page_names,
     get_account,
     get_favorite_pages,
     get_favorite_page_groups,
+    get_recent_task_runs,
     finish_favorite_scan,
     finish_favorite_archive_scan,
+    finish_task_run,
     migrate_secrets_at_rest,
     initialize_database,
     rebase_missing_social_profile_paths,
     save_favorite_page,
     reset_favorite_cursor,
+    recover_interrupted_task_runs,
+    recover_interrupted_downloads,
+    recover_download_queue_batches,
+    enqueue_download_queue_batch,
     query_posts_for_spy,
     mark_posts_download_status,
     set_post_rating,
     save_posts,
+    sync_downloaded_posts_from_folder,
     update_favorite_group_members,
     update_favorite_page_group,
 )
-from web.app import app
+from web.app import _is_local_origin, app
 from web.routes.accounts import _public_account
 from web.routes import accounts as accounts_routes
 from web.routes import downloader as downloader_routes
@@ -51,7 +61,7 @@ from core.page_scraper import (
     PageScraper, _PostCollector, _parse_metric_number, is_valid_facebook_page_name,
 )
 from core.facebook_parser import PostData
-from core.database_maintenance import create_database_backup, inspect_database, restore_database
+from core.database_maintenance import create_database_backup, inspect_database, normalize_page_names_with_backup, restore_database
 from utils.secure_store import is_protected, protect_secret, unprotect_secret
 from utils import config as app_config
 
@@ -91,11 +101,14 @@ class SecurityHelpersTest(unittest.TestCase):
             orchestrator._output_dir = Path(temp_dir)
             orchestrator.stats = core_downloader.DownloadStats(total_posts=1, start_time=time.time())
 
-            def fake_ytdlp(_url, save_dir, _cookies):
-                (save_dir / "video_001.mp4").write_bytes(b"completed-video")
+            def fake_ytdlp(_url, save_dir, _cookies, post_id=None):
+                pid = post_id or "video_001"
+                (save_dir / f"{pid}.mp4").write_bytes(b"completed-video")
                 return True
 
             with patch.object(core_downloader, "download_video", side_effect=fake_ytdlp), patch.object(
+                orchestrator, "_mark_post_download_status"
+            ), patch.object(
                 orchestrator, "_mark_post_downloaded"
             ) as mark_mock:
                 orchestrator._process_single_post(
@@ -103,9 +116,8 @@ class SecurityHelpersTest(unittest.TestCase):
                     browser=FakeBrowser(), cookies={"c_user": "1"},
                 )
 
-            post_dir = Path(temp_dir) / "1042220375120456"
-            self.assertTrue((post_dir / "video_001.mp4").is_file())
-            self.assertTrue((post_dir / "caption.txt").is_file())
+            self.assertTrue((Path(temp_dir) / "1042220375120456.mp4").is_file())
+            self.assertTrue((Path(temp_dir) / "1042220375120456.txt").is_file())
             self.assertEqual(orchestrator.stats.success_posts, 1)
             mark_mock.assert_called_once()
 
@@ -119,11 +131,14 @@ class SecurityHelpersTest(unittest.TestCase):
             orchestrator = core_downloader.DownloadOrchestrator()
             orchestrator._output_dir = Path(temp_dir)
             orchestrator.stats = core_downloader.DownloadStats(total_posts=1, start_time=time.time())
-            with patch.object(core_downloader, "download_video", return_value=False):
+            with patch.object(core_downloader, "download_video", return_value=False), patch.object(
+                orchestrator, "_mark_post_download_status"
+            ):
                 orchestrator._process_single_post(
                     "https://www.facebook.com/1234567890123456", 1,
                     browser=FakeBrowser(), cookies={"c_user": "1"},
                 )
+            self.assertFalse((Path(temp_dir) / "1234567890123456.txt").exists())
             self.assertFalse((Path(temp_dir) / "1234567890123456").exists())
             self.assertEqual(orchestrator.stats.failed_posts, 1)
 
@@ -165,11 +180,117 @@ class SecurityHelpersTest(unittest.TestCase):
         self.assertEqual(events[0][1], events[1][1])
         self.assertEqual(events[1][1], events[2][1])
 
+    def test_multi_account_download_owns_browser_lifecycle_in_each_worker_thread(self):
+        events = []
+
+        class FakeBrowser:
+            def __init__(self, **kwargs):
+                self.port = kwargs["cdp_port"]
+                self.created_thread = threading.get_ident()
+                events.append(("created", self.port, self.created_thread))
+
+            def start(self, _cookies, require_authenticated=False):
+                events.append(("started", self.port, threading.get_ident(), require_authenticated))
+                return self.created_thread == threading.get_ident()
+
+            def stop(self):
+                events.append(("stopped", self.port, threading.get_ident()))
+
+        orchestrator = core_downloader.DownloadOrchestrator()
+        orchestrator._output_dir = Path("test-output")
+        orchestrator._max_threads = 2
+        orchestrator.stats = core_downloader.DownloadStats(total_posts=2, start_time=time.time())
+        accounts = [
+            {"id": 1, "label": "One", "is_active": 1, "cookie": "c_user=1"},
+            {"id": 2, "label": "Two", "is_active": 1, "cookie": "c_user=2"},
+        ]
+
+        def process(_url, _index, *, browser, **_kwargs):
+            events.append(("processed", browser.port, threading.get_ident()))
+            self.assertEqual(browser.created_thread, threading.get_ident())
+            orchestrator._update_stats(failed=False)
+
+        ready = SimpleNamespace(ready=True, code="READY", message="Ready")
+        with patch.object(core_downloader, "BrowserManager", FakeBrowser), patch.object(
+            core_downloader, "check_facebook_account", return_value=ready
+        ), patch.object(core_downloader, "resolve_download_profile", return_value="test-profile"), patch.object(
+            orchestrator, "_mark_urls_download_status"
+        ), patch.object(orchestrator, "_mark_post_download_status"), patch.object(
+            orchestrator, "_process_single_post", side_effect=process
+        ):
+            orchestrator._run_multi_account_pipeline(
+                ["https://facebook.com/101", "https://facebook.com/102"], accounts
+            )
+
+        self.assertEqual(orchestrator.stats.success_posts, 2)
+        processed_events = [event for event in events if event[0] == "processed"]
+        self.assertEqual(len(processed_events), 2)
+        for port in (9701, 9702):
+            lifecycle = [event for event in events if event[1] == port]
+            self.assertEqual([event[0] for event in lifecycle][0], "created")
+            self.assertIn("started", [event[0] for event in lifecycle])
+            self.assertEqual([event[0] for event in lifecycle][-1], "stopped")
+            self.assertEqual({event[2] for event in lifecycle}, {lifecycle[0][2]})
+        for event in processed_events:
+            browser_thread = next(item[2] for item in events if item[0] == "created" and item[1] == event[1])
+            self.assertEqual(event[2], browser_thread)
+
+    def test_multi_account_all_worker_start_failures_finalize_the_queue(self):
+        class FailingBrowser:
+            def __init__(self, **_kwargs):
+                self.last_start_error_code = "BROWSER_START_FAILED"
+                self.last_start_error_message = "Chrome unavailable"
+
+            def start(self, _cookies, require_authenticated=False):
+                return False
+
+            def stop(self):
+                pass
+
+        orchestrator = core_downloader.DownloadOrchestrator()
+        orchestrator._output_dir = Path("test-output")
+        orchestrator._max_threads = 1
+        orchestrator.stats = core_downloader.DownloadStats(total_posts=2, start_time=time.time())
+        ready = SimpleNamespace(ready=True, code="READY", message="Ready")
+        with patch.object(core_downloader, "BrowserManager", FailingBrowser), patch.object(
+            core_downloader, "check_facebook_account", return_value=ready
+        ), patch.object(core_downloader, "resolve_download_profile", return_value="test-profile"), patch.object(
+            orchestrator, "_mark_urls_download_status"
+        ), patch.object(orchestrator, "_mark_post_download_status"):
+            orchestrator._run_multi_account_pipeline(
+                ["https://facebook.com/101", "https://facebook.com/102"],
+                [{"id": 1, "label": "One", "is_active": 1}],
+            )
+
+        self.assertEqual(orchestrator.stats.completed_posts, 2)
+        self.assertEqual(orchestrator.stats.failed_posts, 2)
+
+    def test_stop_leaves_worker_owned_browsers_to_their_own_thread(self):
+        class WorkerBrowser:
+            stopped = False
+
+            def stop(self):
+                self.stopped = True
+
+        orchestrator = core_downloader.DownloadOrchestrator()
+        browser = WorkerBrowser()
+        orchestrator._browsers = [browser]
+        orchestrator._running = True
+
+        orchestrator.stop()
+
+        self.assertTrue(orchestrator._stop_event.is_set())
+        self.assertFalse(browser.stopped)
+
     def test_failed_download_completion_emits_failed_progress(self):
         old_stats = downloader_routes.orchestrator.stats
+        previous_task_run_id = downloader_routes._active_task_run_id
+        previous_queue_batch_id = downloader_routes._active_queue_batch_id
         downloader_routes.orchestrator.stats = core_downloader.DownloadStats(
             total_posts=2, completed_posts=2, failed_posts=2
         )
+        downloader_routes._active_task_run_id = 0
+        downloader_routes._active_queue_batch_id = 0
         try:
             with patch.object(downloader_routes, "log_to_web") as log_mock, patch.object(
                 downloader_routes, "progress_to_web"
@@ -180,6 +301,8 @@ class SecurityHelpersTest(unittest.TestCase):
             self.assertEqual(progress_mock.call_args.args[-1], "failed")
         finally:
             downloader_routes.orchestrator.stats = old_stats
+            downloader_routes._active_task_run_id = previous_task_run_id
+            downloader_routes._active_queue_batch_id = previous_queue_batch_id
 
     def test_download_route_calls_orchestrator_start_for_cookie_mode(self):
         class FakeOrchestrator:
@@ -196,17 +319,76 @@ class SecurityHelpersTest(unittest.TestCase):
             max_threads=2,
             use_accounts=False,
         )
-        with patch.object(downloader_routes, "orchestrator", fake), patch.object(
-            downloader_routes.config, "get",
-            side_effect=lambda key, default=None: {
-                "output_dir": "test-output",
-                "saved_cookies": "c_user=1; xs=valid-cookie",
-            }.get(key, default),
-        ):
-            result = downloader_routes.start_download(request)
-        self.assertEqual(result["status"], "success")
-        self.assertEqual(fake.start_kwargs["max_threads"], 2)
-        self.assertIn("1061899689819191", fake.start_kwargs["urls_text"])
+        previous_task_run_id = downloader_routes._active_task_run_id
+        previous_queue_batch_id = downloader_routes._active_queue_batch_id
+        previous_owner = downloader_routes._active_profile_lease_owner
+        previous_lease_keys = downloader_routes._active_profile_lease_keys
+        with tempfile.TemporaryDirectory() as temp_dir:
+            isolated_db = str(Path(temp_dir) / "route-download-test.db")
+            canary_db = str(Path(temp_dir) / "configured-database-canary.db")
+            initialize_database(canary_db)
+            try:
+                with patch.object(downloader_routes, "orchestrator", fake), patch.object(
+                    downloader_routes, "_db_path", return_value=isolated_db
+                ), patch.object(
+                    downloader_routes.config, "get",
+                    side_effect=lambda key, default=None: {
+                        "output_dir": "test-output",
+                        "saved_cookies": "c_user=1; xs=valid-cookie",
+                        "scraper_db_path": canary_db,
+                    }.get(key, default),
+                ):
+                    result = downloader_routes.start_download(request)
+
+                self.assertEqual(result["status"], "success")
+                self.assertEqual(fake.start_kwargs["max_threads"], 2)
+                self.assertIn("1061899689819191", fake.start_kwargs["urls_text"])
+                self.assertEqual(get_recent_task_runs(canary_db), [])
+                self.assertEqual(len(get_recent_task_runs(isolated_db)), 1)
+            finally:
+                downloader_routes._active_task_run_id = previous_task_run_id
+                downloader_routes._active_queue_batch_id = previous_queue_batch_id
+                downloader_routes._active_profile_lease_owner = previous_owner
+                downloader_routes._active_profile_lease_keys = previous_lease_keys
+
+    def test_selected_download_accounts_rejects_inactive_ids(self):
+        accounts = [
+            {"id": 3, "label": "Ready", "is_active": 1, "preflight_status": "READY"},
+            {"id": 4, "label": "Disabled", "is_active": 0, "preflight_status": ""},
+            {"id": 5, "label": "Waiting", "is_active": 1, "preflight_status": ""},
+        ]
+        with patch.object(downloader_routes, "get_all_accounts", return_value=accounts):
+            selected = downloader_routes._selected_download_accounts("test.db", [5])
+            self.assertEqual([account["id"] for account in selected], [5])
+            with self.assertRaises(HTTPException) as raised:
+                downloader_routes._selected_download_accounts("test.db", [4])
+
+        self.assertEqual(raised.exception.status_code, 422)
+
+    def test_cookie_only_download_rejects_invalid_cookie_before_creating_a_task(self):
+        class FakeOrchestrator:
+            is_running = False
+
+            def start(self, **_kwargs):
+                raise AssertionError("Cookie không hợp lệ không được khởi động downloader")
+
+        request = downloader_routes.DownloadStartRequest(
+            urls="https://www.facebook.com/1061899689819191",
+            use_accounts=False,
+        )
+        with patch.object(downloader_routes, "orchestrator", FakeOrchestrator()), patch.object(
+            downloader_routes, "get_all_accounts", return_value=[]
+        ), patch.object(
+            downloader_routes, "validate_cookies", return_value=(False, "Thiếu cookie")
+        ), patch.object(
+            downloader_routes, "create_task_run"
+        ) as create_task:
+            with self.assertRaises(HTTPException) as raised:
+                downloader_routes.start_download(request)
+
+        self.assertEqual(raised.exception.status_code, 400)
+        self.assertIn("Cookies", raised.exception.detail)
+        create_task.assert_not_called()
 
     def test_view_metric_parser_and_graphql_collector_support_localized_counts(self):
         self.assertEqual(_parse_metric_number("1,2K lượt xem"), 1200)
@@ -288,6 +470,28 @@ class SecurityHelpersTest(unittest.TestCase):
             "https://scontent.fhan1-1.fna.fbcdn.net/dom-preview.jpg",
         )
         self.assertEqual(collector._posts["123456789012345"]["media_count"], 1)
+
+    def test_graphql_video_story_uses_playable_video_url_not_story_url(self):
+        collector = _PostCollector()
+        story = {
+            "post_id": "1644427817693826",
+            "comet_sections": {
+                "content": {
+                    "story": {
+                        "message": {"text": "Video caption"},
+                        "attachments": [{
+                            "media": {"__typename": "Video", "id": "1734567890123456"}
+                        }],
+                    }
+                },
+                "feedback": {},
+            },
+        }
+
+        post = collector._parse_story_node(story)
+
+        self.assertEqual(post["post_type"], "Video")
+        self.assertEqual(post["url"], "https://www.facebook.com/watch/?v=1734567890123456")
 
     def test_page_name_rejects_facebook_detail_label_and_uses_graphql_name(self):
         class FakePage:
@@ -442,13 +646,14 @@ class ApiSessionTest(unittest.TestCase):
 
     def test_api_requires_browser_session(self):
         with tempfile.TemporaryDirectory() as temp_dir, self._temporary_database(temp_dir):
-            with TestClient(app) as client:
+            with TestClient(app, base_url="http://127.0.0.1") as client:
                 response = client.get("/api/system/stats")
                 self.assertEqual(response.status_code, 401)
+                self.assertEqual(client.get("/api/system/health").status_code, 200)
 
     def test_root_establishes_session_and_rejects_foreign_origin(self):
         with tempfile.TemporaryDirectory() as temp_dir, self._temporary_database(temp_dir):
-            with TestClient(app) as client:
+            with TestClient(app, base_url="http://127.0.0.1") as client:
                 self.assertEqual(client.get("/").status_code, 200)
                 self.assertIn("no-store", client.get("/").headers["cache-control"])
                 self.assertEqual(client.get("/api/system/stats").status_code, 200)
@@ -459,10 +664,55 @@ class ApiSessionTest(unittest.TestCase):
                 )
                 self.assertEqual(response.status_code, 403)
 
+    def test_host_and_origin_must_match_local_http_server(self):
+        with tempfile.TemporaryDirectory() as temp_dir, self._temporary_database(temp_dir):
+            self.assertFalse(_is_local_origin("https://127.0.0.1", "127.0.0.1"))
+            self.assertFalse(_is_local_origin("http://[not-an-ip", "127.0.0.1"))
+            self.assertFalse(_is_local_origin("http://localhost", "127.0.0.1"))
+            self.assertTrue(_is_local_origin("http://127.0.0.1", "127.0.0.1"))
+
+            with TestClient(app, base_url="http://127.0.0.1") as client:
+                rejected = client.get("/", headers={"Host": "attacker.invalid"})
+                self.assertEqual(rejected.status_code, 400)
+                self.assertNotIn("tinix_session", rejected.headers.get("set-cookie", ""))
+
+                self.assertEqual(client.get("/").status_code, 200)
+                https_origin = client.post(
+                    "/api/accounts/save",
+                    json={"username": "demo", "cookie": {"invalid": True}},
+                    headers={"Origin": "https://127.0.0.1", "Host": "127.0.0.1"},
+                )
+                self.assertEqual(https_origin.status_code, 403)
+                malformed_origin = client.post(
+                    "/api/accounts/save",
+                    json={"username": "demo", "cookie": {"invalid": True}},
+                    headers={"Origin": "http://[not-an-ip", "Host": "127.0.0.1"},
+                )
+                self.assertEqual(malformed_origin.status_code, 403)
+
+    def test_local_client_still_requires_session_and_matching_origin(self):
+        with tempfile.TemporaryDirectory() as temp_dir, self._temporary_database(temp_dir):
+            with TestClient(app, base_url="http://127.0.0.1") as anonymous:
+                self.assertEqual(anonymous.post("/api/system/open-folder", json={}).status_code, 401)
+            with TestClient(app, base_url="http://127.0.0.1") as client:
+                client.get("/")
+                response = client.post(
+                    "/api/system/open-folder",
+                    json={},
+                    headers={"Origin": "http://localhost:8000", "Host": "127.0.0.1:8000"},
+                )
+                self.assertEqual(response.status_code, 403)
+                matching = client.post(
+                    "/api/accounts/save",
+                    json={"username": "demo", "cookie": {"invalid": True}},
+                    headers={"Origin": "http://127.0.0.1", "Host": "127.0.0.1"},
+                )
+                self.assertEqual(matching.status_code, 422)
+
     def test_validation_error_does_not_echo_request_secrets(self):
         marker = "DO-NOT-ECHO-THIS-COOKIE"
         with tempfile.TemporaryDirectory() as temp_dir, self._temporary_database(temp_dir):
-            with TestClient(app) as client:
+            with TestClient(app, base_url="http://127.0.0.1") as client:
                 client.get("/")
                 response = client.post(
                     "/api/accounts/save",
@@ -474,13 +724,30 @@ class ApiSessionTest(unittest.TestCase):
 
     def test_health_reports_schema_without_private_database_path(self):
         with tempfile.TemporaryDirectory() as temp_dir, self._temporary_database(temp_dir):
-            with TestClient(app) as client:
+            with TestClient(app, base_url="http://127.0.0.1") as client:
                 client.get("/")
                 response = client.get("/api/system/health")
                 self.assertEqual(response.status_code, 200)
                 payload = response.json()["data"]
                 self.assertTrue(payload["checks"]["database"])
                 self.assertNotIn(str(Path(temp_dir)), response.text)
+
+    def test_task_history_api_requires_session_and_returns_safe_summary(self):
+        with tempfile.TemporaryDirectory() as temp_dir, self._temporary_database(temp_dir):
+            db_path = str(Path(temp_dir) / "api.db")
+            create_task_run(
+                db_path, "download", total_items=2,
+                summary={"workers": 2, "cookie": "must-not-be-persisted"},
+            )
+            with TestClient(app, base_url="http://127.0.0.1") as client:
+                self.assertEqual(client.get("/api/system/task-runs").status_code, 401)
+                client.get("/")
+                response = client.get("/api/system/task-runs")
+            self.assertEqual(response.status_code, 200)
+            run = response.json()["data"][0]
+            self.assertEqual(run["task_type"], "download")
+            self.assertEqual(run["summary"], {"workers": 2})
+            self.assertNotIn("cookie", response.text.lower())
 
     def test_favorite_page_api_saves_normalized_public_metadata(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -489,7 +756,7 @@ class ApiSessionTest(unittest.TestCase):
                 scraper_routes.config, "get",
                 side_effect=lambda key, default=None: db_path if key == "scraper_db_path" else default,
             ):
-                with TestClient(app) as client:
+                with TestClient(app, base_url="http://127.0.0.1") as client:
                     client.get("/")
                     saved = client.post(
                         "/api/scrape/favorites/save",
@@ -517,7 +784,7 @@ class ApiSessionTest(unittest.TestCase):
                 scraper_routes.config, "get",
                 side_effect=lambda key, default=None: db_path if key == "scraper_db_path" else default,
             ):
-                with TestClient(app) as client:
+                with TestClient(app, base_url="http://127.0.0.1") as client:
                     client.get("/")
                     created = client.post(
                         "/api/scrape/favorites/groups/create",
@@ -542,7 +809,7 @@ class ApiSessionTest(unittest.TestCase):
                 scraper_routes.config, "get",
                 side_effect=lambda key, default=None: db_path if key == "scraper_db_path" else default,
             ):
-                with TestClient(app) as client:
+                with TestClient(app, base_url="http://127.0.0.1") as client:
                     client.get("/")
                     s1 = client.post("/api/scrape/favorites/save", json={"page_url": "https://facebook.com/page-1"})
                     s2 = client.post("/api/scrape/favorites/save", json={"page_url": "https://facebook.com/page-2"})
@@ -562,6 +829,277 @@ class ApiSessionTest(unittest.TestCase):
 
 
 class DatabaseBootstrapTest(unittest.TestCase):
+    def test_page_search_records_preflight_and_credential_free_history(self):
+        class FakeSearch:
+            def __init__(self, account=None):
+                self.account = account
+
+            def start(self):
+                return True
+
+            def search(self, **_kwargs):
+                return [{"page_name": "Demo", "page_url": "https://www.facebook.com/demo"}]
+
+            def stop(self):
+                return None
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "page-search.db")
+            previous_status = dict(scraper_routes._scrape_status)
+            previous_run_id = scraper_routes._active_task_run_id
+            try:
+                scraper_routes._active_task_run_id = create_task_run(db_path, "page_search", total_items=5)
+                scraper_routes._scrape_status.update({
+                    "is_running": True, "queue_completed": 0, "queue_successful": 0,
+                    "queue_failed": 0, "search_results": [], "workers": {},
+                })
+                ready = SimpleNamespace(ready=True, code="READY", message="Sẵn sàng")
+                with patch.object(scraper_routes.config, "get", side_effect=lambda key, default=None: db_path if key == "scraper_db_path" else default), patch.object(
+                    scraper_routes, "PageSearchEngine", FakeSearch
+                ), patch.object(scraper_routes, "check_facebook_account", return_value=ready) as preflight, patch.object(
+                    scraper_routes, "save_account_preflight_result", return_value="2026-09-14 12:00:00"
+                ):
+                    scraper_routes._run_page_search("demo", 5, 0, "relevance", {"id": 7, "label": "Demo", "is_active": 1})
+
+                run = get_recent_task_runs(db_path)[0]
+                self.assertEqual((run["task_type"], run["status"]), ("page_search", "completed"))
+                self.assertEqual((run["total_items"], run["completed_items"], run["successful_items"]), (5, 1, 1))
+                preflight.assert_called_once()
+            finally:
+                scraper_routes._active_task_run_id = previous_run_id
+                scraper_routes._scrape_status.clear()
+                scraper_routes._scrape_status.update(previous_status)
+
+    def test_pending_auto_download_starts_after_the_current_run(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "durable-auto-queue.db")
+            previous_running = downloader_routes.orchestrator._running
+            previous_shutdown = downloader_routes._shutdown_requested
+            try:
+                downloader_routes._shutdown_requested = False
+                downloader_routes.orchestrator._running = True
+                with patch.object(downloader_routes, "_db_path", return_value=db_path):
+                    self.assertTrue(downloader_routes.enqueue_auto_download(["https://www.facebook.com/12345678901"], []))
+                    self.assertEqual(downloader_routes.get_download_queue_status(db_path)["batches"], 1)
+                    downloader_routes.orchestrator._running = False
+                    with patch.object(downloader_routes, "_start_claimed_auto_batch", return_value=True) as start_next:
+                        downloader_routes._start_pending_auto_download()
+                    self.assertEqual(start_next.call_args.args[0]["urls"], ["https://www.facebook.com/12345678901"])
+            finally:
+                downloader_routes.orchestrator._running = previous_running
+                downloader_routes._shutdown_requested = previous_shutdown
+
+    def test_auto_queue_waits_for_idle_callback_after_completion(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "idle-auto-queue.db")
+            previous_running = downloader_routes.orchestrator._running
+            previous_run_id = downloader_routes._active_task_run_id
+            previous_shutdown = downloader_routes._shutdown_requested
+            try:
+                downloader_routes._shutdown_requested = False
+                downloader_routes._active_task_run_id = 0
+                downloader_routes.orchestrator._running = True
+                with patch.object(downloader_routes, "_db_path", return_value=db_path):
+                    self.assertTrue(downloader_routes.enqueue_auto_download(["https://www.facebook.com/12345678901"], []))
+                    with patch.object(downloader_routes, "_start_claimed_auto_batch", return_value=True) as start_next:
+                        downloader_routes._on_all_complete(True, "done")
+                        start_next.assert_not_called()
+                        downloader_routes.orchestrator._running = False
+                        downloader_routes._on_download_idle()
+                        start_next.assert_called_once()
+            finally:
+                downloader_routes.orchestrator._running = previous_running
+                downloader_routes._active_task_run_id = previous_run_id
+                downloader_routes._shutdown_requested = previous_shutdown
+
+    def test_durable_auto_queue_recovers_a_claimed_batch_after_restart(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "restart-auto-queue.db")
+            batch_id = downloader_routes.enqueue_download_queue_batch(
+                db_path, ["https://www.facebook.com/12345678901"], [7], source="auto"
+            )
+            self.assertGreater(batch_id, 0)
+            claimed = downloader_routes.claim_next_download_queue_batch(db_path)
+            self.assertEqual(claimed["id"], batch_id)
+            self.assertEqual(downloader_routes.get_download_queue_status(db_path)["batches"], 1)
+            self.assertEqual(recover_download_queue_batches(db_path), 1)
+            resumed = downloader_routes.claim_next_download_queue_batch(db_path)
+            self.assertEqual(resumed["urls"], ["https://www.facebook.com/12345678901"])
+
+    def test_stop_all_cancels_persisted_batches_without_starting_them(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "stop-all-auto-queue.db")
+            downloader_routes.enqueue_download_queue_batch(
+                db_path, ["https://www.facebook.com/12345678901"], [], source="auto"
+            )
+            previous_running = downloader_routes.orchestrator._running
+            previous_stop_all = downloader_routes._stop_all_requested
+            try:
+                downloader_routes.orchestrator._running = False
+                with patch.object(downloader_routes, "_db_path", return_value=db_path):
+                    result = downloader_routes.stop_all_downloads()
+                    self.assertEqual(result["cancelled_batches"], 1)
+                    self.assertFalse(downloader_routes.download_has_active_or_pending_work())
+            finally:
+                downloader_routes.orchestrator._running = previous_running
+                downloader_routes._stop_all_requested = previous_stop_all
+
+    def test_pause_and_resume_routes_toggle_a_running_download(self):
+        previous_running = downloader_routes.orchestrator._running
+        previous_pause_event_set = downloader_routes.orchestrator._pause_event.is_set()
+        try:
+            downloader_routes.orchestrator._running = True
+            downloader_routes.orchestrator._pause_event.set()
+
+            paused = downloader_routes.pause_download()
+            self.assertEqual(paused["message"], "Đã tạm dừng")
+            self.assertTrue(downloader_routes.orchestrator.is_paused)
+
+            resumed = downloader_routes.resume_download()
+            self.assertEqual(resumed["message"], "Đã tiếp tục")
+            self.assertFalse(downloader_routes.orchestrator.is_paused)
+        finally:
+            downloader_routes.orchestrator._running = previous_running
+            if previous_pause_event_set:
+                downloader_routes.orchestrator._pause_event.set()
+            else:
+                downloader_routes.orchestrator._pause_event.clear()
+
+    def test_stop_current_keeps_persisted_auto_queue(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "stop-current-auto-queue.db")
+            downloader_routes.enqueue_download_queue_batch(
+                db_path, ["https://www.facebook.com/12345678901"], [], source="auto"
+            )
+            previous_running = downloader_routes.orchestrator._running
+            previous_stop_requested = downloader_routes._download_stop_requested
+            try:
+                downloader_routes.orchestrator._running = True
+                with patch.object(downloader_routes, "_db_path", return_value=db_path), patch.object(
+                    downloader_routes.orchestrator, "stop"
+                ) as stop:
+                    result = downloader_routes.stop_download()
+                    self.assertEqual(result["message"], "Đã dừng tác vụ tải hiện tại")
+                    stop.assert_called_once()
+                    self.assertEqual(downloader_routes.get_download_queue_status(db_path)["batches"], 1)
+            finally:
+                downloader_routes.orchestrator._running = previous_running
+                downloader_routes._download_stop_requested = previous_stop_requested
+
+    def test_cleared_starting_batch_cannot_be_revived_or_started(self):
+        class FakeOrchestrator:
+            is_running = False
+
+            def __init__(self):
+                self.start_calls = 0
+
+            def start(self, **_kwargs):
+                self.start_calls += 1
+                return True
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "clear-starting-auto-queue.db")
+            batch_id = downloader_routes.enqueue_download_queue_batch(
+                db_path, ["https://www.facebook.com/12345678901"], [], source="auto"
+            )
+            claimed = downloader_routes.claim_next_download_queue_batch(db_path)
+            self.assertEqual(claimed["id"], batch_id)
+
+            fake = FakeOrchestrator()
+            previous_run_id = downloader_routes._active_task_run_id
+            previous_batch_id = downloader_routes._active_queue_batch_id
+            previous_owner = downloader_routes._active_profile_lease_owner
+            previous_lease_keys = downloader_routes._active_profile_lease_keys
+            try:
+                with patch.object(downloader_routes, "_db_path", return_value=db_path), patch.object(
+                    downloader_routes, "orchestrator", fake
+                ), patch.object(
+                    downloader_routes, "get_all_accounts", return_value=[]
+                ), patch.object(
+                    downloader_routes, "create_task_run", return_value=1
+                ), patch.object(
+                    downloader_routes, "finish_task_run", return_value=True
+                ), patch.object(
+                    downloader_routes, "acquire_profile_leases", return_value=set()
+                ), patch.object(
+                    downloader_routes, "release_profile_leases"
+                ):
+                    cleared = downloader_routes.clear_pending_download_queue()
+                    self.assertEqual(cleared["cancelled_batches"], 1)
+                    self.assertFalse(downloader_routes._start_claimed_auto_batch(claimed))
+
+                conn = _get_conn(db_path)
+                try:
+                    row = conn.execute(
+                        "SELECT status, urls_json FROM download_queue_batches WHERE id = ?", (batch_id,)
+                    ).fetchone()
+                finally:
+                    conn.close()
+                self.assertEqual(row[0], "cancelled")
+                self.assertEqual(row[1], "[]")
+                self.assertEqual(fake.start_calls, 0)
+            finally:
+                downloader_routes._active_task_run_id = previous_run_id
+                downloader_routes._active_queue_batch_id = previous_batch_id
+                downloader_routes._active_profile_lease_owner = previous_owner
+                downloader_routes._active_profile_lease_keys = previous_lease_keys
+
+    def test_task_history_clamps_inconsistent_counters_to_the_total(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "task-runs-clamp.db")
+            run_id = create_task_run(db_path, "download", total_items=1)
+            self.assertTrue(finish_task_run(
+                db_path, run_id, "failed", completed_items=2, successful_items=0, failed_items=2,
+            ))
+            run = get_recent_task_runs(db_path)[0]
+            self.assertEqual((run["total_items"], run["completed_items"], run["successful_items"], run["failed_items"]), (1, 1, 0, 1))
+
+    def test_task_history_normalizes_legacy_inconsistent_counters_when_read(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "task-runs-legacy-clamp.db")
+            run_id = create_task_run(db_path, "download", total_items=1)
+            conn = _get_conn(db_path)
+            try:
+                conn.execute(
+                    "UPDATE task_runs SET status = 'failed', completed_items = 2, successful_items = 0, failed_items = 2 WHERE id = ?",
+                    (run_id,),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            run = get_recent_task_runs(db_path)[0]
+            self.assertEqual((run["total_items"], run["completed_items"], run["successful_items"], run["failed_items"]), (1, 1, 0, 1))
+
+    def test_task_run_history_recovers_only_interrupted_work(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "task-runs.db")
+            completed_id = create_task_run(db_path, "download", total_items=3, summary={"workers": 2})
+            running_id = create_task_run(db_path, "scrape_quick", total_items=2, summary={"scan_limit": 100})
+            self.assertTrue(finish_task_run(
+                db_path, completed_id, "completed", completed_items=3, successful_items=3,
+            ))
+            self.assertEqual(recover_interrupted_task_runs(db_path), 1)
+            by_id = {run["id"]: run for run in get_recent_task_runs(db_path)}
+            self.assertEqual(by_id[completed_id]["status"], "completed")
+            self.assertEqual(by_id[running_id]["status"], "interrupted")
+            self.assertEqual(by_id[running_id]["summary"], {"scan_limit": 100})
+
+    def test_scrape_preflight_marks_unready_account_before_worker_runs(self):
+        account = {"id": 7, "label": "Expired", "is_active": 1}
+        queue = {"worker_id": "account-7", "account": account, "account_label": "Expired"}
+        previous_workers = scraper_routes._scrape_status["workers"]
+        scraper_routes._scrape_status["workers"] = {"account-7": {"status": "Đang chờ", "error": ""}}
+        try:
+            result = SimpleNamespace(ready=False, code="AUTH_EXPIRED", message="Phiên Facebook đã hết hạn")
+            with patch.object(scraper_routes, "check_facebook_account", return_value=result), patch.object(
+                scraper_routes, "save_account_preflight_result", return_value="2026-09-14 10:00:00"
+            ):
+                scraper_routes._preflight_scrape_queues("unused.db", [queue])
+            self.assertEqual(queue["account_error"], "Phiên Facebook đã hết hạn")
+            self.assertEqual(scraper_routes._scrape_status["workers"]["account-7"]["status"], "Không sẵn sàng")
+        finally:
+            scraper_routes._scrape_status["workers"] = previous_workers
+
     def test_schema_upgrade_removes_legacy_proxy_storage_with_verified_backup(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = str(Path(temp_dir) / "legacy-proxy.db")
@@ -680,6 +1218,29 @@ class DatabaseBootstrapTest(unittest.TestCase):
             self.assertEqual(len(fallback), 3)
             self.assertEqual(by_views[0]["view_count"], 9000)
 
+    def test_spy_search_filters_before_resolving_local_previews(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "spy-search.db")
+            posts = [
+                SimpleNamespace(
+                    post_id="match-1", date="01/01/2026", post_type="Text",
+                    engagement=0, comments=0, shares=0, view_count=0,
+                    caption="Điểm nhấn", url="",
+                ),
+                SimpleNamespace(
+                    post_id="other-2", date="02/01/2026", post_type="Text",
+                    engagement=0, comments=0, shares=0, view_count=0,
+                    caption="Không liên quan", url="",
+                ),
+            ]
+            save_posts(db_path, "Demo", "https://facebook.com/demo", posts)
+
+            with patch("core.db_storage._local_media_preview", return_value=("", "", 0)) as preview:
+                result = query_posts_for_spy(db_path, ["Demo"], query="ĐIỂM")
+
+            self.assertEqual([post["post_id"] for post in result], ["match-1"])
+            self.assertEqual(preview.call_count, 1)
+
     def test_spy_download_status_lifecycle_and_filters(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = str(Path(temp_dir) / "download-status.db")
@@ -712,6 +1273,105 @@ class DatabaseBootstrapTest(unittest.TestCase):
             self.assertTrue(set_post_rating(db_path, downloaded[0]["id"], 4))
             rated = query_posts_for_spy(db_path, ["Demo"])[0]
             self.assertEqual(rated["rating"], 4)
+
+    def test_video_thumbnail_is_not_reported_as_fully_downloaded(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            db_path = str(root / "thumbnail-status.db")
+            output = root / "downloads"
+            post_dir = output / "1234567890123"
+            post_dir.mkdir(parents=True)
+            (post_dir / "thumbnail.jpg").write_bytes(b"thumbnail")
+            save_posts(
+                db_path,
+                "Demo",
+                "https://facebook.com/demo",
+                [SimpleNamespace(
+                    post_id="1234567890123", date="01/01/2026", post_type="Video",
+                    engagement=0, comments=0, shares=0, view_count=1,
+                    caption="Video thumbnail", url="https://facebook.com/watch/?v=1234567890123",
+                )],
+            )
+
+            self.assertEqual(sync_downloaded_posts_from_folder(db_path, str(output)), 1)
+            post = query_posts_for_spy(db_path, ["Demo"])[0]
+            self.assertEqual(post["download_status"], "thumbnail_only")
+            self.assertEqual(query_posts_for_spy(db_path, ["Demo"], download_status="Đã tải"), [])
+            self.assertEqual(
+                query_posts_for_spy(db_path, ["Demo"], download_status="Thiếu video")[0]["post_id"],
+                "1234567890123",
+            )
+            self.assertEqual(get_db_stats(db_path)["downloaded_posts"], 0)
+
+            (post_dir / "video_001.mp4").write_bytes(b"video")
+            self.assertEqual(sync_downloaded_posts_from_folder(db_path, str(output)), 1)
+            completed = query_posts_for_spy(db_path, ["Demo"], download_status="Đã tải")
+            self.assertEqual(completed[0]["download_status"], "downloaded")
+            self.assertEqual(get_db_stats(db_path)["downloaded_posts"], 1)
+
+    def test_queued_downloads_are_marked_before_workers_start(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "queued-status.db")
+            post_ids = ["1234567890123", "1234567890124"]
+            posts = [
+                SimpleNamespace(
+                    post_id=post_id, date="01/01/2026", post_type="Video",
+                    engagement=0, comments=0, shares=0, view_count=1,
+                    caption="Queued", url=f"https://facebook.com/watch/?v={post_id}",
+                )
+                for post_id in post_ids
+            ]
+            save_posts(db_path, "Demo", "https://facebook.com/demo", posts)
+            orchestrator = core_downloader.DownloadOrchestrator()
+            values = {"scraper_db_path": db_path}
+            with patch.object(core_downloader.config, "get", side_effect=lambda key, default=None: values.get(key, default)):
+                orchestrator._mark_urls_download_status(
+                    [f"https://facebook.com/watch/?v={post_id}" for post_id in post_ids],
+                    "downloading",
+                )
+
+            queued = query_posts_for_spy(db_path, ["Demo"], download_status="Đang tải")
+            self.assertEqual({post["post_id"] for post in queued}, set(post_ids))
+
+            mark_posts_download_status(db_path, [post_ids[0]], "downloaded", folder_path="done")
+            mark_posts_download_status(
+                db_path,
+                post_ids,
+                "failed",
+                error="worker stopped",
+                only_if_status="downloading",
+            )
+            states = {post["post_id"]: post["download_status"] for post in query_posts_for_spy(db_path, ["Demo"])}
+            self.assertEqual(states[post_ids[0]], "downloaded")
+            self.assertEqual(states[post_ids[1]], "failed")
+
+    def test_recovery_fails_orphaned_downloads_but_keeps_durable_queue_items(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "interrupted-downloads.db")
+            post_ids = ["1234567890123", "1234567890124"]
+            save_posts(
+                db_path,
+                "Demo",
+                "https://facebook.com/demo",
+                [
+                    SimpleNamespace(
+                        post_id=post_id, date="01/01/2026", post_type="Video",
+                        engagement=0, comments=0, shares=0, view_count=0,
+                        caption="Interrupted", url=f"https://facebook.com/demo/posts/{post_id}",
+                    )
+                    for post_id in post_ids
+                ],
+            )
+            mark_posts_download_status(db_path, post_ids, "downloading")
+            enqueue_download_queue_batch(
+                db_path, [f"https://facebook.com/demo/posts/{post_ids[0]}"], [], source="auto",
+            )
+
+            self.assertEqual(recover_interrupted_downloads(db_path), 1)
+            states = {post["post_id"]: post for post in query_posts_for_spy(db_path, ["Demo"])}
+            self.assertEqual(states[post_ids[0]]["download_status"], "downloading")
+            self.assertEqual(states[post_ids[1]]["download_status"], "failed")
+            self.assertIn("gián đoạn", states[post_ids[1]]["download_error"])
 
     def test_archive_scan_uses_oldest_boundary_and_persists_separate_cursor(self):
         raw = [
@@ -912,7 +1572,7 @@ class DatabaseBootstrapTest(unittest.TestCase):
         self.assertEqual(len(urls), 4)
         self.assertEqual([account["id"] for account in accounts], [1, 2])
 
-    def test_auto_download_url_collection_is_unique_and_request_defaults_off(self):
+    def test_auto_download_url_collection_is_unique_and_request_defaults_on(self):
         posts = [
             SimpleNamespace(url="https://facebook.com/posts/1"),
             SimpleNamespace(url="https://facebook.com/posts/1"),
@@ -923,8 +1583,23 @@ class DatabaseBootstrapTest(unittest.TestCase):
             scraper_routes._downloadable_post_urls(posts),
             ["https://facebook.com/posts/1", "https://facebook.com/posts/2"],
         )
-        self.assertFalse(scraper_routes.FavoriteScanRequest().download_media)
-        self.assertTrue(scraper_routes.FavoriteScanRequest(download_media=True).download_media)
+        request = scraper_routes.ScrapeStartRequest(page_urls=["https://facebook.com/demo"])
+        self.assertTrue(request.download_media)
+        self.assertTrue(scraper_routes.FavoriteScanRequest().download_media)
+
+    def test_auto_download_uses_post_id_instead_of_a_distinct_watch_video_id(self):
+        urls = scraper_routes._downloadable_post_urls([
+            SimpleNamespace(
+                post_id="1234567890123",
+                url="https://www.facebook.com/watch/?v=9876543210987",
+            ),
+            SimpleNamespace(post_id="", url="https://www.facebook.com/watch/?v=9876543210987"),
+        ])
+
+        self.assertEqual(urls, [
+            "https://www.facebook.com/1234567890123",
+            "https://www.facebook.com/watch/?v=9876543210987",
+        ])
 
     def test_quick_scan_distributes_multiple_urls_across_account_queues(self):
         urls = [
@@ -948,41 +1623,42 @@ class DatabaseBootstrapTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             scraper_routes.ScrapeStartRequest(page_urls=urls, mode="New Posts")
 
-    def test_auto_download_uses_available_accounts_and_deduplicates_urls(self):
-        class FakeOrchestrator:
-            is_running = False
-            calls = []
-
-            def start_with_accounts(self, **kwargs):
-                self.calls.append(kwargs)
-                self.is_running = True
-
-            def start_download(self, **kwargs):
-                raise AssertionError("Account khả dụng phải được ưu tiên")
-
-        fake = FakeOrchestrator()
-
-        def config_value(key, default=None):
-            return {
-                "output_dir": "test-output",
-                "max_threads": 3,
-                "scraper_db_path": "test.db",
-            }.get(key, default)
-
-        with patch("web.routes.downloader.orchestrator", fake), patch.object(
-            scraper_routes.config, "get", side_effect=config_value
-        ), patch.object(
-            scraper_routes, "get_all_accounts",
-            return_value=[{"id": 7, "username": "active", "is_active": 1}],
+    def test_quick_auto_scan_prefers_an_unleased_account(self):
+        urls = ["https://www.facebook.com/page-1"]
+        accounts = [
+            {"id": 1, "username": "busy", "is_active": 1},
+            {"id": 2, "username": "available", "is_active": 1},
+        ]
+        with patch.object(
+            scraper_routes,
+            "profile_lease_owner",
+            side_effect=lambda account: "auto-download" if account["id"] == 1 else "",
         ):
+            queues = scraper_routes._build_quick_queues(urls, accounts, "auto", None, 1)
+
+        self.assertEqual([queue["account"]["id"] for queue in queues], [2])
+
+    def test_auto_download_uses_available_accounts_and_deduplicates_urls(self):
+        active_accounts = [{"id": 7, "username": "active", "is_active": 1}]
+        with patch.object(scraper_routes, "get_all_accounts", return_value=active_accounts), patch(
+            "web.routes.downloader.enqueue_auto_download", return_value=True
+        ) as enqueue:
             started = scraper_routes._start_auto_download([
                 "https://facebook.com/posts/1",
                 "https://facebook.com/posts/1",
             ])
         self.assertTrue(started)
-        self.assertEqual(fake.calls[0]["urls_text"], "https://facebook.com/posts/1")
-        self.assertEqual(fake.calls[0]["accounts"][0]["id"], 7)
-        self.assertEqual(fake.calls[0]["max_threads"], 3)
+        enqueue.assert_called_once_with(["https://facebook.com/posts/1"], [7])
+
+    def test_auto_download_keeps_single_account_scan_pool_isolated(self):
+        scan_account = {"id": 1, "username": "scanner", "is_active": 1}
+        with patch("web.routes.downloader.enqueue_auto_download", return_value=True) as enqueue:
+            started = scraper_routes._start_auto_download(
+                ["https://facebook.com/posts/1"], accounts=[scan_account]
+            )
+
+        self.assertTrue(started)
+        enqueue.assert_called_once_with(["https://facebook.com/posts/1"], [1])
 
     def test_stopping_one_favorite_worker_keeps_other_queue_running(self):
         class FakeActiveScraper:
@@ -1094,8 +1770,27 @@ class DatabaseBootstrapTest(unittest.TestCase):
             self.assertTrue({"group_name", "avatar_path", "group_id", "last_synced", "reels_asset_id"} <= columns)
             self.assertEqual(
                 get_db_stats(db_path),
-                {"total_posts": 0, "total_pages": 0, "downloaded_posts": 0},
+                {"total_posts": 0, "scraped_posts": 0, "direct_posts": 0, "total_pages": 0, "downloaded_posts": 0},
             )
+
+    def test_page_name_normalization_creates_backup_and_keeps_post_count(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "escaped-page-name.db")
+            conn = _get_conn(db_path)
+            conn.execute(
+                "INSERT INTO posts (page_name, post_id, url) VALUES (?, ?, ?)",
+                ("X\\u01b0\\u1edfng Ảnh", "1234567890123", "https://facebook.com/1234567890123"),
+            )
+            conn.commit()
+            conn.close()
+
+            result = normalize_page_names_with_backup(db_path)
+            self.assertGreater(result["changed"], 0)
+            self.assertTrue(Path(str(result["backup_path"])).is_file())
+            self.assertEqual(inspect_database(result["backup_path"])["integrity"], "ok")
+            rows = query_posts_for_spy(db_path, ["Xưởng Ảnh"])
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(normalize_escaped_page_names(db_path)["changed"], 0)
 
     def test_downloaded_post_detail_returns_full_caption_and_all_safe_media(self):
         with tempfile.TemporaryDirectory() as temp_dir:

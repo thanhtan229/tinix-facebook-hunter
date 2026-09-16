@@ -9,8 +9,8 @@
   <link rel="icon" type="image/png" sizes="32x32" href="/static/favicon-32x32.png">
   <link rel="icon" type="image/png" sizes="16x16" href="/static/favicon-16x16.png">
   <link rel="apple-touch-icon" sizes="180x180" href="/static/icon.png">
-  <link rel="stylesheet" href="/static/hubspot.css?v=1.21.0">
-  <link rel="stylesheet" href="/static/styles.css?v=1.21.0">
+  <link rel="stylesheet" href="/static/hubspot.css?v=1.23.0-video-popup">
+  <link rel="stylesheet" href="/static/styles.css?v=1.25.3-global-activity-bar">
 </head>
 <body>
 
@@ -40,7 +40,7 @@
       <div class="nav-item" data-tab="tab-spy">
         <span class="nav-index">3</span>
         <span class="icon">📊</span>
-        <span>Kho Dữ Liệu</span>
+        <span>Kho Bài Viết</span>
       </div>
       <div class="nav-item" data-tab="tab-accounts">
         <span class="nav-index">4</span>
@@ -73,6 +73,28 @@
       </div>
     </header>
 
+    <!-- Global task and error status, shared by every workspace tab. -->
+    <section class="app-activity-bar is-idle" id="app-activity-bar" role="status" aria-live="polite" aria-atomic="true">
+      <span class="app-activity-icon" id="app-activity-icon" aria-hidden="true">●</span>
+      <div class="app-activity-copy">
+        <strong id="app-activity-title">Hệ thống sẵn sàng</strong>
+        <span id="app-activity-message">Theo dõi tiến trình và lỗi của toàn bộ tác vụ tại đây.</span>
+      </div>
+      <span class="app-activity-percent" id="app-activity-percent" hidden>0%</span>
+      <button class="app-activity-dismiss" id="btn-dismiss-app-activity" type="button" aria-label="Đặt lại thông báo trạng thái">×</button>
+      <div class="app-activity-progress" aria-hidden="true">
+        <div class="app-activity-progress-value" id="app-activity-progress-value"></div>
+      </div>
+    </section>
+
+    <section class="system-readiness" id="system-readiness" hidden aria-live="polite">
+      <div>
+        <strong id="system-readiness-title">Đang kiểm tra môi trường…</strong>
+        <span id="system-readiness-message">Xác minh các thành phần cần thiết trước khi chạy tác vụ.</span>
+      </div>
+      <button type="button" class="btn btn-secondary btn-sm" id="btn-recheck-system-readiness">Kiểm tra lại</button>
+    </section>
+
     <!-- Workspace Content -->
     <div class="workspace-content">
       <!-- Stats Overview Banner -->
@@ -81,7 +103,21 @@
           <div class="stat-icon">📄</div>
           <div class="stat-info">
             <div class="stat-value" id="stat-total-posts">0</div>
-            <div class="stat-label">Tổng bài viết đã cào</div>
+            <div class="stat-label">Tổng bài đã lưu</div>
+          </div>
+        </div>
+        <div class="stat-item">
+          <div class="stat-icon" style="background: var(--info-light); color: var(--info-blue);">📄</div>
+          <div class="stat-info">
+            <div class="stat-value" id="stat-scraped-posts">0</div>
+            <div class="stat-label">Bài quét từ Page</div>
+          </div>
+        </div>
+        <div class="stat-item">
+          <div class="stat-icon" style="background: var(--orange-light); color: var(--orange-primary);">🔗</div>
+          <div class="stat-info">
+            <div class="stat-value" id="stat-direct-posts">0</div>
+            <div class="stat-label">Bài tải trực tiếp</div>
           </div>
         </div>
         <div class="stat-item">
@@ -107,6 +143,18 @@
         </div>
       </div>
 
+      <section class="recent-task-runs" aria-labelledby="recent-task-runs-title">
+        <div class="recent-task-runs-heading">
+          <div>
+            <h3 id="recent-task-runs-title">Hoạt động gần đây</h3>
+            <span>Chỉ lưu trạng thái và cấu hình tóm tắt, không lưu credential.</span>
+          </div>
+        </div>
+        <div id="recent-task-runs-list" class="recent-task-runs-list">
+          <span class="text-muted">Đang tải lịch sử tác vụ…</span>
+        </div>
+      </section>
+
       <!-- TAB 1: MEDIA DOWNLOADER -->
       <div class="tab-panel active" id="tab-downloader">
         <div class="studio-card">
@@ -119,7 +167,8 @@
               <select id="dl-threads" style="width: 80px;">
                 <option value="1">1</option>
                 <option value="2">2</option>
-                <option value="4" selected>4</option>
+                <option value="3" selected>3</option>
+                <option value="4">4</option>
                 <option value="8">8</option>
                 <option value="16">16</option>
               </select>
@@ -131,15 +180,27 @@
             </label>
 
             <label class="custom-checkbox">
-              <input type="checkbox" id="dl-use-accounts">
+              <input type="checkbox" id="dl-use-accounts" checked>
               <span>Sử dụng Profile tài khoản Facebook đã lưu</span>
             </label>
+
+            <div style="display: flex; align-items: center; gap: 8px;">
+              <span style="font-size: 13px; font-weight: 600;">Account tải:</span>
+              <details id="dl-account-picker" style="min-width: 250px; position: relative;">
+                <summary id="dl-account-picker-summary" style="cursor: pointer;">Tự chọn Account khả dụng</summary>
+                <div id="dl-account-ids" style="position: absolute; z-index: 5; min-width: 250px; max-height: 240px; overflow: auto; padding: 10px; background: var(--bg-card); border: 1px solid var(--border-subtle); border-radius: var(--radius-sm); box-shadow: var(--shadow-md);"></div>
+              </details>
+            </div>
+          </div>
+          <div class="text-muted" style="margin-top:8px; font-size:12px;">
+            Để trống Account tải để tự chọn. Cookie dùng chung chỉ chạy 1 luồng.
           </div>
 
           <div style="display: flex; gap: 10px; margin-top: 18px;">
             <button class="btn btn-primary btn-lg" id="btn-start-dl">🚀 Bắt đầu tải</button>
             <button class="btn btn-secondary btn-lg" id="btn-pause-dl">⏸ Tạm dừng</button>
-            <button class="btn btn-danger btn-lg" id="btn-stop-dl">🛑 Dừng lại</button>
+            <button class="btn btn-danger btn-lg" id="btn-stop-dl">🛑 Dừng lượt hiện tại</button>
+            <button class="btn btn-danger btn-lg" id="btn-stop-all-dl">⏹ Dừng tất cả</button>
           </div>
 
           <!-- Progress Bar -->
@@ -152,6 +213,23 @@
               <div id="dl-progress-bar" style="background: var(--orange-primary); height: 100%; width: 0%; transition: width 0.3s;"></div>
             </div>
           </div>
+
+          <section class="download-status-panel" id="download-status-panel" aria-live="polite">
+            <div class="download-status-summary">
+              <div><small>Đang chờ</small><strong id="dl-count-queued">—</strong></div>
+              <div><small>Thành công</small><strong class="status-success" id="dl-count-success">0</strong></div>
+              <div><small>Đang thử lại</small><strong class="status-retrying" id="dl-count-retrying">0</strong></div>
+              <div><small>Thất bại</small><strong class="status-failed" id="dl-count-failed">0</strong></div>
+            </div>
+            <div style="display:flex; align-items:center; gap:10px; margin-top:10px;">
+              <div class="text-muted" id="dl-auto-queue-status" style="font-size: 12px;"></div>
+              <button class="btn btn-secondary" id="btn-clear-dl-queue" type="button" style="display:none;">Hủy queue chờ</button>
+            </div>
+            <div class="download-worker-heading">Trạng thái account</div>
+            <div class="download-worker-list" id="dl-account-status-list">
+              <span class="text-muted">Chưa có tác vụ tải đang chạy.</span>
+            </div>
+          </section>
         </div>
       </div>
 
@@ -163,11 +241,6 @@
               <h3 style="font-size:15px; margin-bottom:3px;">Thiết lập quét chung</h3>
               <div class="text-muted" style="font-size:12px;">Áp dụng cho Quét Fanpage, Fanpage yêu thích và Tìm Fanpage.</div>
             </div>
-            <label class="custom-checkbox tab2-auto-download-toggle">
-              <input type="checkbox" id="scrape-auto-download">
-              <span>Auto Download</span>
-              <span class="badge badge-gray" id="scrape-auto-download-status">Đang tắt</span>
-            </label>
           </div>
           <div class="tab2-shared-settings-grid">
             <label class="tab2-shared-setting tab2-shared-setting-account">
@@ -193,7 +266,15 @@
               <span>Số lượng cần quét</span>
               <input type="number" id="scrape-common-limit" value="100" min="5" max="2000">
             </label>
+            <label class="tab2-shared-setting tab2-auto-download-setting">
+              <span>Tùy chọn sau quét</span>
+              <span class="custom-checkbox">
+                <input type="checkbox" id="scrape-auto-download" checked>
+                <span>Tự tải media bài mới</span>
+              </span>
+            </label>
           </div>
+          <div class="scrape-execution-summary" id="scrape-execution-summary" aria-live="polite"></div>
           <div class="favorite-workers-panel tab2-shared-workers" id="favorite-workers-panel" hidden>
             <div class="favorite-workers-header">
               <div>
@@ -317,14 +398,26 @@
           </div>
           <div class="collapsible-card-body" id="page-search-body">
             <div class="page-search-controls">
-              <input type="text" id="page-search-keyword" maxlength="100" placeholder="Nhập từ khóa, ví dụ: nội thất Đà Nẵng">
-              <input type="number" id="page-search-limit" value="30" min="5" max="100" title="Số kết quả tối đa">
-              <input type="number" id="page-search-min-followers" value="0" min="0" max="2000000000" title="Số người theo dõi tối thiểu" placeholder="Follower tối thiểu">
-              <select id="page-search-sort">
-                <option value="relevance">Liên quan nhất</option>
-                <option value="followers">Follower cao nhất</option>
-                <option value="name">Tên A–Z</option>
-              </select>
+              <label class="page-search-field">
+                <span class="page-search-field-label">Từ khóa</span>
+                <input type="text" id="page-search-keyword" maxlength="100" placeholder="Nhập từ khóa, ví dụ: nội thất Đà Nẵng">
+              </label>
+              <label class="page-search-field">
+                <span class="page-search-field-label">Số kết quả</span>
+                <input type="number" id="page-search-limit" value="30" min="5" max="100" title="Số kết quả tối đa">
+              </label>
+              <label class="page-search-field">
+                <span class="page-search-field-label">Follower tối thiểu</span>
+                <input type="number" id="page-search-min-followers" value="0" min="0" max="2000000000" title="Số người theo dõi tối thiểu" placeholder="0">
+              </label>
+              <label class="page-search-field">
+                <span class="page-search-field-label">Sắp xếp</span>
+                <select id="page-search-sort">
+                  <option value="relevance">Liên quan nhất</option>
+                  <option value="followers">Follower cao nhất</option>
+                  <option value="name">Tên A–Z</option>
+                </select>
+              </label>
             </div>
             <div style="display:flex; gap:8px; margin-top:10px; flex-wrap:wrap;">
               <button class="btn btn-primary" id="btn-start-page-search">🔎 Tìm Fanpage</button>
@@ -353,59 +446,61 @@
         </div>
       </div>
 
-      <!-- TAB 3: SPY STUDIO (KHO DỮ LIỆU) -->
+      <!-- TAB 3: SPY STUDIO (KHO BÀI VIẾT) -->
       <div class="tab-panel" id="tab-spy">
         <div class="studio-card">
           <!-- Filter Controls -->
-          <div style="display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin-bottom: 16px;">
-            <input type="text" id="spy-search" placeholder="🔍 Tìm kiếm bài viết theo caption, ID..." style="flex: 1; min-width: 200px;">
+          <div class="spy-filter-toolbar">
+            <label class="spy-filter-group">
+              <span class="spy-filter-label">Fanpage</span>
+              <select id="spy-page-filter" style="width: 220px; min-width: 170px;">
+                <option value="" selected>📄 Tất cả Page</option>
+              </select>
+            </label>
             
-            <select id="spy-mode" style="width: 190px;">
-              <option value="newest" selected>Mới nhất</option>
-              <option value="oldest">Cũ nhất</option>
-              <option value="top_engagement">Tương tác cao nhất</option>
-              <option value="top_reactions">Lượt thích cao nhất</option>
-              <option value="top_comments">Bình luận cao nhất</option>
-              <option value="top_shares">Chia sẻ cao nhất</option>
-              <option value="top_views">Lượt xem cao nhất</option>
-            </select>
+            <label class="spy-filter-group">
+              <span class="spy-filter-label">Sắp xếp theo</span>
+              <select id="spy-mode" style="width: 180px;">
+                <option value="newest" selected>Mới nhất</option>
+                <option value="oldest">Cũ nhất</option>
+                <option value="top_engagement">Tương tác cao nhất</option>
+                <option value="top_reactions">Lượt thích cao nhất</option>
+                <option value="top_comments">Bình luận cao nhất</option>
+                <option value="top_shares">Chia sẻ cao nhất</option>
+                <option value="top_views">Lượt xem cao nhất</option>
+              </select>
+            </label>
 
-            <select id="spy-post-type" style="width: 130px;">
-              <option value="Tất cả" selected>Tất cả loại</option>
-              <option value="Ảnh">Ảnh</option>
-              <option value="Video">Video</option>
-              <option value="Text">Văn bản</option>
-            </select>
+            <label class="spy-filter-group">
+              <span class="spy-filter-label">Loại bài</span>
+              <select id="spy-post-type" style="width: 180px;">
+                <option value="Tất cả" selected>Tất cả loại</option>
+                <option value="Ảnh">Ảnh</option>
+                <option value="Video">Video</option>
+                <option value="Text">Văn bản</option>
+              </select>
+            </label>
 
-            <select id="spy-dl-status" style="width: 130px;">
-              <option value="Tất cả" selected>Tất cả trạng thái</option>
-              <option value="Chưa tải">Chưa tải</option>
-              <option value="Đang tải">Đang tải</option>
-              <option value="Tải lỗi">Tải lỗi</option>
-              <option value="Đã tải">Đã tải</option>
-            </select>
+            <label class="spy-filter-group">
+              <span class="spy-filter-label">Trạng thái tải</span>
+              <select id="spy-dl-status" style="width: 180px;">
+                <option value="Tất cả" selected>Tất cả trạng thái</option>
+                <option value="Chưa tải">Chưa tải</option>
+                <option value="Đang tải">Đang tải</option>
+                <option value="Tải lỗi">Tải lỗi</option>
+                <option value="Thiếu video">Thiếu video</option>
+                <option value="Đã tải">Đã tải</option>
+              </select>
+            </label>
 
-            <button class="btn btn-teal" id="btn-refresh-spy">🔍 Lọc</button>
-            <button class="btn btn-secondary" id="btn-export-excel">📊 Xuất Excel</button>
-            <button class="btn btn-danger" id="btn-delete-spy-pages">🗑 Xóa Pages đã chọn</button>
-            <button class="btn btn-danger" id="btn-clear-spy">⚠ Dọn toàn bộ kho</button>
-          </div>
-
-          <!-- Page Checkbox Strip -->
-          <div style="background: var(--bg-light); border: 1px solid var(--border-subtle); border-radius: var(--radius-sm); padding: 10px 14px; margin-bottom: 16px;">
-            <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px;">
-              <label class="custom-checkbox">
-                <input type="checkbox" id="spy-select-all-pages" checked>
-                <span style="font-weight: 700;">📄 Chọn tất cả Pages</span>
-              </label>
-              <span class="badge badge-teal" id="spy-pages-counter">0 Pages</span>
+            <div class="spy-filter-group">
+              <span class="spy-filter-label spy-filter-label-empty" aria-hidden="true">&nbsp;</span>
+              <button class="btn btn-secondary" id="btn-export-excel" title="Xuất danh sách bài viết ra Excel">📊 Xuất Excel</button>
             </div>
-            <div id="spy-pages-container" style="display: flex; gap: 12px; flex-wrap: wrap; max-height: 80px; overflow-y: auto;">
-              <!-- Dynamic Page Checkboxes -->
-            </div>
-            <label class="custom-checkbox" style="margin-top: 10px;">
-              <input type="checkbox" id="spy-delete-media">
-              <span>Xóa cả thư mục media đã tải (chỉ bên trong thư mục output)</span>
+
+            <label class="spy-filter-group spy-filter-search-group">
+              <span class="spy-filter-label">Tìm kiếm bài viết</span>
+              <input type="text" id="spy-search" placeholder="🔍 Tìm theo caption, Post ID..." style="width: 280px; min-width: 180px;">
             </label>
           </div>
 
@@ -417,6 +512,7 @@
                 <span>Chọn tất cả bài</span>
               </label>
               <button class="btn btn-teal btn-sm" id="btn-download-spy-posts" disabled>⬇ Download đã chọn</button>
+              <button class="btn btn-secondary btn-sm" id="btn-retry-spy-posts" disabled>↻ Thử lại lỗi/thumbnail</button>
               <button class="btn btn-danger btn-sm" id="btn-delete-spy-posts" disabled>🗑 Xóa đã chọn</button>
               <span class="text-muted" id="spy-selected-counter">0 bài đã chọn</span>
             </div>
@@ -458,33 +554,112 @@
         </div>
       </div>
 
-      <!-- TAB 4: ACCOUNTS -->
+      <!-- TAB 4: ACCOUNTS (MASTER-DETAIL SPLIT VIEW) -->
       <div class="tab-panel" id="tab-accounts">
-        <div class="studio-card">
-          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;">
-            <h3 style="font-size: 15px;">Danh Sách Tài Khoản Facebook</h3>
-            <div style="display:flex; gap:8px; align-items:center;">
-              <button class="btn btn-teal btn-sm" id="btn-import-profile">⬇ Import Profiles ZIP</button>
-              <button class="btn btn-secondary btn-sm" id="btn-export-profile" disabled title="ZIP chứa thông tin đăng nhập và phiên Chrome; hãy bảo quản cẩn thận">⬆ Export Account & Sessions ZIP</button>
-              <button class="btn btn-secondary btn-sm" id="btn-cleanup-profiles" disabled>🧹 Dọn profile</button>
-              <button class="btn btn-danger btn-sm" id="btn-close-all-chrome">✕ Close All</button>
-              <button class="btn btn-primary btn-sm" id="btn-add-account">➕ Thêm Tài Khoản</button>
+        <!-- Top Toolbar with Management Actions -->
+        <div class="accounts-top-toolbar">
+          <div class="accounts-toolbar-left">
+            <span class="accounts-brand-accent">|</span>
+            <span class="accounts-main-heading">Quản Lý Tài Khoản</span>
+          </div>
+          <div class="accounts-toolbar-actions">
+            <button class="btn btn-teal btn-sm" id="btn-import-profile" title="Import profile từ file ZIP">⬇ Import Profiles ZIP</button>
+            <button class="btn btn-secondary btn-sm" id="btn-export-profile" disabled title="ZIP chứa thông tin đăng nhập và phiên Chrome; hãy bảo quản cẩn thận">⬆ Export Account & Sessions ZIP</button>
+            <button class="btn btn-secondary btn-sm" id="btn-cleanup-profiles" disabled title="Dọn dẹp cache và dữ liệu tạm của Chrome profile">🧹 Dọn profile</button>
+            <button class="btn btn-danger btn-sm" id="btn-close-all-chrome" title="Đóng tất cả Chrome do Tinix quản lý">✕ Close All</button>
+            <button class="btn btn-primary btn-sm" id="btn-add-account">➕ Thêm Account</button>
+          </div>
+        </div>
+
+        <!-- Master-Detail Container -->
+        <div class="account-split-layout" id="account-split-layout">
+          <!-- LEFT COLUMN: Account List (Master Pane) -->
+          <div class="account-list-pane" id="account-list-pane">
+            <!-- Header with Title & Badge -->
+            <div class="account-pane-header">
+              <div class="account-pane-title-wrap">
+                <span class="account-title-bar">|</span>
+                <span class="account-pane-title">Danh sách account</span>
+                <span class="account-count-badge" id="account-count-badge">Hiển thị 0/0</span>
+              </div>
+              <div class="account-pane-actions">
+                <button type="button" class="btn btn-secondary btn-sm" id="btn-preflight-selected-accounts" disabled title="Kiểm tra Chrome và phiên Facebook của các account đã chọn" onclick="checkSelectedAccountsPreflight()">✓ Check Preflight (0)</button>
+              </div>
+            </div>
+
+            <!-- Filter Pills / Tabs -->
+            <div class="account-filter-tabs" id="account-filter-tabs">
+              <button type="button" class="acc-tab-pill active" data-filter="all">Tất cả <span class="pill-count" id="count-pill-all">0</span></button>
+              <button type="button" class="acc-tab-pill" data-filter="facebook">Facebook <span class="pill-count" id="count-pill-fb">0</span></button>
+              <button type="button" class="acc-tab-pill" data-filter="active">Live <span class="pill-count" id="count-pill-active">0</span></button>
+            </div>
+
+            <!-- Search Input -->
+            <div class="account-search-wrap">
+              <input type="text" id="acc-search-input" class="account-search-input" placeholder="Tìm tên, email hoặc ID" autocomplete="off">
+            </div>
+
+            <!-- Filter Dropdowns Row -->
+            <div class="account-filter-controls">
+              <label class="account-filter-group">
+                <span class="account-filter-label">Trạng thái</span>
+                <select id="acc-status-filter" class="account-select-filter" title="Lọc theo trạng thái">
+                  <option value="all">Mọi trạng thái</option>
+                  <option value="active">Active / Live</option>
+                  <option value="disabled">Disabled</option>
+                  <option value="has_cookie">Có Cookie</option>
+                  <option value="no_cookie">Chưa có Cookie</option>
+                </select>
+              </label>
+              <label class="account-filter-group">
+                <span class="account-filter-label">Sắp xếp</span>
+                <select id="acc-sort-select" class="account-select-filter" title="Sắp xếp danh sách">
+                  <option value="name_asc">Nền tảng, tên A–Z</option>
+                  <option value="name_desc">Tên Z–A</option>
+                  <option value="id_asc">ID tăng dần</option>
+                  <option value="id_desc">ID giảm dần</option>
+                  <option value="newest">Mới nhất</option>
+                </select>
+              </label>
+            </div>
+
+            <div class="account-list-column-header" aria-label="Tiêu đề cột danh sách account">
+              <div class="account-list-column-header-left">
+                <span class="account-column-checkbox">
+                  <button type="button" class="account-column-toggle" id="btn-toggle-select-all-accounts" title="Chọn tất cả account đang hiển thị" aria-label="Chọn tất cả account đang hiển thị" onclick="toggleAllVisibleAccountPreflightSelection()">☐</button>
+                </span>
+                <span class="account-column-star">
+                  <button type="button" class="account-column-toggle account-column-favorite-toggle" id="btn-toggle-select-favorite-accounts" title="Chọn tất cả account yêu thích đang hiển thị" aria-label="Chọn tất cả account yêu thích đang hiển thị" onclick="toggleVisibleFavoriteAccountPreflightSelection()">☆</button>
+                </span>
+                <span class="account-column-index">STT</span>
+                <span class="account-column-name">Tài khoản</span>
+              </div>
+              <div class="account-list-column-header-right">
+                <span class="account-column-preflight">Check preflight</span>
+                <span class="account-column-status">Trạng thái</span>
+                <span class="account-column-actions">Thao tác</span>
+              </div>
+            </div>
+
+            <!-- Account Cards Scrollable List -->
+            <div class="account-cards-list" id="account-cards-list">
+              <!-- Rendered dynamically -->
             </div>
           </div>
 
-          <div style="overflow-x: auto;">
-            <table style="width: 100%; border-collapse: collapse; text-align: left; font-size: 13px;">
-              <thead>
-                <tr style="background: var(--teal-dark); color: #FFFFFF;">
-                  <th style="padding: 10px 14px;">ID</th>
-                  <th style="padding: 10px 14px;">Tên gợi nhớ</th>
-                  <th style="padding: 10px 14px;">Username / UID</th>
-                  <th style="padding: 10px 14px;">Trạng thái</th>
-                  <th style="padding: 10px 14px; text-align: right;">Hành động</th>
-                </tr>
-              </thead>
-              <tbody id="accounts-tbody"></tbody>
-            </table>
+          <!-- SPLITTER / DIVIDER -->
+          <div class="account-pane-splitter" id="account-pane-splitter" title="Thu gọn / Mở rộng">
+            <button type="button" class="splitter-toggle-btn" id="btn-toggle-splitter" title="Thu gọn/Mở rộng cột trái" aria-label="Toggle pane">
+              <span id="splitter-arrow">◀</span>
+            </button>
+          </div>
+
+          <!-- RIGHT COLUMN: Account Detail & Direct Editing (Detail Pane) -->
+          <div class="account-detail-pane" id="account-detail-pane">
+            <!-- Dynamic Content for Selected Account -->
+            <div id="account-detail-container">
+              <!-- Rendered dynamically -->
+            </div>
           </div>
         </div>
       </div>
@@ -530,6 +705,6 @@
 <!-- Toast Container -->
 <div class="toast-container" id="toast-container"></div>
 
-<script src="/static/app.js?v=1.21.0-profile-cleanup1"></script>
+<script src="/static/app.js?v=1.25.3-global-activity-bar"></script>
 </body>
 </html>

@@ -5,26 +5,86 @@ Supports group management and duplicate URL detection.
 """
 
 import os
+import re
 import json
 import sqlite3
 import sys
 import threading
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Any
 
 from core.page_scraper import is_valid_facebook_page_name
 from utils import logger
 from utils.secure_store import is_protected, protect_secret, reveal_secret
 
 
-ACCOUNT_SECRET_FIELDS = {"password", "secret_2fa", "email_pass", "cookie"}
-SCHEMA_VERSION = 10
+ACCOUNT_SECRET_FIELDS = {"password", "secret_2fa", "email_pass", "cookie", "recovery_codes"}
+SCHEMA_VERSION = 13
 _SCHEMA_LOCK = threading.RLock()
 _SCHEMA_READY: set[str] = set()
 
 
 MEDIA_DOWNLOAD_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".mp4", ".mov", ".webm", ".avi", ".mkv"}
+_UNICODE_ESCAPE_RE = re.compile(r"\\u([0-9a-fA-F]{4})|\\U([0-9a-fA-F]{8})")
+
+
+def normalize_page_name(value: str) -> str:
+    """Decode literal Unicode escapes left by older Facebook metadata imports."""
+    text = str(value or "")
+    if not _UNICODE_ESCAPE_RE.search(text):
+        return text
+
+    def replace(match: re.Match) -> str:
+        try:
+            return chr(int(match.group(1) or match.group(2), 16))
+        except ValueError:
+            return match.group(0)
+
+    return _UNICODE_ESCAPE_RE.sub(replace, text)
+
+
+def has_escaped_page_names(db_path: str) -> bool:
+    """Return whether stored Page labels need the one-time normalization."""
+    conn = _get_conn(db_path)
+    try:
+        for table in ("posts", "pages", "favorite_pages", "managed_pages"):
+            rows = conn.execute(f"SELECT page_name FROM {table}").fetchall()
+            if any(normalize_page_name(row[0] or "") != (row[0] or "") for row in rows):
+                return True
+        return False
+    finally:
+        conn.close()
+
+
+def normalize_escaped_page_names(db_path: str) -> dict[str, int]:
+    """Normalize Page labels without deleting rows or merging conflicting posts."""
+    tables = (("posts", "id"), ("pages", "id"), ("favorite_pages", "id"), ("managed_pages", "id"))
+    changed = 0
+    skipped = 0
+    conn = _get_conn(db_path)
+    try:
+        for table, identifier in tables:
+            rows = conn.execute(f"SELECT {identifier}, page_name FROM {table}").fetchall()
+            for row_id, stored_name in rows:
+                normalized = normalize_page_name(stored_name or "")
+                if normalized == (stored_name or ""):
+                    continue
+                if table == "posts":
+                    post_id = conn.execute("SELECT post_id FROM posts WHERE id = ?", (row_id,)).fetchone()[0]
+                    duplicate = conn.execute(
+                        "SELECT 1 FROM posts WHERE page_name = ? AND post_id = ? AND id != ?",
+                        (normalized, post_id, row_id),
+                    ).fetchone()
+                    if duplicate:
+                        skipped += 1
+                        continue
+                conn.execute(f"UPDATE {table} SET page_name = ? WHERE {identifier} = ?", (normalized, row_id))
+                changed += 1
+        conn.commit()
+    finally:
+        conn.close()
+    return {"changed": changed, "skipped": skipped}
 
 
 def _default_db_path() -> str:
@@ -391,16 +451,37 @@ def _initialize_schema(db_path: str) -> sqlite3.Connection:
             email_pass  TEXT    NOT NULL DEFAULT '',
             cookie      TEXT    NOT NULL DEFAULT '',
             is_active   INTEGER NOT NULL DEFAULT 1,
-            last_login  TEXT    NOT NULL DEFAULT '',
-            created_at  TEXT    NOT NULL DEFAULT '',
+            last_login      TEXT    NOT NULL DEFAULT '',
+            preflight_status     TEXT    NOT NULL DEFAULT '',
+            preflight_message    TEXT    NOT NULL DEFAULT '',
+            preflight_checked_at TEXT    NOT NULL DEFAULT '',
+            created_at      TEXT    NOT NULL DEFAULT '',
+            business_id     TEXT    NOT NULL DEFAULT '',
+            recovery_email  TEXT    NOT NULL DEFAULT '',
+            recovery_codes  TEXT    NOT NULL DEFAULT '',
+            notes           TEXT    NOT NULL DEFAULT '',
             UNIQUE(username)
         )
     """)
     try:
         ac_cols = [row[1] for row in conn.execute("PRAGMA table_info(fb_accounts)").fetchall()]
+        if "created_at" not in ac_cols:
+            conn.execute("ALTER TABLE fb_accounts ADD COLUMN created_at TEXT NOT NULL DEFAULT ''")
         if "business_id" not in ac_cols:
             conn.execute("ALTER TABLE fb_accounts ADD COLUMN business_id TEXT NOT NULL DEFAULT ''")
-            conn.commit()
+        if "recovery_email" not in ac_cols:
+            conn.execute("ALTER TABLE fb_accounts ADD COLUMN recovery_email TEXT NOT NULL DEFAULT ''")
+        if "recovery_codes" not in ac_cols:
+            conn.execute("ALTER TABLE fb_accounts ADD COLUMN recovery_codes TEXT NOT NULL DEFAULT ''")
+        if "notes" not in ac_cols:
+            conn.execute("ALTER TABLE fb_accounts ADD COLUMN notes TEXT NOT NULL DEFAULT ''")
+        if "preflight_status" not in ac_cols:
+            conn.execute("ALTER TABLE fb_accounts ADD COLUMN preflight_status TEXT NOT NULL DEFAULT ''")
+        if "preflight_message" not in ac_cols:
+            conn.execute("ALTER TABLE fb_accounts ADD COLUMN preflight_message TEXT NOT NULL DEFAULT ''")
+        if "preflight_checked_at" not in ac_cols:
+            conn.execute("ALTER TABLE fb_accounts ADD COLUMN preflight_checked_at TEXT NOT NULL DEFAULT ''")
+        conn.commit()
     except Exception:
         pass
 
@@ -585,6 +666,43 @@ def _initialize_schema(db_path: str) -> sqlite3.Connection:
             if "proxy_id" in columns:
                 conn.execute(f"ALTER TABLE {table} DROP COLUMN proxy_id")
         conn.execute("DROP TABLE IF EXISTS proxies")
+
+    # --- Local task-run history (never stores credentials) ---
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS task_runs (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_type       TEXT    NOT NULL,
+            status          TEXT    NOT NULL DEFAULT 'running',
+            total_items     INTEGER NOT NULL DEFAULT 0,
+            completed_items INTEGER NOT NULL DEFAULT 0,
+            successful_items INTEGER NOT NULL DEFAULT 0,
+            failed_items    INTEGER NOT NULL DEFAULT 0,
+            summary_json    TEXT    NOT NULL DEFAULT '{}',
+            error_message   TEXT    NOT NULL DEFAULT '',
+            started_at      TEXT    NOT NULL DEFAULT '',
+            finished_at     TEXT    NOT NULL DEFAULT ''
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_task_runs_started ON task_runs(started_at DESC)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_task_runs_status ON task_runs(status)")
+
+    # --- Durable Auto Download queue (stores work only until it is terminal) ---
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS download_queue_batches (
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            source           TEXT    NOT NULL DEFAULT 'auto',
+            status           TEXT    NOT NULL DEFAULT 'queued',
+            item_count       INTEGER NOT NULL DEFAULT 0,
+            urls_json        TEXT    NOT NULL DEFAULT '[]',
+            account_ids_json TEXT    NOT NULL DEFAULT '[]',
+            error_message    TEXT    NOT NULL DEFAULT '',
+            created_at       TEXT    NOT NULL DEFAULT '',
+            updated_at       TEXT    NOT NULL DEFAULT '',
+            started_at       TEXT    NOT NULL DEFAULT '',
+            finished_at      TEXT    NOT NULL DEFAULT ''
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_download_queue_status_id ON download_queue_batches(status, id)")
 
     conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
     conn.commit()
@@ -930,7 +1048,7 @@ def save_favorite_page(
         existing = conn.execute(
             "SELECT page_name FROM pages WHERE page_url = ?", (canonical,)
         ).fetchone()
-        resolved_name = str(page_name or (existing[0] if existing else "")).strip()
+        resolved_name = normalize_page_name(str(page_name or (existing[0] if existing else "")).strip())
         conn.execute("""
             INSERT INTO favorite_pages
                 (page_url, page_name, account_id, scan_limit, created_at, updated_at,
@@ -1033,7 +1151,7 @@ def finish_favorite_archive_scan(
     values: list = [status, int(saved_posts), str(error or "")[:1000], now]
     if page_name:
         fields.append("page_name = ?")
-        values.append(page_name)
+        values.append(normalize_page_name(page_name))
     if successful:
         fields.extend((
             "archive_cursor_post_ids = ?", "archive_scanned_count = archive_scanned_count + ?",
@@ -1083,7 +1201,7 @@ def finish_favorite_scan(
     values: list = [status, int(new_posts), str(error or "")[:1000], now]
     if page_name:
         fields.append("page_name = ?")
-        values.append(page_name)
+        values.append(normalize_page_name(page_name))
     if successful:
         fields.extend(("last_successful_scan_at = ?", "cursor_post_ids = ?"))
         values.extend((now, json.dumps((cursor_post_ids or [])[:20], ensure_ascii=False)))
@@ -1170,6 +1288,7 @@ def save_posts(
     if not posts:
         return 0
 
+    page_name = normalize_page_name(page_name)
     canonical = normalize_page_url(page_url) if page_url else ""
     conn = _get_conn(db_path)
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -1336,38 +1455,662 @@ def get_posts_by_page(db_path: str, page_name: str) -> List[dict]:
         return []
 
 
+def get_post_by_id(db_path: str, post_id: str, url: str = "") -> Optional[dict]:
+    """Get metadata for a single post by post_id or url."""
+    if not post_id and not url:
+        return None
+    try:
+        conn = _get_conn(db_path)
+        cursor = conn.execute("""
+            SELECT post_id, page_name, page_url, date, post_type,
+                   caption, url, media_preview_url, media_count
+            FROM posts
+            WHERE post_id = ? OR url = ?
+            ORDER BY id DESC LIMIT 1
+        """, (str(post_id or ""), str(url or "")))
+        row = cursor.fetchone()
+        conn.close()
+        if not row:
+            return None
+        return {
+            "post_id": row[0],
+            "page_name": row[1],
+            "page_url": row[2],
+            "date": row[3],
+            "post_type": row[4],
+            "caption": row[5],
+            "url": row[6],
+            "media_preview_url": row[7],
+            "media_count": row[8],
+        }
+    except Exception as e:
+        logger.debug(f"Lỗi đọc post by id: {str(e)[:150]}")
+        return None
+
+
 def get_db_stats(db_path: str) -> dict:
     """Get database statistics."""
     try:
         conn = _get_conn(db_path)
         total_posts = conn.execute("SELECT COUNT(*) FROM posts").fetchone()[0]
-        total_pages = conn.execute("SELECT COUNT(DISTINCT page_name) FROM posts").fetchone()[0]
-        downloaded_posts = conn.execute("SELECT COUNT(*) FROM posts WHERE downloaded = 1").fetchone()[0]
+        direct_posts = conn.execute(
+            "SELECT COUNT(*) FROM posts WHERE page_name = 'Tải trực tiếp'"
+        ).fetchone()[0]
+        total_pages = conn.execute(
+            "SELECT COUNT(DISTINCT page_name) FROM posts WHERE page_name != 'Tải trực tiếp'"
+        ).fetchone()[0]
+        downloaded_posts = conn.execute(
+            "SELECT COUNT(*) FROM posts WHERE download_status = 'downloaded'"
+        ).fetchone()[0]
         conn.close()
         return {
             "total_posts": total_posts,
+            "scraped_posts": total_posts - direct_posts,
+            "direct_posts": direct_posts,
             "total_pages": total_pages,
             "downloaded_posts": downloaded_posts,
         }
     except Exception:
-        return {"total_posts": 0, "total_pages": 0, "downloaded_posts": 0}
+        return {"total_posts": 0, "scraped_posts": 0, "direct_posts": 0, "total_pages": 0, "downloaded_posts": 0}
+
+
+# ─── Task run history ───────────────────────────────────────────────────────
+
+_TASK_RUN_STATUSES = {"running", "completed", "partial", "failed", "stopped", "interrupted"}
+_TASK_RUN_SUMMARY_FIELDS = {
+    "workers", "use_accounts", "scan_limit", "download_media", "account_mode", "scan_direction",
+}
+
+
+def _safe_task_run_summary(summary: Optional[dict[str, Any]]) -> dict[str, Any]:
+    """Keep only non-sensitive, presentation-safe task options in local history."""
+    if not isinstance(summary, dict):
+        return {}
+    return {
+        key: value for key, value in summary.items()
+        if key in _TASK_RUN_SUMMARY_FIELDS and isinstance(value, (str, int, float, bool))
+    }
+
+
+def create_task_run(
+    db_path: str,
+    task_type: str,
+    *,
+    total_items: int = 0,
+    summary: Optional[dict[str, Any]] = None,
+) -> int:
+    """Create a local, credential-free record for a long-running task."""
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    conn = _get_conn(db_path)
+    try:
+        cursor = conn.execute(
+            """INSERT INTO task_runs (task_type, status, total_items, summary_json, started_at)
+               VALUES (?, 'running', ?, ?, ?)""",
+            (
+                str(task_type or "task")[:80],
+                max(0, int(total_items or 0)),
+                json.dumps(_safe_task_run_summary(summary), ensure_ascii=False),
+                now,
+            ),
+        )
+        conn.execute(
+            "DELETE FROM task_runs WHERE id NOT IN (SELECT id FROM task_runs ORDER BY id DESC LIMIT 500)"
+        )
+        conn.commit()
+        return int(cursor.lastrowid or 0)
+    finally:
+        conn.close()
+
+
+def finish_task_run(
+    db_path: str,
+    run_id: int,
+    status: str,
+    *,
+    completed_items: int = 0,
+    successful_items: int = 0,
+    failed_items: int = 0,
+    error_message: str = "",
+) -> bool:
+    """Finish a task run once; task summaries are deliberately non-sensitive."""
+    if not run_id or status not in _TASK_RUN_STATUSES - {"running", "interrupted"}:
+        return False
+    conn = _get_conn(db_path)
+    try:
+        row = conn.execute("SELECT total_items FROM task_runs WHERE id = ? AND status = 'running'", (int(run_id),)).fetchone()
+        if row is None:
+            return False
+        total_items = max(0, int(row[0] or 0))
+        completed = min(total_items, max(0, int(completed_items or 0)))
+        successful = min(completed, max(0, int(successful_items or 0)))
+        failed = min(completed - successful, max(0, int(failed_items or 0)))
+        cursor = conn.execute(
+            """UPDATE task_runs
+               SET status = ?, completed_items = ?, successful_items = ?, failed_items = ?,
+                   error_message = ?, finished_at = ?
+               WHERE id = ? AND status = 'running'""",
+            (
+                status,
+                completed,
+                successful,
+                failed,
+                str(error_message or "")[:1000],
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                int(run_id),
+            ),
+        )
+        conn.commit()
+        return cursor.rowcount == 1
+    finally:
+        conn.close()
+
+
+def prune_task_runs(db_path: str, keep: int = 500) -> int:
+    """Keep task history bounded without retaining inputs or credentials."""
+    conn = _get_conn(db_path)
+    try:
+        cursor = conn.execute(
+            "DELETE FROM task_runs WHERE id NOT IN (SELECT id FROM task_runs ORDER BY id DESC LIMIT ?)",
+            (max(1, int(keep or 500)),),
+        )
+        conn.commit()
+        return int(cursor.rowcount)
+    finally:
+        conn.close()
+
+
+def recover_interrupted_task_runs(db_path: str) -> int:
+    """Mark task records left running by a previous process as interrupted."""
+    conn = _get_conn(db_path)
+    try:
+        cursor = conn.execute(
+            """UPDATE task_runs
+               SET status = 'interrupted', error_message = 'Ứng dụng đã dừng trước khi tác vụ hoàn tất',
+                   finished_at = ?
+               WHERE status = 'running'""",
+            (datetime.now().strftime("%Y-%m-%d %H:%M:%S"),),
+        )
+        conn.commit()
+        return int(cursor.rowcount)
+    finally:
+        conn.close()
+
+
+# ─── Durable Auto Download Queue ──────────────────────────────────────────
+
+_DOWNLOAD_QUEUE_ACTIVE_STATUSES = {"queued", "starting", "running"}
+_DOWNLOAD_QUEUE_TERMINAL_STATUSES = {"completed", "failed", "cancelled"}
+
+
+def _normalize_download_queue_urls(urls: List[str]) -> List[str]:
+    return list(dict.fromkeys(str(url).strip() for url in urls if str(url).strip()))
+
+
+def _normalize_download_queue_account_ids(account_ids: List[int]) -> List[int]:
+    return list(dict.fromkeys(int(value or 0) for value in account_ids if int(value or 0) > 0))
+
+
+def enqueue_download_queue_batch(
+    db_path: str,
+    urls: List[str],
+    account_ids: List[int],
+    *,
+    source: str = "auto",
+) -> int:
+    """Persist one Auto Download batch before it is eligible to start."""
+    normalized_urls = _normalize_download_queue_urls(urls)
+    if not normalized_urls:
+        return 0
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    conn = _get_conn(db_path)
+    try:
+        cursor = conn.execute(
+            """INSERT INTO download_queue_batches
+               (source, status, item_count, urls_json, account_ids_json, created_at, updated_at)
+               VALUES (?, 'queued', ?, ?, ?, ?, ?)""",
+            (
+                str(source or "auto")[:40], len(normalized_urls),
+                json.dumps(normalized_urls, ensure_ascii=False),
+                json.dumps(_normalize_download_queue_account_ids(account_ids), ensure_ascii=False),
+                now, now,
+            ),
+        )
+        conn.execute(
+            """DELETE FROM download_queue_batches
+               WHERE status IN ('completed', 'failed', 'cancelled')
+                 AND id NOT IN (
+                    SELECT id FROM download_queue_batches
+                    WHERE status IN ('completed', 'failed', 'cancelled')
+                    ORDER BY id DESC LIMIT 200
+                 )"""
+        )
+        conn.commit()
+        return int(cursor.lastrowid or 0)
+    finally:
+        conn.close()
+
+
+def claim_next_download_queue_batch(db_path: str) -> Optional[dict]:
+    """Atomically claim the oldest queued batch for the single downloader."""
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    conn = _get_conn(db_path)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            """SELECT id, source, item_count, urls_json, account_ids_json
+               FROM download_queue_batches WHERE status = 'queued' ORDER BY id LIMIT 1"""
+        ).fetchone()
+        if row is None:
+            conn.commit()
+            return None
+        changed = conn.execute(
+            """UPDATE download_queue_batches
+               SET status = 'starting', updated_at = ?, started_at = ?, error_message = ''
+               WHERE id = ? AND status = 'queued'""",
+            (now, now, int(row[0])),
+        ).rowcount
+        conn.commit()
+        if changed != 1:
+            return None
+        try:
+            urls = _normalize_download_queue_urls(json.loads(row[3] or "[]"))
+            account_ids = _normalize_download_queue_account_ids(json.loads(row[4] or "[]"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            urls, account_ids = [], []
+        return {
+            "id": int(row[0]), "source": str(row[1] or "auto"),
+            "item_count": int(row[2] or 0), "urls": urls, "account_ids": account_ids,
+        }
+    finally:
+        conn.close()
+
+
+def set_download_queue_batch_status(
+    db_path: str,
+    batch_id: int,
+    status: str,
+    *,
+    error_message: str = "",
+    purge_payload: bool = False,
+    expected_statuses: Optional[set[str]] = None,
+) -> bool:
+    """Update one batch and erase queued URLs after its terminal outcome.
+
+    ``expected_statuses`` makes a state transition conditional so a batch that
+    was cancelled while it was being prepared cannot later be revived.
+    """
+    if not batch_id or status not in _DOWNLOAD_QUEUE_ACTIVE_STATUSES | _DOWNLOAD_QUEUE_TERMINAL_STATUSES:
+        return False
+    expected = set(expected_statuses or ())
+    if expected and not expected <= _DOWNLOAD_QUEUE_ACTIVE_STATUSES | _DOWNLOAD_QUEUE_TERMINAL_STATUSES:
+        return False
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    terminal = status in _DOWNLOAD_QUEUE_TERMINAL_STATUSES
+    conn = _get_conn(db_path)
+    try:
+        expected_clause = ""
+        expected_values: list[str] = []
+        if expected:
+            expected_values = sorted(expected)
+            expected_clause = f" AND status IN ({', '.join('?' for _ in expected_values)})"
+        cursor = conn.execute(
+            """UPDATE download_queue_batches
+               SET status = ?, error_message = ?, updated_at = ?,
+                   finished_at = CASE WHEN ? THEN ? ELSE finished_at END,
+                   urls_json = CASE WHEN ? THEN '[]' ELSE urls_json END
+               WHERE id = ?""" + expected_clause,
+            [
+                status, str(error_message or "")[:1000], now, int(terminal), now,
+                int(bool(purge_payload and terminal)), int(batch_id),
+                *expected_values,
+            ],
+        )
+        conn.commit()
+        return cursor.rowcount == 1
+    finally:
+        conn.close()
+
+
+def cancel_pending_download_queue_batches(db_path: str) -> int:
+    """Cancel queued work without touching a currently running downloader."""
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    conn = _get_conn(db_path)
+    try:
+        cursor = conn.execute(
+            """UPDATE download_queue_batches
+               SET status = 'cancelled', error_message = 'Người dùng đã dừng toàn bộ queue',
+                   updated_at = ?, finished_at = ?, urls_json = '[]'
+               WHERE status IN ('queued', 'starting')""",
+            (now, now),
+        )
+        conn.commit()
+        return int(cursor.rowcount)
+    finally:
+        conn.close()
+
+
+def recover_download_queue_batches(db_path: str) -> int:
+    """Return unfinished persisted batches to FIFO queue after an app restart."""
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    conn = _get_conn(db_path)
+    try:
+        cursor = conn.execute(
+            """UPDATE download_queue_batches
+               SET status = 'queued', updated_at = ?, error_message = ''
+               WHERE status IN ('starting', 'running')""",
+            (now,),
+        )
+        conn.commit()
+        return int(cursor.rowcount)
+    finally:
+        conn.close()
+
+
+def get_download_queue_status(db_path: str) -> dict:
+    """Return safe aggregate queue state; URLs remain private operational payload."""
+    conn = _get_conn(db_path)
+    try:
+        rows = conn.execute(
+            """SELECT status, COUNT(*), COALESCE(SUM(item_count), 0)
+               FROM download_queue_batches
+               WHERE status IN ('queued', 'starting', 'running') GROUP BY status"""
+        ).fetchall()
+        counts = {str(row[0]): {"batches": int(row[1]), "items": int(row[2])} for row in rows}
+        queued = counts.get("queued", {"batches": 0, "items": 0})
+        starting = counts.get("starting", {"batches": 0, "items": 0})
+        running = counts.get("running", {"batches": 0, "items": 0})
+        return {
+            "batches": queued["batches"] + starting["batches"],
+            "items": queued["items"] + starting["items"],
+            "running_batches": running["batches"], "running_items": running["items"],
+        }
+    finally:
+        conn.close()
+
+
+def get_recent_task_runs(db_path: str, limit: int = 12) -> List[dict]:
+    """Return recent local run summaries without user credentials or raw input."""
+    conn = _get_conn(db_path)
+    try:
+        rows = conn.execute(
+            """SELECT id, task_type, status, total_items, completed_items, successful_items,
+                      failed_items, summary_json, error_message, started_at, finished_at
+               FROM task_runs ORDER BY id DESC LIMIT ?""",
+            (max(1, min(int(limit or 12), 50)),),
+        ).fetchall()
+        result = []
+        for row in rows:
+            try:
+                summary = json.loads(row[7] or "{}")
+            except (TypeError, ValueError):
+                summary = {}
+            total_items = max(0, int(row[3] or 0))
+            completed_items = min(total_items, max(0, int(row[4] or 0)))
+            successful_items = min(completed_items, max(0, int(row[5] or 0)))
+            failed_items = min(completed_items - successful_items, max(0, int(row[6] or 0)))
+            result.append({
+                "id": row[0], "task_type": row[1], "status": row[2],
+                "total_items": total_items, "completed_items": completed_items,
+                "successful_items": successful_items, "failed_items": failed_items,
+                "summary": summary if isinstance(summary, dict) else {},
+                "error_message": row[8] or "", "started_at": row[9] or "", "finished_at": row[10] or "",
+            })
+        return result
+    finally:
+        conn.close()
 
 
 # ─── Post Spy Queries ────────────────────────────────────────────────────────
 
-def _local_media_preview(download_path: str) -> tuple[str, str, int]:
-    """Return first local preview, its kind, and media count for a downloaded post."""
-    if not download_path:
-        return "", "", 0
-    root = Path(download_path).expanduser()
+_LEGACY_SYNTHETIC_PAGE_URL = "https://www.facebook.com/tinix-direct-downloads"
+
+
+def resolve_download_target(
+    db_path: str,
+    post_ids: List[str],
+    *,
+    url: str = "",
+    page_url: str = "",
+    page_name: str = "",
+    caption: str = "",
+) -> Optional[dict]:
+    """Find the original scraped post or an identified source page for a download."""
+    ids = list(dict.fromkeys(str(value or "").strip() for value in post_ids if str(value or "").strip()))
+    canonical_page_url = normalize_page_url(page_url) if page_url else ""
+    clean_page_name = str(page_name or "").strip()
     try:
-        files = [root] if root.is_file() else [item for item in root.iterdir() if item.is_file()]
+        conn = _get_conn(db_path)
+        try:
+            if canonical_page_url and ids:
+                placeholders = ",".join("?" for _ in ids)
+                row = conn.execute(
+                    f"""SELECT id, page_name, page_url, group_name FROM posts
+                        WHERE page_url = ? AND post_id IN ({placeholders}) ORDER BY id DESC LIMIT 1""",
+                    [canonical_page_url, *ids],
+                ).fetchone()
+                if row:
+                    return {"row_id": row[0], "page_name": row[1], "page_url": row[2], "group_name": row[3] or ""}
+
+            if canonical_page_url and caption.strip():
+                rows = conn.execute(
+                    """SELECT id, page_name, page_url, group_name FROM posts
+                       WHERE page_url = ? AND caption = ?""",
+                    (canonical_page_url, caption.strip()),
+                ).fetchall()
+                if len(rows) == 1:
+                    row = rows[0]
+                    return {"row_id": row[0], "page_name": row[1], "page_url": row[2], "group_name": row[3] or ""}
+
+            if canonical_page_url:
+                row = conn.execute(
+                    "SELECT page_name, group_name FROM pages WHERE page_url = ?", (canonical_page_url,)
+                ).fetchone()
+                if row:
+                    return {"row_id": 0, "page_name": row[0], "page_url": canonical_page_url, "group_name": row[1] or ""}
+
+                if clean_page_name and clean_page_name != "Unknown":
+                    return {"row_id": 0, "page_name": clean_page_name, "page_url": canonical_page_url, "group_name": ""}
+
+            if ids:
+                placeholders = ",".join("?" for _ in ids)
+                row = conn.execute(
+                    f"""SELECT id, page_name, page_url, group_name FROM posts
+                        WHERE page_url != ? AND post_id IN ({placeholders}) ORDER BY id DESC LIMIT 1""",
+                    [_LEGACY_SYNTHETIC_PAGE_URL, *ids],
+                ).fetchone()
+                if row:
+                    return {"row_id": row[0], "page_name": row[1], "page_url": row[2], "group_name": row[3] or ""}
+
+            if url:
+                row = conn.execute(
+                    """SELECT id, page_name, page_url, group_name FROM posts
+                       WHERE page_url != ? AND url = ? ORDER BY id DESC LIMIT 1""",
+                    (_LEGACY_SYNTHETIC_PAGE_URL, url),
+                ).fetchone()
+                if row:
+                    return {"row_id": row[0], "page_name": row[1], "page_url": row[2], "group_name": row[3] or ""}
+        finally:
+            conn.close()
+    except Exception as exc:
+        logger.debug(f"Không tìm được bài nguồn để cập nhật tải: {str(exc)[:150]}")
+    return None
+
+
+def mark_post_row_downloaded(
+    db_path: str, row_id: int, folder_path: str, *, status: str = "downloaded", error: str = ""
+) -> bool:
+    """Mark one exact Post Spy row as downloaded."""
+    if not row_id:
+        return False
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    is_complete = int(status == "downloaded")
+    try:
+        conn = _get_conn(db_path)
+        cur = conn.execute(
+            """UPDATE posts SET downloaded = ?, download_path = ?, downloaded_at = ?,
+               download_status = ?, download_error = ? WHERE id = ?""",
+            (is_complete, folder_path, now, status, error, int(row_id)),
+        )
+        conn.commit()
+        conn.close()
+        return cur.rowcount == 1
+    except Exception as exc:
+        logger.error(f"Không cập nhật trạng thái tải của bài nguồn: {str(exc)[:200]}")
+        return False
+
+
+def register_downloaded_post_for_page(
+    db_path: str,
+    post_id: str,
+    url: str,
+    caption: str,
+    *,
+    page_name: str,
+    page_url: str,
+    post_type: str,
+    media_count: int,
+    folder_path: str,
+    status: str = "downloaded",
+    error: str = "",
+) -> bool:
+    """Save a download under its verified Facebook source page, never a synthetic page."""
+    normalized_id = re.sub(r"\D", "", str(post_id or "")).strip()
+    canonical_page_url = normalize_page_url(page_url) if page_url else ""
+    clean_page_name = str(page_name or "").strip()
+    if len(normalized_id) < 10 or not canonical_page_url or not clean_page_name or clean_page_name == "Unknown":
+        return False
+
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        conn = _get_conn(db_path)
+        registered = conn.execute(
+            "SELECT page_name, group_name FROM pages WHERE page_url = ?", (canonical_page_url,)
+        ).fetchone()
+        if registered:
+            clean_page_name = registered[0] or clean_page_name
+            group_name = registered[1] or ""
+        else:
+            group_name = ""
+
+        conn.execute(
+            """INSERT INTO posts (
+                page_name, page_url, group_name, post_id, date, post_type,
+                engagement, comments, shares, view_count, caption, url,
+                media_preview_url, media_count, scraped_at, downloaded,
+                download_path, downloaded_at, download_status, download_error
+            ) VALUES (?, ?, ?, ?, '', ?, 0, 0, 0, 0, ?, ?, '', ?, ?, 1, ?, ?, ?, ?)
+            ON CONFLICT(page_name, post_id) DO UPDATE SET
+                caption = CASE WHEN excluded.caption != '' THEN excluded.caption ELSE posts.caption END,
+                url = CASE WHEN excluded.url != '' THEN excluded.url ELSE posts.url END,
+                media_count = MAX(posts.media_count, excluded.media_count),
+                scraped_at = excluded.scraped_at, downloaded = 1,
+                download_path = excluded.download_path, downloaded_at = excluded.downloaded_at,
+                download_status = excluded.download_status, download_error = excluded.download_error""",
+            (clean_page_name, canonical_page_url, group_name, normalized_id, post_type or "Text",
+             str(caption or ""), str(url or ""), max(0, int(media_count or 0)), now,
+             str(folder_path or ""), now, status, str(error or "")[:1000]),
+        )
+        total_posts = conn.execute("SELECT COUNT(*) FROM posts WHERE page_url = ?", (canonical_page_url,)).fetchone()[0]
+        conn.execute(
+            """INSERT INTO pages (page_url, page_name, group_name, post_count, last_scraped, created_at)
+               VALUES (?, ?, ?, ?, ?, ?)
+               ON CONFLICT(page_url) DO UPDATE SET
+                   page_name = excluded.page_name, post_count = excluded.post_count, last_scraped = excluded.last_scraped""",
+            (canonical_page_url, clean_page_name, group_name, total_posts, now, now),
+        )
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as exc:
+        logger.error(f"Không lưu được bài tải vào page nguồn: {str(exc)[:200]}")
+        return False
+
+def _media_preview_key(post_id: str) -> str:
+    """Return the filename key used by flat media storage for a post."""
+    raw_post_id = str(post_id or "").strip()
+    return re.sub(r"\D", "", raw_post_id).strip() or raw_post_id
+
+
+def _index_flat_media_files(output_dir: Path, post_ids: List[str]) -> Dict[str, List[Path]]:
+    """Scan a flat media directory once and group its files by requested post ID."""
+    keys = {_media_preview_key(post_id) for post_id in post_ids if _media_preview_key(post_id)}
+    if not keys or not output_dir.is_dir():
+        return {}
+
+    numeric_keys = {key for key in keys if key.isdigit()}
+    non_numeric_keys = keys - numeric_keys
+    files_by_post_id: Dict[str, List[Path]] = {}
+
+    try:
+        for item in output_dir.iterdir():
+            if not item.is_file() or item.suffix.lower() not in MEDIA_DOWNLOAD_EXTS:
+                continue
+            filename = item.name
+            numeric_match = re.match(r"^(\d+)(?=[_.])", filename)
+            if numeric_match and numeric_match.group(1) in numeric_keys:
+                files_by_post_id.setdefault(numeric_match.group(1), []).append(item)
+                continue
+            for key in non_numeric_keys:
+                if filename.startswith(f"{key}_") or filename.startswith(f"{key}."):
+                    files_by_post_id.setdefault(key, []).append(item)
+                    break
+    except OSError:
+        return {}
+
+    return files_by_post_id
+
+
+def _local_media_preview(
+    download_path: str,
+    post_id: str = "",
+    flat_media_files: Optional[Dict[str, List[Path]]] = None,
+) -> tuple[str, str, int]:
+    """Return first local preview, its kind, and media count for a downloaded post."""
+    if not download_path and not post_id:
+        return "", "", 0
+    from utils import config
+    out_dir = Path(config.get("output_dir", ".")).expanduser().resolve()
+    root = Path(download_path).expanduser().resolve() if download_path else out_dir
+    if not root.exists():
+        fallback_root = out_dir / root.name
+        if fallback_root.exists():
+            root = fallback_root
+        elif out_dir.exists():
+            root = out_dir
+        else:
+            return "", "", 0
+
+    clean_pid = _media_preview_key(post_id)
+    media_files = []
+    image_exts = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
+
+    try:
+        # Flat storage: search files matching post_id in root directory
+        if clean_pid and root.is_dir() and root == out_dir and flat_media_files is not None:
+            media_files = list(flat_media_files.get(clean_pid, []))
+        elif clean_pid and root.is_dir():
+            for item in root.iterdir():
+                if not item.is_file():
+                    continue
+                if (
+                    item.stem == clean_pid
+                    or item.name.startswith(f"{clean_pid}_")
+                    or item.name.startswith(f"{clean_pid}.")
+                ) and item.suffix.lower() in MEDIA_DOWNLOAD_EXTS:
+                    media_files.append(item)
+
+        if not media_files:
+            if root.is_file() and root.suffix.lower() in MEDIA_DOWNLOAD_EXTS:
+                media_files = [root]
+            elif root.is_dir() and (root != out_dir or (clean_pid and root.name == clean_pid)):
+                media_files = [item for item in root.iterdir() if item.is_file() and item.suffix.lower() in MEDIA_DOWNLOAD_EXTS]
     except (OSError, ValueError):
         return "", "", 0
-    media_files = [item for item in files if item.suffix.lower() in MEDIA_DOWNLOAD_EXTS]
+
     if not media_files:
         return "", "", 0
-    image_exts = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
+
+    # Sort images first, then videos; and by filename (e.g. _1 before _2)
     media_files.sort(key=lambda item: (item.suffix.lower() not in image_exts, item.name.lower()))
     first = media_files[0]
     kind = "image" if first.suffix.lower() in image_exts else "video"
@@ -1382,6 +2125,7 @@ def query_posts_for_spy(
     download_status: str = "Tất cả",
     sort_by: str = "",
     sort_order: str = "desc",
+    query: str = "",
 ) -> List[dict]:
     """Query posts for Post Spy Manager.
 
@@ -1413,11 +2157,22 @@ def query_posts_for_spy(
             "Chưa tải": "not_downloaded",
             "Đang tải": "downloading",
             "Tải lỗi": "failed",
+            "Thiếu video": "thumbnail_only",
             "Đã tải": "downloaded",
         }
         if download_status in status_filters:
             where += " AND download_status = ?"
             params.append(status_filters[download_status])
+
+        query_text = str(query or "").strip().lower()
+        if query_text:
+            conn.create_function("unicode_lower", 1, lambda value: str(value or "").lower())
+            where += """ AND (
+                instr(unicode_lower(caption), ?) > 0
+                OR instr(unicode_lower(post_id), ?) > 0
+                OR instr(unicode_lower(page_name), ?) > 0
+            )"""
+            params.extend((query_text, query_text, query_text))
 
         date_expr = "CASE WHEN length(date) = 10 THEN substr(date, 7, 4) || substr(date, 4, 2) || substr(date, 1, 2) ELSE date END"
         sort_columns = {
@@ -1428,7 +2183,7 @@ def query_posts_for_spy(
             "comments": "comments",
             "shares": "shares",
             "total_engagement": "(engagement + comments + shares)",
-            "downloaded": "CASE download_status WHEN 'downloading' THEN 1 WHEN 'failed' THEN 2 WHEN 'downloaded' THEN 3 ELSE 0 END",
+            "downloaded": "CASE download_status WHEN 'downloading' THEN 1 WHEN 'failed' THEN 2 WHEN 'thumbnail_only' THEN 3 WHEN 'downloaded' THEN 4 ELSE 0 END",
             "view_count": "view_count",
         }
         if not sort_by:
@@ -1458,10 +2213,17 @@ def query_posts_for_spy(
             {limit_clause}
         """
 
-        cursor = conn.execute(sql, params)
+        rows = conn.execute(sql, params).fetchall()
+        from utils import config
+        flat_media_files = _index_flat_media_files(
+            Path(config.get("output_dir", ".")).expanduser().resolve(),
+            [r[2] or "" for r in rows],
+        )
         posts = []
-        for r in cursor.fetchall():
-            preview_path, preview_kind, local_media_count = _local_media_preview(r[12] or "")
+        for r in rows:
+            preview_path, preview_kind, local_media_count = _local_media_preview(
+                r[12] or "", post_id=r[2] or "", flat_media_files=flat_media_files
+            )
             posts.append({
                 "group_name": r[0], "page_name": r[1], "post_id": r[2],
                 "date": r[3], "post_type": r[4], "engagement": r[5] or 0,
@@ -1518,20 +2280,23 @@ def get_spy_post_by_row_id(db_path: str, row_id: int) -> Optional[dict]:
         return None
 
 
-def mark_posts_downloaded(db_path: str, post_ids: List[str], folder_path: str = "") -> int:
+def mark_posts_downloaded(
+    db_path: str, post_ids: List[str], folder_path: str = "", status: str = "downloaded", error: str = ""
+) -> int:
     """Mark posts as downloaded. Returns count of updated rows."""
     if not post_ids:
         return 0
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    is_complete = int(status == "downloaded")
     try:
         conn = _get_conn(db_path)
         updated = 0
         for pid in post_ids:
             cur = conn.execute("""
-                UPDATE posts SET downloaded = 1, download_path = ?, downloaded_at = ?,
-                                 download_status = 'downloaded', download_error = ''
+                UPDATE posts SET downloaded = ?, download_path = ?, downloaded_at = ?,
+                                 download_status = ?, download_error = ?
                 WHERE post_id = ?
-            """, (folder_path, now, pid))
+            """, (is_complete, folder_path, now, status, error, pid))
             updated += cur.rowcount
         conn.commit()
         conn.close()
@@ -1539,6 +2304,19 @@ def mark_posts_downloaded(db_path: str, post_ids: List[str], folder_path: str = 
     except Exception as e:
         logger.error(f"Mark downloaded error: {str(e)[:200]}")
         return 0
+
+
+def update_post_download_path(db_path: str, row_id: int, path: str) -> bool:
+    """Update download_path and mark downloaded=1 for a post by row ID."""
+    try:
+        conn = _get_conn(db_path)
+        conn.execute("UPDATE posts SET download_path = ?, downloaded = 1 WHERE id = ?", (path, int(row_id)))
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as e:
+        logger.error(f"Update post download path error: {str(e)[:200]}")
+        return False
 
 
 def set_post_rating(db_path: str, row_id: int, rating: int) -> bool:
@@ -1565,9 +2343,10 @@ def mark_posts_download_status(
     *,
     error: str = "",
     folder_path: str = "",
+    only_if_status: str = "",
 ) -> int:
     """Persist a post download lifecycle state for all matching post identifiers."""
-    allowed = {"not_downloaded", "downloading", "failed", "downloaded"}
+    allowed = {"not_downloaded", "downloading", "failed", "thumbnail_only", "downloaded"}
     if status not in allowed:
         raise ValueError(f"Unsupported download status: {status}")
     clean_ids = list(dict.fromkeys(str(pid or "").strip() for pid in post_ids if str(pid or "").strip()))
@@ -1577,15 +2356,17 @@ def mark_posts_download_status(
     conn = _get_conn(db_path)
     try:
         placeholders = ",".join("?" for _ in clean_ids)
-        if status == "downloaded":
+        status_guard = " AND download_status = ?" if only_if_status else ""
+        guard_params = [only_if_status] if only_if_status else []
+        if status in {"downloaded", "thumbnail_only"}:
             cursor = conn.execute(
                 f"""
                 UPDATE posts
-                SET downloaded = 1, download_status = 'downloaded', download_error = '',
+                SET downloaded = 1, download_status = ?, download_error = ?,
                     download_path = ?, downloaded_at = ?
-                WHERE post_id IN ({placeholders})
+                WHERE post_id IN ({placeholders}){status_guard}
                 """,
-                [folder_path, now, *clean_ids],
+                [status, str(error or "")[:1000], folder_path, now, *clean_ids, *guard_params],
             )
         else:
             cursor = conn.execute(
@@ -1594,9 +2375,9 @@ def mark_posts_download_status(
                 SET downloaded = 0, download_status = ?, download_error = ?,
                     download_path = CASE WHEN ? = 'failed' THEN '' ELSE download_path END,
                     downloaded_at = CASE WHEN ? = 'failed' THEN '' ELSE downloaded_at END
-                WHERE post_id IN ({placeholders})
+                WHERE post_id IN ({placeholders}){status_guard}
                 """,
-                [status, str(error or "")[:1000], status, status, *clean_ids],
+                [status, str(error or "")[:1000], status, status, *clean_ids, *guard_params],
             )
         conn.commit()
         return int(cursor.rowcount)
@@ -1608,16 +2389,33 @@ def mark_posts_download_status(
 
 
 def recover_interrupted_downloads(db_path: str) -> int:
-    """Turn stale in-progress rows into failures when the application starts."""
+    """Fail stale in-progress rows, except URLs retained by a durable queue."""
     conn = _get_conn(db_path)
     try:
+        queued_post_ids: set[str] = set()
+        queued_rows = conn.execute(
+            "SELECT urls_json FROM download_queue_batches WHERE status IN ('queued', 'starting', 'running')"
+        ).fetchall()
+        for (urls_json,) in queued_rows:
+            try:
+                urls = json.loads(urls_json or "[]")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            for url in urls if isinstance(urls, list) else []:
+                queued_post_ids.update(re.findall(r"\d{10,}", str(url or "")))
+
+        protected_clause = ""
+        params: list[str] = []
+        if queued_post_ids:
+            protected_clause = f" AND post_id NOT IN ({','.join('?' for _ in queued_post_ids)})"
+            params = sorted(queued_post_ids)
         cursor = conn.execute(
             """
             UPDATE posts
             SET downloaded = 0, download_status = 'failed',
                 download_error = 'Tác vụ tải bị gián đoạn do ứng dụng đã dừng'
-            WHERE download_status = 'downloading'
-            """
+            WHERE download_status = 'downloading'""" + protected_clause,
+            params,
         )
         conn.commit()
         return int(cursor.rowcount)
@@ -1656,44 +2454,132 @@ def get_downloaded_posts_by_ids(db_path: str, post_ids: List[str]) -> Dict[str, 
 
 
 def sync_downloaded_posts_from_folder(db_path: str, output_dir: str) -> int:
-    """Mark scraped posts as downloaded when their post-id folder contains media."""
+    """Synchronize verified local media without promoting incomplete migrations."""
     if not output_dir or not os.path.isdir(output_dir):
         return 0
     try:
-        post_folders = {}
-        for entry in os.scandir(output_dir):
-            if not entry.is_dir():
-                continue
-            post_id = entry.name.strip()
-            if not post_id:
-                continue
-            try:
-                has_media = any(
-                    f.is_file() and Path(f.name).suffix.lower() in MEDIA_DOWNLOAD_EXTS
-                    for f in os.scandir(entry.path)
-                )
-            except Exception:
-                has_media = False
-            if has_media:
-                post_folders[post_id] = entry.path
+        video_exts = {".mp4", ".mov", ".webm", ".avi", ".mkv", ".m4v"}
+        post_folders: dict[str, tuple[str, bool, int]] = {}
+        legacy_pending: dict[str, str] = {}
+        numeric_legacy_dirs: dict[str, tuple[str, list[os.DirEntry[str]]]] = {}
 
-        if not post_folders:
+        flat_by_pid: dict[str, list[str]] = {}
+        for entry in os.scandir(output_dir):
+            if entry.is_file():
+                match = re.match(r"^(\d+)(?=[_.])", entry.name)
+                if match:
+                    pid = match.group(1)
+                    flat_by_pid.setdefault(pid, []).append(entry.name)
+            elif entry.is_dir():
+                post_id = entry.name.strip()
+                if post_id:
+                    try:
+                        entries = list(os.scandir(entry.path))
+                        if post_id.isdigit():
+                            numeric_legacy_dirs[post_id] = (entry.path, entries)
+                            continue
+                        media_files = [f.name for f in entries if f.is_file() and Path(f.name).suffix.lower() in MEDIA_DOWNLOAD_EXTS]
+                        if media_files:
+                            has_vid = any(Path(f).suffix.lower() in video_exts for f in media_files)
+                            post_folders[post_id] = (entry.path, has_vid, len(media_files))
+                    except Exception:
+                        pass
+
+        for pid, (legacy_path, legacy_entries) in numeric_legacy_dirs.items():
+            has_marker = any(item.name == ".tinix-migration-pending" for item in legacy_entries)
+            if has_marker or pid in flat_by_pid:
+                legacy_pending[pid] = legacy_path
+                continue
+            media = [item.name for item in legacy_entries if item.is_file() and Path(item.name).suffix.lower() in MEDIA_DOWNLOAD_EXTS]
+            if media:
+                has_video = any(Path(name).suffix.lower() in video_exts for name in media)
+                post_folders[pid] = (legacy_path, has_video, len(media))
+
+        for pid, filenames in flat_by_pid.items():
+            if pid in legacy_pending:
+                continue
+            media = [f for f in filenames if Path(f).suffix.lower() in MEDIA_DOWNLOAD_EXTS]
+            if media:
+                has_vid = any(Path(f).suffix.lower() in video_exts for f in media)
+                post_folders[pid] = (output_dir, has_vid, len(media))
+
+        if not post_folders and not legacy_pending:
             return 0
 
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         conn = _get_conn(db_path)
         updated = 0
-        for post_id, folder_path in post_folders.items():
-            cur = conn.execute("""
-                UPDATE posts
-                SET downloaded = 1,
-                    download_status = 'downloaded',
-                    download_error = '',
-                    download_path = CASE WHEN download_path = '' THEN ? ELSE download_path END,
-                    downloaded_at = CASE WHEN downloaded_at = '' THEN ? ELSE downloaded_at END
-                WHERE post_id = ? AND downloaded = 0
-            """, (folder_path, now, post_id))
-            updated += cur.rowcount
+        for post_id in set(post_folders) | set(legacy_pending):
+            row = conn.execute(
+                """SELECT id, post_type, media_count, downloaded, download_path,
+                          download_status, download_error
+                   FROM posts WHERE post_id = ?""",
+                (post_id,)
+            ).fetchone()
+            if not row:
+                logger.debug(f"Bỏ qua media {post_id}: chưa xác minh được page nguồn")
+                continue
+            row_id, post_type, expected_media_count, downloaded, cur_path, cur_status, cur_error = (
+                row[0], row[1] or "", max(0, int(row[2] or 0)), row[3], row[4] or "", row[5] or "", row[6] or ""
+            )
+
+            if post_id in legacy_pending:
+                pending_path = legacy_pending[post_id]
+                pending_error = "Đang chờ hoàn tất migration dữ liệu cũ"
+                if (
+                    downloaded
+                    or cur_path != pending_path
+                    or cur_status != "failed"
+                    or cur_error != pending_error
+                ):
+                    conn.execute(
+                        """
+                        UPDATE posts
+                        SET downloaded = 0, download_status = 'failed', download_error = ?, download_path = ?
+                        WHERE id = ?
+                        """,
+                        (pending_error, pending_path, row_id),
+                    )
+                    updated += 1
+                continue
+
+            folder_path, has_video, local_media_count = post_folders[post_id]
+
+            is_video_post = post_type == "Video"
+            if is_video_post and not has_video:
+                status = "thumbnail_only"
+                error = "Chỉ có ảnh thumbnail/caption, chưa có file video stream"
+                downloaded_value = 1
+            elif expected_media_count > local_media_count:
+                status = "failed"
+                error = f"Thiếu media local: tìm thấy {local_media_count}/{expected_media_count} file"
+                downloaded_value = 0
+            else:
+                status = "downloaded"
+                error = ""
+                downloaded_value = 1
+
+            need_update = (
+                bool(downloaded) != bool(downloaded_value)
+                or not cur_path
+                or not os.path.exists(cur_path)
+                or cur_path != folder_path
+                or (is_video_post and not has_video and cur_status == "downloaded")
+                or (has_video and cur_status != "downloaded")
+                or cur_status != status
+            )
+            if need_update:
+                conn.execute("""
+                    UPDATE posts
+                    SET downloaded = ?,
+                        download_status = ?,
+                        download_error = ?,
+                        download_path = ?,
+                        downloaded_at = CASE WHEN downloaded_at = '' OR downloaded_at IS NULL THEN ? ELSE downloaded_at END
+                    WHERE id = ?
+                """, (downloaded_value, status, error, folder_path, now, row_id))
+                updated += 1
+
         conn.commit()
         conn.close()
         if updated:
@@ -1709,16 +2595,45 @@ def bulk_delete_posts(db_path: str, post_ids: List[str]) -> dict:
     if not post_ids:
         return {"deleted": 0, "paths": []}
     try:
+        from utils import config
+        out_dir = Path(config.get("output_dir", ".")).expanduser().resolve()
         conn = _get_conn(db_path)
-        # Collect download paths first
         placeholders = ",".join("?" for _ in post_ids)
         cursor = conn.execute(
-            f"SELECT download_path FROM posts WHERE post_id IN ({placeholders})",
+            f"SELECT post_id, download_path FROM posts WHERE post_id IN ({placeholders})",
             post_ids,
         )
-        paths = [r[0] for r in cursor.fetchall() if r[0]]
+        paths: set[str] = set()
+        for pid, dl_path in cursor.fetchall():
+            clean_pid = re.sub(r"\D", "", str(pid or "")).strip() or str(pid or "").strip()
+            target_dir = Path(dl_path).expanduser().resolve() if dl_path else out_dir
+            if not target_dir.exists():
+                target_dir = out_dir
+            if target_dir.is_dir():
+                if target_dir != out_dir:
+                    paths.add(str(target_dir))
+                else:
+                    if clean_pid:
+                        try:
+                            for item in target_dir.iterdir():
+                                if item.is_file() and (
+                                    item.stem == clean_pid
+                                    or item.name.startswith(f"{clean_pid}_")
+                                    or item.name.startswith(f"{clean_pid}.")
+                                ):
+                                    paths.add(str(item))
+                        except Exception:
+                            pass
+            elif target_dir.is_file():
+                paths.add(str(target_dir))
 
-        # Delete records
+        paths = {
+            path for path in paths
+            if path != str(out_dir) and conn.execute(
+                "SELECT 1 FROM posts WHERE download_path = ? LIMIT 1", (path,)
+            ).fetchone() is None
+        }
+
         cur = conn.execute(
             f"DELETE FROM posts WHERE post_id IN ({placeholders})",
             post_ids,
@@ -1727,7 +2642,7 @@ def bulk_delete_posts(db_path: str, post_ids: List[str]) -> dict:
         conn.commit()
         conn.close()
         logger.info(f"🗑 Đã xóa {deleted} bài viết từ database")
-        return {"deleted": deleted, "paths": paths}
+        return {"deleted": deleted, "paths": sorted(paths)}
     except Exception as e:
         logger.error(f"Bulk delete error: {str(e)[:200]}")
         return {"deleted": 0, "paths": []}
@@ -1740,6 +2655,9 @@ def bulk_delete_post_rows(db_path: str, row_ids: List[int]) -> dict:
         return {"deleted": 0, "paths": []}
     conn = _get_conn(db_path)
     try:
+        from utils import config
+        out_dir = Path(config.get("output_dir", ".")).expanduser().resolve()
+
         page_urls: set[str] = set()
         paths: set[str] = set()
         deleted = 0
@@ -1747,11 +2665,35 @@ def bulk_delete_post_rows(db_path: str, row_ids: List[int]) -> dict:
             chunk = normalized_ids[offset:offset + 500]
             placeholders = ",".join("?" for _ in chunk)
             rows = conn.execute(
-                f"SELECT DISTINCT page_url, download_path FROM posts WHERE id IN ({placeholders})",
+                f"SELECT DISTINCT post_id, page_url, download_path FROM posts WHERE id IN ({placeholders})",
                 chunk,
             ).fetchall()
-            page_urls.update(row[0] for row in rows if row[0])
-            paths.update(row[1] for row in rows if row[1])
+            for pid, page_url, dl_path in rows:
+                if page_url:
+                    page_urls.add(page_url)
+                clean_pid = re.sub(r"\D", "", str(pid or "")).strip() or str(pid or "").strip()
+                target_dir = Path(dl_path).expanduser().resolve() if dl_path else out_dir
+                if not target_dir.exists():
+                    target_dir = out_dir
+
+                if target_dir.is_dir():
+                    if target_dir != out_dir:
+                        paths.add(str(target_dir))
+                    else:
+                        if clean_pid:
+                            try:
+                                for item in target_dir.iterdir():
+                                    if item.is_file() and (
+                                        item.stem == clean_pid
+                                        or item.name.startswith(f"{clean_pid}_")
+                                        or item.name.startswith(f"{clean_pid}.")
+                                    ):
+                                        paths.add(str(item))
+                            except Exception:
+                                pass
+                elif target_dir.is_file():
+                    paths.add(str(target_dir))
+
             deleted += conn.execute(
                 f"DELETE FROM posts WHERE id IN ({placeholders})", chunk
             ).rowcount
@@ -1766,7 +2708,7 @@ def bulk_delete_post_rows(db_path: str, row_ids: List[int]) -> dict:
             )
         paths = {
             path for path in paths
-            if conn.execute(
+            if path != str(out_dir) and conn.execute(
                 "SELECT 1 FROM posts WHERE download_path = ? LIMIT 1", (path,)
             ).fetchone() is None
         }
@@ -1787,11 +2729,9 @@ def add_account(db_path: str, **kwargs) -> int:
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     try:
         conn = _get_conn(db_path)
-        cur = conn.execute("""
-            INSERT INTO fb_accounts
-                (label, username, password, secret_2fa, email, email_pass, cookie, is_active, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
+        ac_cols = [row[1] for row in conn.execute("PRAGMA table_info(fb_accounts)").fetchall()]
+        cols = ["label", "username", "password", "secret_2fa", "email", "email_pass", "cookie", "is_active", "created_at"]
+        vals = [
             kwargs.get("label", ""),
             kwargs.get("username", ""),
             protect_secret(kwargs.get("password", "")),
@@ -1799,9 +2739,20 @@ def add_account(db_path: str, **kwargs) -> int:
             kwargs.get("email", ""),
             protect_secret(kwargs.get("email_pass", "")),
             protect_secret(kwargs.get("cookie", "")),
-            1,
+            int(bool(kwargs.get("is_active", 1))),
             now,
-        ))
+        ]
+        if "recovery_email" in ac_cols:
+            cols.append("recovery_email")
+            vals.append(kwargs.get("recovery_email", ""))
+        if "recovery_codes" in ac_cols:
+            cols.append("recovery_codes")
+            vals.append(protect_secret(kwargs.get("recovery_codes", "")))
+        if "notes" in ac_cols:
+            cols.append("notes")
+            vals.append(kwargs.get("notes", ""))
+        placeholders = ", ".join(["?"] * len(cols))
+        cur = conn.execute(f"INSERT INTO fb_accounts ({', '.join(cols)}) VALUES ({placeholders})", vals)
         conn.commit()
         new_id = cur.lastrowid
         conn.close()
@@ -1813,26 +2764,52 @@ def add_account(db_path: str, **kwargs) -> int:
 
 def update_account(db_path: str, account_id: int, **kwargs) -> bool:
     """Update an existing account."""
-    fields = []
-    values = []
-    for key in ("label", "username", "password", "secret_2fa", "email",
-                "email_pass", "cookie", "is_active", "last_login"):
-        if key in kwargs:
-            fields.append(f"{key} = ?")
-            value = kwargs[key]
-            values.append(protect_secret(value) if key in ACCOUNT_SECRET_FIELDS else value)
-    if not fields:
-        return False
-    values.append(account_id)
     try:
         conn = _get_conn(db_path)
-        conn.execute(f"UPDATE fb_accounts SET {', '.join(fields)} WHERE id = ?", values)
-        conn.commit()
+        row = conn.execute("SELECT 1 FROM fb_accounts WHERE id = ?", (account_id,)).fetchone()
+        if not row:
+            conn.close()
+            return False
+
+        fields = []
+        values = []
+        allowed_keys = (
+            "label", "username", "password", "secret_2fa", "email",
+            "email_pass", "cookie", "is_active", "last_login",
+            "recovery_email", "recovery_codes", "notes",
+            "preflight_status", "preflight_message", "preflight_checked_at",
+        )
+        for key in allowed_keys:
+            if key in kwargs:
+                fields.append(f"{key} = ?")
+                value = kwargs[key]
+                values.append(protect_secret(value) if key in ACCOUNT_SECRET_FIELDS else value)
+
+        if fields:
+            values.append(account_id)
+            conn.execute(f"UPDATE fb_accounts SET {', '.join(fields)} WHERE id = ?", values)
+            conn.commit()
         conn.close()
         return True
     except Exception as e:
         logger.error(f"Lỗi cập nhật account: {str(e)[:100]}")
         return False
+
+
+def save_account_preflight_result(
+    db_path: str, account_id: int, *, code: str, message: str,
+) -> str:
+    """Persist the latest non-sensitive Facebook session readiness result."""
+    checked_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    if update_account(
+        db_path,
+        account_id,
+        preflight_status=str(code or "PREFLIGHT_FAILED"),
+        preflight_message=str(message or "Không thể kiểm tra phiên Facebook."),
+        preflight_checked_at=checked_at,
+    ):
+        return checked_at
+    return ""
 
 
 def save_business_id(db_path: str, account_id: int, business_id: str) -> bool:
@@ -1866,14 +2843,24 @@ def get_all_accounts(db_path: str) -> List[dict]:
     """Get all Facebook accounts and their dedicated Chrome profile."""
     try:
         conn = _get_conn(db_path)
-        rows = conn.execute("""
+        ac_cols = [row[1] for row in conn.execute("PRAGMA table_info(fb_accounts)").fetchall()]
+        notes_col = "a.notes" if "notes" in ac_cols else "'' AS notes"
+        rec_codes_col = "a.recovery_codes" if "recovery_codes" in ac_cols else "'' AS recovery_codes"
+        rec_email_col = "a.recovery_email" if "recovery_email" in ac_cols else "'' AS recovery_email"
+        preflight_status_col = "a.preflight_status" if "preflight_status" in ac_cols else "'' AS preflight_status"
+        preflight_message_col = "a.preflight_message" if "preflight_message" in ac_cols else "'' AS preflight_message"
+        preflight_checked_at_col = "a.preflight_checked_at" if "preflight_checked_at" in ac_cols else "'' AS preflight_checked_at"
+
+        rows = conn.execute(f"""
             SELECT a.id, a.label, a.username, a.password, a.secret_2fa,
                    a.email, a.email_pass, a.cookie, a.is_active,
                    a.last_login, a.created_at, a.business_id,
+                   {preflight_status_col}, {preflight_message_col}, {preflight_checked_at_col},
                    (SELECT sa.profile_dir
                     FROM social_accounts sa
                     WHERE sa.platform = 'facebook' AND sa.legacy_fb_id = a.id
-                    ORDER BY sa.id DESC LIMIT 1) AS profile_dir
+                    ORDER BY sa.id DESC LIMIT 1) AS profile_dir,
+                   {notes_col}, {rec_codes_col}, {rec_email_col}
             FROM fb_accounts a
             ORDER BY a.id
         """).fetchall()
@@ -1884,7 +2871,13 @@ def get_all_accounts(db_path: str) -> List[dict]:
                 "secret_2fa": reveal_secret(r[4]), "email": r[5], "email_pass": reveal_secret(r[6]),
                 "cookie": reveal_secret(r[7]), "is_active": r[8],
                 "last_login": r[9], "created_at": r[10], "business_id": r[11] or "",
-                "profile_dir": r[12] or "",
+                "preflight_status": r[12] or "",
+                "preflight_message": r[13] or "",
+                "preflight_checked_at": r[14] or "",
+                "profile_dir": r[15] or "",
+                "notes": r[16] or "",
+                "recovery_codes": reveal_secret(r[17]) if r[17] else "",
+                "recovery_email": r[18] or "",
             }
             for r in rows
         ]
@@ -1893,10 +2886,14 @@ def get_all_accounts(db_path: str) -> List[dict]:
         return []
 
 
-def get_account(db_path: str, account_id: int) -> Optional[dict]:
+def get_account(db_path: str, account_id: Any) -> Optional[dict]:
+    try:
+        acc_id_num = int(account_id)
+    except (TypeError, ValueError):
+        return None
     accounts = get_all_accounts(db_path)
     for a in accounts:
-        if a["id"] == account_id:
+        if int(a["id"]) == acc_id_num:
             return a
     return None
 
@@ -2517,7 +3514,7 @@ def save_managed_pages(db_path: str, account_id: int, pages: List[dict]) -> int:
                         THEN managed_pages.group_id
                         ELSE excluded.group_id
                     END
-            """, (account_id, p.get("page_name", ""), p.get("page_url", ""),
+            """, (account_id, normalize_page_name(p.get("page_name", "")), p.get("page_url", ""),
                   page_id, now, now, group_name, group_id))
             count += 1
         conn.commit()
@@ -2725,8 +3722,9 @@ def get_scraped_pages_full(db_path: str) -> List[dict]:
             SELECT p.id, p.page_url, p.page_name, p.group_name,
                    p.post_count, p.follower_count, p.last_scraped, p.created_at
             FROM pages p
+            WHERE p.page_url != ?
             ORDER BY p.group_name, p.page_name
-        """).fetchall()
+        """, (_LEGACY_SYNTHETIC_PAGE_URL,)).fetchall()
         conn.close()
         return [
             {

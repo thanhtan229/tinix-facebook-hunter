@@ -5,7 +5,8 @@ Tests for utils.process_cleanup module.
 from __future__ import annotations
 
 import os
-from unittest.mock import MagicMock
+from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 
 from utils.process_cleanup import (
@@ -23,6 +24,7 @@ from utils.process_cleanup import (
     is_workspace_python_process,
     wait_for_port_free,
 )
+from utils import logger as app_logger
 
 
 def test_get_workspace_root():
@@ -144,9 +146,14 @@ def test_is_project_chrome_process(tmp_path):
     assert is_project_chrome_process(p_project_chrome, chrome_profiles, exclude_pids) is True
 
 
-def test_cleanup_previous_sessions_dry_run():
-    # Calling cleanup_previous_sessions when no sessions are running
-    result = cleanup_previous_sessions(port=DEFAULT_PORT, close_windows=False, verbose=False)
+def test_cleanup_previous_sessions_dry_run(tmp_path):
+    """The cleanup coordinator can be inspected without scanning live processes."""
+    with patch("utils.process_cleanup.psutil", None), patch(
+        "utils.process_cleanup.is_port_in_use", return_value=False
+    ):
+        result = cleanup_previous_sessions(
+            port=DEFAULT_PORT, workspace_root=tmp_path, close_windows=False, verbose=False
+        )
     assert isinstance(result, dict)
     assert "backend_closed" in result
     assert "chrome_closed" in result
@@ -162,3 +169,40 @@ def test_console_and_terminal_definitions():
     assert "conhost.exe" in TERMINAL_PROCESS_NAMES
     assert "windowsterminal.exe" in TERMINAL_PROCESS_NAMES
 
+
+def test_logger_uses_configured_test_log_directory(tmp_path):
+    log_dir = tmp_path / "isolated-logs"
+    previous_logger = app_logger._logger
+    previous_gui_handler = app_logger._gui_handler
+    test_logger = None
+    try:
+        with patch.dict(os.environ, {"TINIX_LOG_DIR": str(log_dir)}):
+            app_logger._logger = None
+            app_logger._gui_handler = None
+            test_logger = app_logger.setup_logger("TinixLoggerIsolationTest")
+            test_logger.error("isolated test log")
+        log_files = list(log_dir.glob("app_*.log"))
+        assert len(log_files) == 1
+        assert "isolated test log" in log_files[0].read_text(encoding="utf-8")
+    finally:
+        if test_logger:
+            for handler in list(test_logger.handlers):
+                test_logger.removeHandler(handler)
+                handler.close()
+        app_logger._logger = previous_logger
+        app_logger._gui_handler = previous_gui_handler
+
+
+def test_pytest_session_uses_an_isolated_log_directory():
+    log_dir = Path(os.environ["TINIX_LOG_DIR"])
+    assert log_dir.name.startswith("tinix-facebook-hunter-pytest-")
+    assert log_dir.is_dir()
+    assert log_dir.resolve() != (get_workspace_root() / "logs").resolve()
+
+
+def test_pytest_session_logger_writes_only_to_the_isolated_directory():
+    marker = "pytest-session-log-isolation"
+    app_logger.error(marker)
+    log_files = list(Path(os.environ["TINIX_LOG_DIR"]).glob("app_*.log"))
+    assert log_files
+    assert any(marker in log_file.read_text(encoding="utf-8") for log_file in log_files)

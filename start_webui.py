@@ -1,7 +1,4 @@
-"""
-Tinix-Facebook-Hunter — WebUI Launcher
-Starts FastAPI on an available localhost port beginning at 7866 and opens the browser.
-"""
+"""Tinix-Facebook-Hunter WebUI launcher bound to its desktop App Mode port."""
 
 import os
 import sys
@@ -44,11 +41,18 @@ def is_port_in_use(port: int) -> bool:
         return s.connect_ex((HOST, port)) == 0
 
 
-def find_available_port(start_port: int = DEFAULT_PORT) -> int:
-    port = start_port
-    while is_port_in_use(port):
-        port += 1
-    return port
+def get_listen_port() -> int:
+    """Return the only port understood by the desktop launcher.
+
+    ``START.bat`` opens Chrome App Mode at ``DEFAULT_PORT``.  Falling back to a
+    different port would start a hidden backend while the visible application
+    still points at the unavailable default URL.
+    """
+    if is_port_in_use(DEFAULT_PORT):
+        raise RuntimeError(
+            f"Cổng {DEFAULT_PORT} đang được sử dụng. Dừng ứng dụng đang chiếm cổng rồi chạy lại Tinix."
+        )
+    return DEFAULT_PORT
 
 
 def open_browser(url: str):
@@ -57,12 +61,16 @@ def open_browser(url: str):
     webbrowser.open(url)
 
 
-def main():
-    port = find_available_port(DEFAULT_PORT)
+def main() -> int:
+    try:
+        port = get_listen_port()
+    except RuntimeError as exc:
+        print(f"[ERROR] {exc}", flush=True)
+        return 1
     url = f"http://{HOST}:{port}"
 
     print("=" * 60)
-    print(f"  ⚡ Tinix-Facebook-Hunter (Modern WebUI Hub) is starting...")
+    print("  ⚡ Tinix-Facebook-Hunter (Modern WebUI Hub) is starting...")
     print(f"  🌐 URL: {url}")
     print("=" * 60)
 
@@ -82,6 +90,8 @@ def main():
             log_level="warning",
             access_log=False
         )
+        print(f"[INFO] WebUI server đã dừng: {url}", flush=True)
+        return 0
     except BaseException as exc:
         print(f"UVICORN RUN CRASHED: {type(exc).__name__}: {exc}", flush=True)
         traceback.print_exc()
@@ -89,7 +99,8 @@ def main():
             sys.stdout.flush()
         if hasattr(sys.stderr, "flush"):
             sys.stderr.flush()
+        return 1
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

@@ -10,8 +10,18 @@ import sys
 def create_desktop_shortcut() -> bool:
     try:
         base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        start_vbs = os.path.join(base_dir, "START.vbs")
         start_bat = os.path.join(base_dir, "START.bat")
-        target_bat = start_bat if os.path.exists(start_bat) else os.path.join(base_dir, "Run.bat")
+        if os.path.exists(start_vbs):
+            target_exe = "wscript.exe"
+            arguments = f'//nologo "{start_vbs}"'
+        elif os.path.exists(start_bat):
+            target_exe = "cmd.exe"
+            arguments = f'/c "{start_bat}"'
+        else:
+            target_exe = "cmd.exe"
+            arguments = f'/c "{os.path.join(base_dir, "Run.bat")}"'
+
         icon_ico = os.path.join(base_dir, "assets", "icon.ico")
         desktop_dir = os.path.join(os.environ.get("USERPROFILE", ""), "Desktop")
 
@@ -20,15 +30,16 @@ def create_desktop_shortcut() -> bool:
 
         shortcut_path = os.path.join(desktop_dir, "Tinix-Facebook-Hunter.lnk")
 
-        # Use PowerShell script with WindowStyle = 7 (Minimized) so command window doesn't flash
+        # Create shortcut targeting wscript.exe or cmd.exe with arguments to allow Pin to Taskbar
         ps_script = f"""
 $ws = New-Object -ComObject WScript.Shell
 $s = $ws.CreateShortcut('{shortcut_path}')
-$s.TargetPath = '{target_bat}'
+$s.TargetPath = '{target_exe}'
+$s.Arguments = '{arguments}'
 $s.WorkingDirectory = '{base_dir}'
 $s.IconLocation = '{icon_ico},0'
 $s.Description = 'Tinix-Facebook-Hunter (App Mode)'
-$s.WindowStyle = 7
+$s.WindowStyle = 1
 $s.Save()
 """
         subprocess.run(

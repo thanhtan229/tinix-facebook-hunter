@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import shutil
 from pathlib import Path
 from typing import Iterable
@@ -67,31 +68,53 @@ def _delete_scraped_records(
     connection = _get_conn(db_path)
     try:
         connection.execute("BEGIN IMMEDIATE")
+        from utils import config
+        out_root = Path(config.get("output_dir", ".")).expanduser().resolve()
+
         if all_pages:
-            media_paths = [
-                row[0]
-                for row in connection.execute(
-                    "SELECT DISTINCT download_path FROM posts WHERE download_path != ''"
-                ).fetchall()
-            ]
+            post_rows = connection.execute(
+                "SELECT DISTINCT post_id, download_path FROM posts WHERE download_path != ''"
+            ).fetchall()
             posts_deleted = connection.execute("DELETE FROM posts").rowcount
             pages_deleted = connection.execute("DELETE FROM pages").rowcount
         else:
             placeholders = ",".join("?" for _ in urls)
-            media_paths = [
-                row[0]
-                for row in connection.execute(
-                    f"SELECT DISTINCT download_path FROM posts "
-                    f"WHERE page_url IN ({placeholders}) AND download_path != ''",
-                    urls,
-                ).fetchall()
-            ]
+            post_rows = connection.execute(
+                f"SELECT DISTINCT post_id, download_path FROM posts "
+                f"WHERE page_url IN ({placeholders}) AND download_path != ''",
+                urls,
+            ).fetchall()
             posts_deleted = connection.execute(
                 f"DELETE FROM posts WHERE page_url IN ({placeholders})", urls
             ).rowcount
             pages_deleted = connection.execute(
                 f"DELETE FROM pages WHERE page_url IN ({placeholders})", urls
             ).rowcount
+
+        media_paths = []
+        for pid, dl_path in post_rows:
+            clean_pid = re.sub(r"\D", "", str(pid or "")).strip() or str(pid or "").strip()
+            target_dir = Path(dl_path).expanduser().resolve() if dl_path else out_root
+            if not target_dir.exists():
+                target_dir = out_root
+            if target_dir.is_dir():
+                if target_dir != out_root:
+                    media_paths.append(str(target_dir))
+                else:
+                    if clean_pid:
+                        try:
+                            for item in target_dir.iterdir():
+                                if item.is_file() and (
+                                    item.stem == clean_pid
+                                    or item.name.startswith(f"{clean_pid}_")
+                                    or item.name.startswith(f"{clean_pid}.")
+                                ):
+                                    media_paths.append(str(item))
+                        except Exception:
+                            pass
+            elif target_dir.is_file():
+                media_paths.append(str(target_dir))
+
         if media_paths:
             media_placeholders = ",".join("?" for _ in media_paths)
             still_referenced = {
@@ -102,7 +125,7 @@ def _delete_scraped_records(
                     media_paths,
                 ).fetchall()
             }
-            media_paths = [path for path in media_paths if path not in still_referenced]
+            media_paths = [path for path in media_paths if path not in still_referenced and path != str(out_root)]
         connection.commit()
         return int(pages_deleted), int(posts_deleted), media_paths
     except Exception:

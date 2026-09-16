@@ -6,7 +6,12 @@ import sqlite3
 from datetime import datetime
 from pathlib import Path
 
-from core.db_storage import SCHEMA_VERSION, initialize_database
+from core.db_storage import (
+    SCHEMA_VERSION,
+    has_escaped_page_names,
+    initialize_database,
+    normalize_escaped_page_names,
+)
 
 
 def inspect_database(path: str | Path) -> dict[str, object]:
@@ -74,3 +79,13 @@ def restore_database(path: str | Path, backup: str | Path) -> str:
     if not restored["supported"]:
         raise RuntimeError("Restored database failed verification")
     return safety_backup
+
+
+def normalize_page_names_with_backup(path: str | Path) -> dict[str, object]:
+    """Back up first, then apply the idempotent legacy Page-name cleanup."""
+    database = Path(path).expanduser().resolve()
+    if not has_escaped_page_names(str(database)):
+        return {"changed": 0, "skipped": 0, "backup_path": ""}
+    backup_path = create_database_backup(database)
+    result = normalize_escaped_page_names(str(database))
+    return {**result, "backup_path": backup_path}

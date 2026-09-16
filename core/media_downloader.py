@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import threading
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
 from urllib.parse import urlparse
@@ -30,6 +31,32 @@ USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/120.0.0.0 Safari/537.36"
 )
+
+_download_result_local = threading.local()
+
+
+def _set_last_download_error(code: str = "", message: str = "") -> None:
+    """Store one worker-local result so the orchestrator can pace safely."""
+    _download_result_local.code = code
+    _download_result_local.message = message
+
+
+def get_last_download_error() -> tuple[str, str]:
+    """Return the latest media failure for the current download worker."""
+    return (
+        str(getattr(_download_result_local, "code", "") or ""),
+        str(getattr(_download_result_local, "message", "") or ""),
+    )
+
+
+def _http_error_code(status_code: int) -> str:
+    if status_code == 429:
+        return "RATE_LIMITED"
+    if status_code in {401, 403}:
+        return "MEDIA_ACCESS_DENIED"
+    if status_code == 404:
+        return "MEDIA_URL_EXPIRED"
+    return "MEDIA_HTTP_ERROR"
 
 
 def save_text_content(text: str, save_path: Path) -> bool:
@@ -72,6 +99,7 @@ def download_image(
     Returns:
         True if download was successful.
     """
+    _set_last_download_error()
     try:
         save_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -102,6 +130,7 @@ def download_image(
         # Verify file is not empty
         if save_path.stat().st_size < 100:
             logger.warning(f"Ảnh tải về quá nhỏ, có thể bị lỗi: {save_path.name}")
+            _set_last_download_error("MEDIA_ACCESS_DENIED", "Ảnh tải về quá nhỏ hoặc bị Facebook chặn.")
             return False
 
         logger.info(f"Đã tải ảnh: {save_path.name} ({_format_size(save_path.stat().st_size)})")
@@ -109,12 +138,18 @@ def download_image(
 
     except httpx.HTTPStatusError as e:
         logger.error(f"Lỗi HTTP {e.response.status_code} khi tải ảnh: {save_path.name}")
+        _set_last_download_error(
+            _http_error_code(e.response.status_code),
+            f"Tải ảnh nhận HTTP {e.response.status_code}.",
+        )
         return False
     except httpx.TimeoutException:
         logger.error(f"Hết thời gian chờ khi tải ảnh: {save_path.name}")
+        _set_last_download_error("NETWORK_TIMEOUT", "Tải ảnh quá thời gian chờ.")
         return False
     except Exception as e:
         logger.error(f"Lỗi tải ảnh {save_path.name}: {str(e)[:100]}")
+        _set_last_download_error("DOWNLOAD_FAILED", f"Tải ảnh lỗi: {str(e)[:100]}")
         return False
 
 
@@ -137,6 +172,7 @@ def download_video_direct(
     Returns:
         True if download was successful.
     """
+    _set_last_download_error()
     try:
         save_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -180,10 +216,12 @@ def download_video_direct(
                 if "<html" in content.lower() or "error" in content.lower():
                     logger.error("File tải về là trang lỗi, không phải video")
                     save_path.unlink(missing_ok=True)
+                    _set_last_download_error("MEDIA_ACCESS_DENIED", "Facebook trả về trang lỗi thay vì video.")
                     return False
             except Exception:
                 pass
             save_path.unlink(missing_ok=True)
+            _set_last_download_error("MEDIA_ACCESS_DENIED", "Video tải về quá nhỏ hoặc không hợp lệ.")
             return False
 
         logger.info(f"Đã tải video: {save_path.name} ({_format_size(file_size)})")
@@ -191,12 +229,18 @@ def download_video_direct(
 
     except httpx.HTTPStatusError as e:
         logger.error(f"Lỗi HTTP {e.response.status_code} khi tải video: {save_path.name}")
+        _set_last_download_error(
+            _http_error_code(e.response.status_code),
+            f"Tải video nhận HTTP {e.response.status_code}.",
+        )
         return False
     except httpx.TimeoutException:
         logger.error(f"Hết thời gian chờ khi tải video")
+        _set_last_download_error("NETWORK_TIMEOUT", "Tải video quá thời gian chờ.")
         return False
     except Exception as e:
         logger.error(f"Lỗi tải video {save_path.name}: {str(e)[:100]}")
+        _set_last_download_error("DOWNLOAD_FAILED", f"Tải video lỗi: {str(e)[:100]}")
         return False
 
 
@@ -205,6 +249,7 @@ def download_video(
     save_dir: Path,
     cookies: Dict[str, str],
     progress_callback: Optional[Callable] = None,
+    post_id: Optional[str] = None,
 ) -> bool:
     """
     Download video from a Facebook post using yt-dlp.
@@ -214,10 +259,12 @@ def download_video(
         save_dir: Directory to save the video.
         cookies: Facebook cookies for authentication.
         progress_callback: Optional callback(status_text).
+        post_id: Optional numeric post ID for flat file naming.
 
     Returns:
         True if download was successful.
     """
+    _set_last_download_error()
     try:
         save_dir.mkdir(parents=True, exist_ok=True)
 
@@ -238,7 +285,11 @@ def download_video(
             cookie_file.close()
 
             # Build yt-dlp command
-            output_template = str(save_dir / "video_%(autonumber)03d.%(ext)s")
+            clean_pid = re.sub(r"\D", "", str(post_id or "")).strip()
+            if clean_pid:
+                output_template = str(save_dir / f"{clean_pid}.%(ext)s")
+            else:
+                output_template = str(save_dir / "video_%(autonumber)03d.%(ext)s")
 
             cmd = [
                 _get_ytdlp_path(),
@@ -248,7 +299,7 @@ def download_video(
                 "--merge-output-format", "mp4",
                 "--no-warnings",
                 "--no-check-certificates",
-                "--retries", "3",
+                "--retries", "1",
                 "--user-agent", USER_AGENT,
                 post_url,
             ]
@@ -269,17 +320,29 @@ def download_video(
 
             if result.returncode == 0:
                 # Find downloaded video files
-                video_files = list(save_dir.glob("video_*"))
+                video_exts = {".mp4", ".mov", ".webm", ".avi", ".mkv", ".m4v"}
+                if clean_pid:
+                    video_files = [
+                        vf for vf in save_dir.glob(f"{clean_pid}*")
+                        if vf.is_file() and vf.suffix.lower() in video_exts
+                    ]
+                else:
+                    video_files = list(save_dir.glob("video_*"))
+
                 if video_files:
                     for vf in video_files:
                         logger.info(f"Đã tải video: {vf.name} ({_format_size(vf.stat().st_size)})")
                     return True
                 else:
                     logger.warning("yt-dlp hoàn thành nhưng không tìm thấy file video")
+                    _set_last_download_error("DOWNLOAD_FAILED", "yt-dlp không tạo được file video.")
                     return False
             else:
                 error_msg = result.stderr.strip()[:200] if result.stderr else "Unknown error"
                 logger.error(f"yt-dlp thất bại: {error_msg}")
+                lowered = error_msg.lower()
+                code = "RATE_LIMITED" if any(marker in lowered for marker in ("429", "too many requests", "rate limit", "try again later")) else "DOWNLOAD_FAILED"
+                _set_last_download_error(code, f"yt-dlp thất bại: {error_msg}")
                 return False
 
         finally:
@@ -292,12 +355,15 @@ def download_video(
 
     except subprocess.TimeoutExpired:
         logger.error("Tải video quá thời gian (> 10 phút)")
+        _set_last_download_error("NETWORK_TIMEOUT", "yt-dlp quá thời gian tải video.")
         return False
     except FileNotFoundError:
         logger.error("Không tìm thấy yt-dlp. Đảm bảo yt-dlp đã được cài đặt.")
+        _set_last_download_error("DOWNLOADER_UNAVAILABLE", "Không tìm thấy yt-dlp.")
         return False
     except Exception as e:
         logger.error(f"Lỗi tải video: {str(e)[:200]}")
+        _set_last_download_error("DOWNLOAD_FAILED", f"yt-dlp lỗi: {str(e)[:200]}")
         return False
 
 
@@ -317,13 +383,13 @@ def _get_extension_from_url(url: str) -> Optional[str]:
     parsed = urlparse(url)
     path = parsed.path.lower()
 
-    for ext in (".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"):
+    for ext in (".jpeg", ".jpg", ".png", ".gif", ".webp", ".bmp"):
         if path.endswith(ext):
             return ext
 
     # Check for Facebook CDN URLs that may have extension in query
     if "scontent" in url:
-        return ".jpg"  # Facebook images are typically JPEG
+        return ".jpeg"  # Facebook images are typically JPEG
 
     return None
 

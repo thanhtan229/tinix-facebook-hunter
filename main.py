@@ -32,7 +32,7 @@ if sys.stderr is None:
     except Exception:
         sys.stderr = open(os.devnull, "w", encoding="utf-8")
 
-from start_webui import main
+from start_webui import main  # noqa: E402 - pythonw streams must be configured before importing the launcher.
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

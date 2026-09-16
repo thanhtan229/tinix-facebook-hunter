@@ -1,18 +1,28 @@
 import threading
 import time
+from uuid import uuid4
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from fastapi import APIRouter, HTTPException
 from pydantic import Field, HttpUrl, model_validator
 from typing import List, Literal, Optional
 from core.page_scraper import PageScraper, is_valid_facebook_page_name
 from core.page_search import PageSearchEngine
+from core.account_preflight import check_facebook_account
+from core.profile_lease import (
+    ProfileLeaseConflict,
+    acquire_profile_leases,
+    profile_lease_owner,
+    release_profile_leases,
+)
 from core.db_storage import (
+    create_task_run,
     create_favorite_page_group,
     delete_favorite_page,
     delete_favorite_pages,
     delete_favorite_page_group,
     finish_favorite_scan,
     finish_favorite_archive_scan,
+    finish_task_run,
     get_all_accounts,
     get_favorite_page,
     get_favorite_page_groups,
@@ -25,6 +35,7 @@ from core.db_storage import (
     reset_favorite_cursor,
     reset_favorite_cursors,
     save_favorite_page,
+    save_account_preflight_result,
     save_posts,
     update_favorite_group_members,
     update_favorite_page_group,
@@ -39,6 +50,9 @@ _scraper_thread: Optional[threading.Thread] = None
 _active_scraper: Optional[PageScraper] = None
 _active_favorite_scrapers: dict[str, PageScraper] = {}
 _favorite_worker_stop_events: dict[str, threading.Event] = {}
+_active_task_run_id = 0
+_active_profile_lease_owner = ""
+_active_profile_lease_keys: set[str] = set()
 _scrape_lock = threading.RLock()
 _stop_requested = threading.Event()
 _scrape_status = {
@@ -49,6 +63,8 @@ _scrape_status = {
     "elapsed": 0,
     "queue_total": 0,
     "queue_completed": 0,
+    "queue_successful": 0,
+    "queue_failed": 0,
     "current_favorite_id": 0,
     "new_posts": 0,
     "task_type": "",
@@ -62,6 +78,71 @@ _scrape_status = {
 def scrape_is_running() -> bool:
     with _scrape_lock:
         return bool(_scrape_status["is_running"])
+
+
+def _finish_scrape_task_run(status: str, saved_posts: int = 0, error: str = "") -> None:
+    """Persist a compact, credential-free summary when a scan coordinator ends."""
+    global _active_task_run_id
+    if not _active_task_run_id:
+        return
+    with _scrape_lock:
+        completed = int(_scrape_status.get("queue_completed", 0))
+        successful = int(_scrape_status.get("queue_successful", 0))
+        failed = int(_scrape_status.get("queue_failed", 0))
+    finish_task_run(
+        get_db_path(config.get("scraper_db_path", "")),
+        _active_task_run_id,
+        status,
+        completed_items=completed,
+        successful_items=successful,
+        failed_items=failed,
+        error_message=error or ("" if status == "completed" else f"Đã lưu {saved_posts} bài"),
+    )
+    _active_task_run_id = 0
+
+
+def _record_scrape_page_result(success: Optional[bool]) -> None:
+    """Count a processed Page once; worker state is not a Page-level outcome."""
+    with _scrape_lock:
+        _scrape_status["queue_completed"] += 1
+        if success is True:
+            _scrape_status["queue_successful"] += 1
+        elif success is False:
+            _scrape_status["queue_failed"] += 1
+
+
+def _release_scrape_profile_leases() -> None:
+    global _active_profile_lease_owner, _active_profile_lease_keys
+    if _active_profile_lease_keys:
+        release_profile_leases(_active_profile_lease_owner, _active_profile_lease_keys)
+        _active_profile_lease_owner = ""
+        _active_profile_lease_keys = set()
+
+
+def _preflight_scrape_queues(db_path: str, queues: List[dict]) -> None:
+    """Check assigned accounts before a scan uses their Chrome profile."""
+    for queue in queues:
+        if _stop_requested.is_set() or queue.get("account_error"):
+            continue
+        account = queue.get("account")
+        if not account:
+            continue
+        worker_id = queue["worker_id"]
+        _update_favorite_worker(worker_id, status="Đang kiểm tra", error="")
+        result = check_facebook_account(account)
+        checked_at = save_account_preflight_result(
+            db_path,
+            int(account.get("id") or 0),
+            code=result.code,
+            message=result.message,
+        )
+        if result.ready:
+            _update_favorite_worker(worker_id, status="Đang chờ", error="")
+            log_to_web(f"[{queue['account_label']}] Preflight sẵn sàng ({checked_at or 'chưa lưu'}).", "OK")
+            continue
+        queue["account_error"] = result.message
+        _update_favorite_worker(worker_id, status="Không sẵn sàng", error=result.message)
+        log_to_web(f"[{queue['account_label']}] Preflight thất bại: {result.message}", "WARNING")
 
 
 def _resolve_scraped_page_name(
@@ -85,7 +166,7 @@ class ScrapeStartRequest(ApiRequest):
     account_mode: Literal["auto", "default", "specific"] = "auto"
     account_id: Optional[int] = Field(default=None, gt=0)
     max_concurrency: int = Field(default=2, ge=1, le=8)
-    download_media: Optional[bool] = False
+    download_media: Optional[bool] = True
 
     @model_validator(mode="after")
     def validate_batch(self):
@@ -147,7 +228,7 @@ class FavoriteScanRequest(ApiRequest):
     account_id: Optional[int] = Field(default=None, gt=0)
     max_concurrency: int = Field(default=2, ge=1, le=8)
     scan_limit: int = Field(default=100, ge=5, le=2000)
-    download_media: bool = False
+    download_media: bool = True
     scan_direction: Literal["new", "older"] = "new"
     delay_mode: Literal["fast", "balanced", "cautious"] = "balanced"
 
@@ -199,9 +280,21 @@ def _run_page_search(
     """Run discovery in the same exclusive browser-task lane as page scraping."""
     global _active_scraper, _scrape_status
     scraper = PageSearchEngine(account=account)
+    final_status = "completed"
+    results: List[dict] = []
+    error_message = ""
     try:
         with _scrape_lock:
             _active_scraper = scraper
+        if account:
+            preflight = check_facebook_account(account)
+            checked_at = save_account_preflight_result(
+                get_db_path(config.get("scraper_db_path", "")),
+                int(account.get("id") or 0), code=preflight.code, message=preflight.message,
+            )
+            if not preflight.ready:
+                raise RuntimeError(preflight.message)
+            log_to_web(f"[{_account_label(account)}] Preflight sẵn sàng ({checked_at or 'chưa lưu'}).", "OK")
         log_to_web(f"Tìm Fanpage với từ khóa: {keyword}", "INFO")
         if not scraper.start():
             raise RuntimeError("Không thể khởi động Chrome")
@@ -219,11 +312,14 @@ def _run_page_search(
             _scrape_status["search_results"] = results
             _scrape_status["posts_found"] = len(results)
         if _stop_requested.is_set():
+            final_status = "stopped"
             log_to_web(f"Đã dừng tìm kiếm; giữ lại {len(results)} kết quả.", "WARNING")
         else:
             log_to_web(f"✅ Đã tìm thấy {len(results)} Fanpage.", "OK")
     except Exception as exc:
         message = str(exc)[:500]
+        error_message = message
+        final_status = "stopped" if _stop_requested.is_set() else "failed"
         if not _stop_requested.is_set():
             logger.exception("Lỗi tìm kiếm Fanpage", exc)
             log_to_web(f"Lỗi tìm Fanpage: {message}", "ERROR")
@@ -237,15 +333,28 @@ def _run_page_search(
         with _scrape_lock:
             _scrape_status["is_running"] = False
             _active_scraper = None
-        progress_to_web("page_search", 100, 100, "", "completed")
+            _scrape_status["queue_completed"] = len(results)
+            _scrape_status["queue_successful"] = len(results)
+            _scrape_status["queue_failed"] = 0 if final_status != "failed" else 1
+        progress_to_web("page_search", 100, 100, "", final_status)
+        _finish_scrape_task_run(final_status, error=error_message)
+        _release_scrape_profile_leases()
 
 
 def _downloadable_post_urls(posts: List[object]) -> List[str]:
-    """Return unique Facebook post URLs produced by a completed scrape."""
+    """Return unique post URLs keyed by the stable ID persisted in Post Spy."""
     urls: List[str] = []
     seen: set[str] = set()
     for post in posts:
-        url = str(getattr(post, "url", "") or "").strip()
+        post_id = str(getattr(post, "post_id", "") or "").strip()
+        # Scanner video links often use ``watch/?v=<video_id>`` while the
+        # database is keyed by the post ID.  A direct numeric URL lets the
+        # downloader resolve that same DB row and update its status correctly.
+        url = (
+            f"https://www.facebook.com/{post_id}"
+            if post_id.isdigit()
+            else str(getattr(post, "url", "") or "").strip()
+        )
         if url and url not in seen:
             seen.add(url)
             urls.append(url)
@@ -253,21 +362,15 @@ def _downloadable_post_urls(posts: List[object]) -> List[str]:
 
 
 def _start_auto_download(urls: List[str], accounts: Optional[List[dict]] = None) -> bool:
-    """Hand one deduplicated scrape result batch to the existing downloader."""
+    """Hand one deduplicated scrape result batch to the downloader account pool."""
     unique_urls = list(dict.fromkeys(str(url).strip() for url in urls if str(url).strip()))
     if not unique_urls:
         return False
     try:
-        from web.routes.downloader import orchestrator
-
-        if orchestrator.is_running:
-            log_to_web(
-                f"Auto Download bỏ qua {len(unique_urls)} bài vì một tác vụ Download khác đang chạy.",
-                "WARNING",
-            )
-            return False
-        out_dir = config.get("output_dir", ".") or "."
-        max_threads = max(1, min(int(config.get("max_threads", 4) or 4), 20))
+        from web.routes.downloader import enqueue_auto_download
+        # A scan-owned pool must stay exclusive to this batch.  Adding every
+        # configured account here would lease unrelated profiles and prevent a
+        # following scan from creating its own FIFO download batch.
         active_accounts = [
             account for account in (accounts or []) if account and account.get("is_active", 1)
         ]
@@ -281,22 +384,8 @@ def _start_auto_download(urls: List[str], accounts: Optional[List[dict]] = None)
             key = account.get("id") or account.get("profile_dir") or account.get("username")
             unique_accounts[key] = account
         active_accounts = list(unique_accounts.values())
-        urls_text = "\n".join(unique_urls)
-        if active_accounts:
-            orchestrator.start_with_accounts(
-                urls_text=urls_text,
-                accounts=active_accounts,
-                output_dir=out_dir,
-                max_threads=max_threads,
-            )
-        else:
-            orchestrator.start(
-                urls_text=urls_text,
-                cookie_string=config.get("saved_cookies", ""),
-                output_dir=out_dir,
-                max_threads=max_threads,
-            )
-        if orchestrator.is_running:
+        account_ids = [int(account.get("id") or 0) for account in active_accounts]
+        if enqueue_auto_download(unique_urls, account_ids):
             log_to_web(f"⬇ Auto Download đã nhận {len(unique_urls)} bài vừa quét.", "OK")
             return True
         log_to_web("Auto Download không thể khởi động; hãy kiểm tra Account hoặc cookie tải.", "WARNING")
@@ -315,6 +404,7 @@ def _run_scrape_worker(
 
     db_p = get_db_path(config.get("scraper_db_path", ""))
     auto_download_urls: List[str] = []
+    final_status = "completed"
     log_to_web(f"Khởi động trình duyệt quét Page: {page_url} (tối đa {limit} bài)...", "INFO")
 
     try:
@@ -323,6 +413,7 @@ def _run_scrape_worker(
             _active_scraper = scraper
 
         if not scraper.start():
+            final_status = "failed"
             log_to_web("Không thể khởi động Chrome cho tác vụ quét Page.", "ERROR")
             return
 
@@ -367,9 +458,11 @@ def _run_scrape_worker(
             scan_label = "bài cũ" if mode == "Older Posts" else "bài viết"
             log_to_web(f"✅ Đã quét xong {len(posts)} {scan_label}! Đã lưu {saved_count} bài vào cơ sở dữ liệu.", "OK")
         else:
+            final_status = "stopped" if _stop_requested.is_set() else "partial"
             log_to_web("Không tìm thấy bài viết nào hoặc quá trình bị hủy.", "WARNING")
 
     except Exception as e:
+        final_status = "failed"
         logger.exception("Lỗi trong tác vụ quét Page", e)
         log_to_web(f"Lỗi khi quét: {str(e)}", "ERROR")
     finally:
@@ -381,7 +474,7 @@ def _run_scrape_worker(
         with _scrape_lock:
             _scrape_status["is_running"] = False
             _active_scraper = None
-        progress_to_web("scraper", 100, 100, "", "completed")
+        progress_to_web("scraper", 100, 100, "", final_status)
         if auto_download_urls and not _stop_requested.is_set():
             _start_auto_download(auto_download_urls, [account] if account else [])
 
@@ -398,6 +491,10 @@ def _build_quick_queues(
 ) -> List[dict]:
     """Distribute transient Page URLs so one Account owns at most one worker."""
     active_accounts = [item for item in accounts if item.get("is_active", 1)]
+    if account_mode == "auto":
+        available_accounts = [item for item in active_accounts if not profile_lease_owner(item)]
+        if available_accounts:
+            active_accounts = available_accounts
     if account_mode == "specific":
         selected = next((item for item in active_accounts if item.get("id") == account_id), None)
         return [{"worker_id": f"account-{account_id}", "account": selected,
@@ -422,6 +519,17 @@ def _run_quick_worker(queue: dict) -> int:
     stop_event = _favorite_worker_stop_events[worker_id]
     total_saved = 0
     worker_failed = False
+    if queue.get("account_error"):
+        _update_favorite_worker(worker_id, status="Không sẵn sàng", error=queue["account_error"])
+        log_to_web(f"[{queue['account_label']}] Bỏ qua hàng đợi: {queue['account_error']}", "WARNING")
+        for _ in queue.get("page_urls", []):
+            _record_scrape_page_result(False)
+        _update_favorite_worker(
+            worker_id,
+            queue_completed=len(queue.get("page_urls", [])),
+            posts_found=0,
+        )
+        return 0
     _update_favorite_worker(worker_id, status="Đang chạy")
 
     for position, page_url in enumerate(queue["page_urls"], start=1):
@@ -436,6 +544,7 @@ def _run_quick_worker(queue: dict) -> int:
             f"🔍 [{queue['account_label']}] {position}/{len(queue['page_urls'])} · {page_url}", "INFO"
         )
         scraper = PageScraper(account=account)
+        page_outcome: Optional[bool] = None
         with _scrape_lock:
             _active_favorite_scrapers[worker_id] = scraper
         try:
@@ -481,10 +590,12 @@ def _run_quick_worker(queue: dict) -> int:
             else:
                 log_to_web(f"Không tìm thấy bài viết tại {page_url}.", "WARNING")
             total_saved += saved_count
+            page_outcome = not (_stop_requested.is_set() or stop_event.is_set())
             with _scrape_lock:
                 _scrape_status["new_posts"] += saved_count
         except Exception as exc:
             worker_failed = True
+            page_outcome = False
             _update_favorite_worker(worker_id, error=str(exc)[:200])
             log_to_web(f"Lỗi quét {page_url}: {str(exc)[:180]}", "ERROR")
         finally:
@@ -493,8 +604,8 @@ def _run_quick_worker(queue: dict) -> int:
             except Exception:
                 pass
             with _scrape_lock:
-                _scrape_status["queue_completed"] += 1
                 _active_favorite_scrapers.pop(worker_id, None)
+            _record_scrape_page_result(page_outcome)
             _update_favorite_worker(worker_id, queue_completed=position, new_posts=total_saved)
 
     stopped = _stop_requested.is_set() or stop_event.is_set()
@@ -507,7 +618,11 @@ def _run_quick_worker(queue: dict) -> int:
 
 def _run_quick_parallel(queues: List[dict], max_concurrency: int, download_media: bool) -> None:
     total_saved = 0
+    worker_failed = False
     try:
+        if any(queue.get("requires_preflight") for queue in queues):
+            db_p = get_db_path(config.get("scraper_db_path", ""))
+            _preflight_scrape_queues(db_p, queues)
         with ThreadPoolExecutor(
             max_workers=max(1, min(max_concurrency, len(queues))),
             thread_name_prefix="quick-scan",
@@ -517,14 +632,25 @@ def _run_quick_parallel(queues: List[dict], max_concurrency: int, download_media
                 try:
                     total_saved += int(future.result() or 0)
                 except Exception as exc:
+                    worker_failed = True
                     logger.exception("Lỗi hàng đợi quét nhanh", exc)
     finally:
         with _scrape_lock:
+            worker_failed = worker_failed or any(
+                worker.get("status") in {"Lỗi", "Không sẵn sàng"}
+                for worker in _scrape_status.get("workers", {}).values()
+            ) or _scrape_status["queue_completed"] > _scrape_status["queue_successful"]
             _scrape_status["is_running"] = False
             _active_favorite_scrapers.clear()
             _favorite_worker_stop_events.clear()
-        progress_to_web("scraper", 100, 100, "", "completed")
-        log_to_web(f"Hoàn tất quét nhanh nhiều Page: đã lưu {total_saved} bài.", "OK")
+        final_status = "stopped" if _stop_requested.is_set() else ("partial" if worker_failed else "completed")
+        progress_to_web("scraper", 100, 100, "", final_status)
+        log_to_web(
+            f"Hoàn tất quét nhanh nhiều Page: đã lưu {total_saved} bài.",
+            "WARNING" if final_status != "completed" else "OK",
+        )
+        _finish_scrape_task_run(final_status, total_saved)
+        _release_scrape_profile_leases()
         if download_media and not _stop_requested.is_set():
             urls = [url for queue in queues for url in queue.get("download_urls", [])]
             used_accounts = [queue.get("account") for queue in queues if queue.get("account")]
@@ -537,6 +663,10 @@ def _build_favorite_queues(
 ) -> List[dict]:
     """Group pages into fair per-account queues; a profile never has two workers."""
     active_accounts = [item for item in accounts if item.get("is_active", 1)]
+    if account_mode == "auto":
+        available_accounts = [item for item in active_accounts if not profile_lease_owner(item)]
+        if available_accounts:
+            active_accounts = available_accounts
     account_by_id = {int(item["id"]): item for item in accounts}
     queues: dict[str, dict] = {}
 
@@ -621,8 +751,7 @@ def _run_favorite_worker(queue: dict) -> int:
                 error=queue["account_error"],
             )
             _update_favorite_worker(worker_id, error=queue["account_error"])
-            with _scrape_lock:
-                _scrape_status["queue_completed"] += 1
+            _record_scrape_page_result(False)
             _update_favorite_worker(worker_id, queue_completed=position)
             continue
 
@@ -630,11 +759,13 @@ def _run_favorite_worker(queue: dict) -> int:
             f"⭐ [{queue['account_label']}] {position}/{len(favorite_ids)} · {page_label}", "INFO"
         )
         scraper = PageScraper(account=account)
+        page_outcome: Optional[bool] = None
         with _scrape_lock:
             _active_favorite_scrapers[worker_id] = scraper
         try:
             if not scraper.start():
                 worker_failed = True
+                page_outcome = False
                 finish_favorite_scan(
                     db_p, favorite_id, status="Lỗi", new_posts=0,
                     error="Không thể khởi động Chrome",
@@ -690,6 +821,8 @@ def _run_favorite_worker(queue: dict) -> int:
             stopped = _stop_requested.is_set() or stop_event.is_set() or reason == "stopped"
             if queue.get("download_media") and saved_count and not stopped:
                 queue.setdefault("download_urls", []).extend(_downloadable_post_urls(posts))
+            # A stopped or cursor-limited scan has no terminal Page result.
+            page_outcome = True if complete and not stopped else None
 
             if scan_direction == "older":
                 archive_ids = [post.post_id for post in posts if post.post_id]
@@ -745,6 +878,7 @@ def _run_favorite_worker(queue: dict) -> int:
                 )
         except Exception as exc:
             worker_failed = True
+            page_outcome = False
             logger.exception("Lỗi quét Fanpage yêu thích", exc)
             finish_favorite_scan(
                 db_p, favorite_id, status="Lỗi", new_posts=0, error=str(exc)[:500],
@@ -757,7 +891,6 @@ def _run_favorite_worker(queue: dict) -> int:
                 pass
             with _scrape_lock:
                 _active_favorite_scrapers.pop(worker_id, None)
-                _scrape_status["queue_completed"] += 1
                 _scrape_status["new_posts"] += total_new - int(
                     _scrape_status["workers"][worker_id].get("new_posts", 0)
                 )
@@ -765,6 +898,7 @@ def _run_favorite_worker(queue: dict) -> int:
                 worker_id, queue_completed=position, new_posts=total_new,
                 current_favorite_id=0,
             )
+            _record_scrape_page_result(page_outcome)
 
     stopped = _stop_requested.is_set() or stop_event.is_set()
     final_status = "Đã dừng" if stopped else ("Lỗi" if worker_failed else "Hoàn tất")
@@ -781,7 +915,11 @@ def _run_favorite_parallel(
     """Coordinate independent per-account queues with a bounded worker pool."""
     global _active_favorite_scrapers
     total_new = 0
+    worker_failed = False
     try:
+        if any(queue.get("requires_preflight") for queue in queues):
+            db_p = get_db_path(config.get("scraper_db_path", ""))
+            _preflight_scrape_queues(db_p, queues)
         worker_limit = max(1, min(max_concurrency, len(queues)))
         with ThreadPoolExecutor(max_workers=worker_limit, thread_name_prefix="favorite-scan") as pool:
             futures = [pool.submit(_run_favorite_worker, queue) for queue in queues]
@@ -789,16 +927,24 @@ def _run_favorite_parallel(
                 try:
                     total_new += int(future.result() or 0)
                 except Exception as exc:
+                    worker_failed = True
                     logger.exception("Lỗi hàng đợi Account", exc)
     finally:
         with _scrape_lock:
+            worker_failed = worker_failed or any(
+                worker.get("status") in {"Lỗi", "Không sẵn sàng"}
+                for worker in _scrape_status.get("workers", {}).values()
+            ) or _scrape_status["queue_completed"] > _scrape_status["queue_successful"]
             _scrape_status["is_running"] = False
             _scrape_status["current_favorite_id"] = 0
             _active_favorite_scrapers.clear()
             _favorite_worker_stop_events.clear()
-        progress_to_web("scraper", 100, 100, "", "completed")
-        level = "WARNING" if _stop_requested.is_set() else "OK"
+        final_status = "stopped" if _stop_requested.is_set() else ("partial" if worker_failed else "completed")
+        progress_to_web("scraper", 100, 100, "", final_status)
+        level = "WARNING" if final_status != "completed" else "OK"
         log_to_web(f"Hoàn tất các hàng đợi yêu thích: {total_new} bài mới.", level)
+        _finish_scrape_task_run(final_status, total_new)
+        _release_scrape_profile_leases()
         if download_media and not _stop_requested.is_set():
             urls = [url for queue in queues for url in queue.get("download_urls", [])]
             accounts = [queue.get("account") for queue in queues if queue.get("account")]
@@ -830,7 +976,7 @@ def _run_favorite_queue(
 @router.post("/start")
 def start_scrape(req: ScrapeStartRequest):
     """Start one or many Page scans using bounded per-account queues."""
-    global _scraper_thread
+    global _active_task_run_id, _scraper_thread, _active_profile_lease_owner, _active_profile_lease_keys
     page_urls = list(dict.fromkeys(
         [str(value) for value in req.page_urls]
         + ([str(req.page_url)] if req.page_url else [])
@@ -858,11 +1004,32 @@ def start_scrape(req: ScrapeStartRequest):
             "mode": req.mode or "All", "scan_limit": limit,
             "delay_profile": DELAY_PROFILES[req.delay_mode],
             "download_media": bool(req.download_media), "download_urls": [],
+            "requires_preflight": True,
         })
 
     with _scrape_lock:
         if _scrape_status["is_running"]:
             raise HTTPException(status_code=400, detail="Tác vụ quét Page đang chạy rồi!")
+        _active_profile_lease_owner = f"scrape-{uuid4().hex[:8]}"
+        try:
+            _active_profile_lease_keys = acquire_profile_leases(
+                _active_profile_lease_owner, [queue.get("account") for queue in queues]
+            )
+        except ProfileLeaseConflict as exc:
+            _active_profile_lease_owner = ""
+            _active_profile_lease_keys = set()
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        _active_task_run_id = create_task_run(
+            db_p,
+            "scrape_quick",
+            total_items=len(page_urls),
+            summary={
+                "workers": worker_count,
+                "scan_limit": limit,
+                "download_media": bool(req.download_media),
+                "account_mode": req.account_mode,
+            },
+        )
         _scrape_status.update({
             "is_running": True,
             "current_page": "",
@@ -870,6 +1037,8 @@ def start_scrape(req: ScrapeStartRequest):
             "start_time": time.time(),
             "queue_total": len(page_urls),
             "queue_completed": 0,
+            "queue_successful": 0,
+            "queue_failed": 0,
             "current_favorite_id": 0,
             "new_posts": 0,
             "task_type": "quick_batch",
@@ -926,6 +1095,16 @@ def stop_scrape():
     if is_running:
         return {"status": "success", "message": "Tác vụ đang khởi động; lệnh dừng sẽ khả dụng sau ít giây"}
     return {"status": "success", "message": "Không có tác vụ nào đang chạy"}
+
+
+def shutdown_scraper(timeout_seconds: float = 5.0) -> None:
+    """Request worker-owned browsers to stop during application shutdown."""
+    stop_scrape()
+    thread = _scraper_thread
+    if thread and thread is not threading.current_thread() and thread.is_alive():
+        thread.join(timeout=max(0.0, float(timeout_seconds)))
+    if thread and thread.is_alive():
+        log_to_web("Quét Page chưa dừng kịp khi đóng app; tác vụ sẽ được đánh dấu gián đoạn.", "WARNING")
 
 @router.get("/status")
 def get_scrape_status():
@@ -1079,7 +1258,7 @@ def batch_reset_favorite_cursor_endpoint(req: FavoriteBatchActionRequest):
 
 @router.post("/favorites/scan")
 def scan_favorite_pages(req: FavoriteScanRequest):
-    global _scraper_thread
+    global _active_task_run_id, _scraper_thread, _active_profile_lease_owner, _active_profile_lease_keys
     db_p = get_db_path(config.get("scraper_db_path", ""))
     available = {item["id"]: item for item in get_favorite_pages(db_p, active_only=True)}
     requested_ids = list(dict.fromkeys(int(value) for value in req.favorite_ids))
@@ -1109,17 +1288,40 @@ def scan_favorite_pages(req: FavoriteScanRequest):
     for queue in queues:
         queue["download_media"] = req.download_media
         queue["download_urls"] = []
+        queue["requires_preflight"] = True
         queue["scan_direction"] = req.scan_direction
         queue["scan_limit"] = req.scan_limit
         queue["delay_profile"] = DELAY_PROFILES[req.delay_mode]
     with _scrape_lock:
         if _scrape_status["is_running"]:
             raise HTTPException(status_code=409, detail="Tác vụ quét Page đang chạy")
+        _active_profile_lease_owner = f"scrape-{uuid4().hex[:8]}"
+        try:
+            _active_profile_lease_keys = acquire_profile_leases(
+                _active_profile_lease_owner, [queue.get("account") for queue in queues]
+            )
+        except ProfileLeaseConflict as exc:
+            _active_profile_lease_owner = ""
+            _active_profile_lease_keys = set()
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        _active_task_run_id = create_task_run(
+            db_p,
+            "scrape_favorites",
+            total_items=len(favorite_ids),
+            summary={
+                "workers": worker_count,
+                "scan_limit": req.scan_limit,
+                "download_media": bool(req.download_media),
+                "scan_direction": req.scan_direction,
+                "account_mode": req.account_mode,
+            },
+        )
         _stop_requested.clear()
         _scrape_status.update({
             "is_running": True, "current_page": "", "posts_found": 0,
             "start_time": time.time(), "queue_total": len(favorite_ids),
             "queue_completed": 0, "current_favorite_id": 0, "new_posts": 0,
+            "queue_successful": 0, "queue_failed": 0,
             "task_type": "favorites", "keyword": "", "error": "", "search_results": [],
             "workers": {
                 queue["worker_id"]: {
@@ -1182,7 +1384,7 @@ def stop_favorite_worker(req: FavoriteWorkerStopRequest):
 @router.post("/search/start")
 def start_page_search(req: PageSearchRequest):
     """Start an authenticated Facebook Page discovery task."""
-    global _scraper_thread
+    global _active_task_run_id, _scraper_thread, _active_profile_lease_owner, _active_profile_lease_keys
     keyword = req.keyword.strip()
     if not keyword:
         raise HTTPException(status_code=422, detail="Từ khóa không được để trống")
@@ -1202,10 +1404,22 @@ def start_page_search(req: PageSearchRequest):
     with _scrape_lock:
         if _scrape_status["is_running"]:
             raise HTTPException(status_code=409, detail="Một tác vụ Facebook khác đang chạy")
+        _active_profile_lease_owner = f"page-search-{uuid4().hex[:8]}"
+        try:
+            _active_profile_lease_keys = acquire_profile_leases(_active_profile_lease_owner, [account])
+        except ProfileLeaseConflict as exc:
+            _active_profile_lease_owner = ""
+            _active_profile_lease_keys = set()
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        _active_task_run_id = create_task_run(
+            db_p, "page_search", total_items=req.limit,
+            summary={"account_mode": req.account_mode},
+        )
         _stop_requested.clear()
         _scrape_status.update({
             "is_running": True, "current_page": "", "posts_found": 0,
             "start_time": time.time(), "queue_total": req.limit, "queue_completed": 0,
+            "queue_successful": 0, "queue_failed": 0,
             "current_favorite_id": 0, "new_posts": 0, "task_type": "page_search",
             "keyword": keyword, "error": "", "search_results": [],
             "workers": {},

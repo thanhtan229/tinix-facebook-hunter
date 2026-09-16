@@ -1,6 +1,7 @@
 @echo off
 setlocal enabledelayedexpansion
 cd /d "%~dp0"
+if /i "%~1"=="silent" set "TINIX_SILENT=1"
 title Tinix-Facebook-Hunter App
 
 echo ========================================================
@@ -66,7 +67,7 @@ if not errorlevel 1 (
 if not defined PYTHON_CMD (
     echo [LOI] Khong tim thay Python tren he thong!
     echo Vui long cai dat Python 3.10 hoac 3.11 tai https://www.python.org/
-    pause
+    if not "%TINIX_SILENT%"=="1" pause
     exit /b 1
 )
 if not exist "%PYTHONW_CMD%" (
@@ -76,12 +77,11 @@ if not exist "%PYTHONW_CMD%" (
 set "TINIX_PORT=7866"
 
 REM 2. Kiem tra xem may chu ngam da chay chua
-"%PYTHON_CMD%" -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:%TINIX_PORT%/api/system/health', timeout=1)" >nul 2>nul
-if errorlevel 1 (
+"%PYTHON_CMD%" -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:%TINIX_PORT%/api/system/health', timeout=1)" >nul 2>nul && (
+    echo [Tinix] May chu dang chay san tren port %TINIX_PORT%.
+) || (
     call :start_background_server
     if errorlevel 1 exit /b 1
-) else (
-    echo [Tinix] May chu dang chay san tren port %TINIX_PORT%.
 )
 
 REM 3. Tim Google Chrome hoac Microsoft Edge de mo che do App Mode doc lap
@@ -94,9 +94,9 @@ if not defined BROWSER_APP_EXE if exist "%ProgramFiles%\Microsoft\Edge\Applicati
 
 echo [Tinix] Dang mo ung dung che do App Mode doc lap...
 if defined BROWSER_APP_EXE (
-    start "" "%BROWSER_APP_EXE%" --app="http://127.0.0.1:%TINIX_PORT%"
+    start "" "%BROWSER_APP_EXE%" --start-maximized --user-data-dir="%~dp0chrome_profile_ui" --no-first-run --no-default-browser-check --app="http://127.0.0.1:%TINIX_PORT%"
 ) else (
-    start "" "http://127.0.0.1:%TINIX_PORT%"
+    start "" /max "http://127.0.0.1:%TINIX_PORT%"
 )
 
 REM 4. Tu dong tao Desktop shortcut neu chua ton tai
@@ -119,8 +119,7 @@ start "" "%PYTHONW_CMD%" "%~dp0main.py"
 
 REM Cho server san sang toi da 15 giay
 for /l %%i in (1,1,15) do (
-    "%PYTHON_CMD%" -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:%TINIX_PORT%/api/system/health', timeout=1)" >nul 2>nul
-    if not errorlevel 1 (
+    "%PYTHON_CMD%" -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:%TINIX_PORT%/api/system/health', timeout=1)" >nul 2>nul && (
         echo [Tinix] May chu ngam da san sang!
         exit /b 0
     )
@@ -129,5 +128,5 @@ for /l %%i in (1,1,15) do (
 
 echo [LOI] May chu ngam khong phan hoi sau 15 giay!
 echo Kiem tra log tai: %~dp0logs\server_startup.log
-pause
+if not "%TINIX_SILENT%"=="1" pause
 exit /b 1

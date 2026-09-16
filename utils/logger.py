@@ -29,7 +29,13 @@ class GUIHandler(logging.Handler):
         if self._callback is None:
             return
         try:
-            msg = self.format(record)
+            # The Web UI owns its timestamp and level badge. Forwarding the
+            # formatted record would duplicate both (for example, two [INFO]
+            # labels and two clocks) while file logs keep the full formatter.
+            msg = record.getMessage()
+            if record.exc_info:
+                formatter = self.formatter or logging.Formatter()
+                msg = f"{msg}\n{formatter.formatException(record.exc_info)}"
             level = record.levelname  # INFO, WARNING, ERROR
             self._callback(level, msg)
         except Exception:
@@ -44,7 +50,10 @@ _gui_handler: Optional[GUIHandler] = None
 
 def _get_log_dir() -> Path:
     """Get the log directory."""
-    if getattr(sys, 'frozen', False):
+    configured_dir = os.environ.get("TINIX_LOG_DIR", "").strip()
+    if configured_dir:
+        log_dir = Path(configured_dir).expanduser()
+    elif getattr(sys, 'frozen', False):
         log_dir = Path(sys.executable).parent / "logs"
     else:
         log_dir = Path(__file__).parent.parent / "logs"

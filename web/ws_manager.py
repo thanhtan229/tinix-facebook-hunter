@@ -73,3 +73,13 @@ def progress_to_web(task: str, current: int, total: int, speed: str = "", status
         "speed": speed,
         "status": status
     })
+
+
+def account_status_to_web(payload: Dict[str, Any]):
+    """Publish a safe account-health event for the downloader status panel."""
+    manager.broadcast_sync({"type": "download_account", **payload})
+
+
+def download_item_to_web(payload: Dict[str, Any]):
+    """Publish one structured post outcome instead of forcing the UI to parse logs."""
+    manager.broadcast_sync({"type": "download_item", **payload})

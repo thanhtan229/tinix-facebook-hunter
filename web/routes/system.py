@@ -10,6 +10,7 @@ from core.db_storage import (
     get_db_path,
     get_db_stats,
     get_all_accounts,
+    get_recent_task_runs,
     migrate_secrets_at_rest,
     SCHEMA_VERSION,
 )
@@ -25,7 +26,10 @@ CONFIG_SECRET_FIELDS = {"saved_cookies", "cookies", "fb_app_secret", "access_tok
 
 def _public_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
     """Return UI settings without persisted cookies or credentials."""
-    public = {k: v for k, v in cfg.items() if k.lower() not in CONFIG_SECRET_FIELDS}
+    public = {
+        k: v for k, v in cfg.items()
+        if k.lower() not in CONFIG_SECRET_FIELDS and not k.startswith("_")
+    }
     public["has_saved_cookies"] = bool(cfg.get("saved_cookies") or cfg.get("cookies"))
     return public
 
@@ -33,6 +37,7 @@ class ConfigUpdateRequest(ApiRequest):
     output_dir: Optional[str] = Field(default=None, max_length=4_096)
     max_threads: Optional[int] = Field(default=None, ge=1, le=20)
     auto_open_folder: Optional[bool] = None
+    download_use_accounts: Optional[bool] = None
     scraper_db_path: Optional[str] = Field(default=None, max_length=4_096)
     theme: Optional[str] = Field(default=None, pattern="^(light|dark|system)$")
 
@@ -142,12 +147,21 @@ def get_stats():
         "status": "success",
         "data": {
             "total_posts": stats.get("total_posts", 0),
+            "scraped_posts": stats.get("scraped_posts", 0),
+            "direct_posts": stats.get("direct_posts", 0),
             "downloaded_posts": stats.get("downloaded_posts", 0),
             "total_pages": stats.get("total_pages", 0),
             "total_accounts": len(accounts),
             "active_accounts": sum(1 for a in accounts if a.get("is_active")),
         }
     }
+
+
+@router.get("/task-runs")
+def get_task_runs():
+    """Return recent local task summaries for the dashboard activity panel."""
+    db_p = get_db_path(config.get("scraper_db_path", ""))
+    return {"status": "success", "data": get_recent_task_runs(db_p)}
 
 
 @router.get("/health")

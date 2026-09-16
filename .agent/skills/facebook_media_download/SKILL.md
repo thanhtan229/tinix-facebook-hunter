@@ -168,20 +168,24 @@ class DownloadStats:
 
 ## Output Structure
 
+Tất cả bài viết được lưu trực tiếp vào thư mục chung cấu hình trong Cài Đặt (Flat storage theo Post ID):
 ```
 _DOWNLOAD/_TINIX/
-├── 836851975657298/       # Post ID as folder name
-│   ├── image_001.jpg      # Full-res images
-│   ├── image_002.jpg
-│   └── video_001.mp4      # Video (if present)
-├── pfbid2abc123def456/    # pfbid format
-│   └── image_001.jpg
+├── 836851975657298.txt         # Caption bài viết
+├── 836851975657298_1.jpeg      # Ảnh thứ 1 (full-res)
+├── 836851975657298_2.jpeg      # Ảnh thứ 2
+├── 836851975657298.mp4         # Video (nếu có)
+├── 970714485604379.txt
+├── 970714485604379_1.jpeg
+├── 970714485604379.mp4
 └── ...
 ```
+*Ghi chú*: Cấu trúc thuần flat storage trong thư mục Settings. Các thư mục con cũ khi khởi động hoặc đồng bộ sẽ tự động được di chuyển (migration) ra ngoài flat storage và xóa thư mục con.
 
 ## Debug Tips
 
 - Video download fails → check if `post_data.video_url` is populated
+- Video download gets wrong video → ensure URL uses canonical page post URL (`/{page}/posts/{id}` or `/{id}`) rather than `watch/?v={id}` when ID is a post/story ID (otherwise Facebook redirects to random Watch/Reels recommendations). Also inspect links inside `article` for embedded `/reel/` or `/videos/` IDs.
 - Image too small (<100 bytes) → likely blocked by Facebook CDN
 - 403 errors → cookies expired or CDN requires authenticated session
 - yt-dlp fails → check if `yt-dlp.exe` is in PATH or bundled directory

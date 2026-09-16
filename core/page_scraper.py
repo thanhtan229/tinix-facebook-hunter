@@ -268,7 +268,11 @@ class _PostCollector:
                             existing["date"] = post["date"]
                         if post.get("caption") and not existing.get("caption"):
                             existing["caption"] = post["caption"]
-                        if post.get("url") and (not existing.get("url") or existing["url"] == f"https://www.facebook.com/{pid}"):
+                        if post.get("url") and (
+                            not existing.get("url")
+                            or existing["url"] == f"https://www.facebook.com/{pid}"
+                            or ("watch" in post["url"] and "watch" not in existing.get("url", ""))
+                        ):
                             existing["url"] = post["url"]
                         if post.get("media_preview_url") and not existing.get("media_preview_url"):
                             existing["media_preview_url"] = post["media_preview_url"]
@@ -476,14 +480,25 @@ class _PostCollector:
         view_count = self._extract_view_count(node)
 
         # --- URL ---
-        url = f"https://www.facebook.com/{post_id}"
-        node_str_for_url = json.dumps(node, default=str)
-        url_match = re.search(
-            r'"url":\s*"(https?://www\.facebook\.com/[^"]*(?:posts|videos|permalink|pfbid|reel)[^"]*)"',
-            node_str_for_url,
-        )
-        if url_match:
-            url = url_match.group(1).replace("\\/", "/")
+        # A story ID is not necessarily the playable video ID.  Facebook redirects
+        # /<page>/posts/<story-id> video posts to a generic/unavailable page, which
+        # leaves the downloader with only a thumbnail.  Keep the story ID for the
+        # database, but use the attachment's video ID for the download URL.
+        video_id = self._extract_primary_video_id(content) if post_type == "Video" else ""
+        if video_id:
+            url = f"https://www.facebook.com/watch/?v={video_id}"
+        else:
+            node_str_for_url = json.dumps(node, default=str)
+            url_match = re.search(
+                r'"url":\s*"(https?://www\.facebook\.com/[^"]*(?:posts|videos|permalink|pfbid|reel)[^"]*)"',
+                node_str_for_url,
+            )
+            if url_match:
+                url = url_match.group(1).replace("\\/", "/")
+            elif getattr(self, "_page_url", None):
+                url = f"{str(self._page_url).rstrip('/')}/posts/{post_id}"
+            else:
+                url = f"https://www.facebook.com/{post_id}"
 
         # Only return if we have meaningful data
         if not date_str and not caption and not engagement and not view_count:
@@ -509,6 +524,31 @@ class _PostCollector:
             "media_preview_url": media_preview_url,
             "media_count": media_count,
         }
+
+    @staticmethod
+    def _extract_primary_video_id(content: object) -> str:
+        """Return the first actual video attachment ID from a story's content."""
+        def visit(value: object) -> str:
+            if isinstance(value, dict):
+                is_video = str(value.get("__typename", "")) == "Video"
+                if is_video:
+                    for key in ("id", "video_id", "fbid"):
+                        candidate = str(value.get(key, "") or "")
+                        if candidate.isdigit() and len(candidate) >= 10:
+                            return candidate
+                for child in value.values():
+                    if isinstance(child, (dict, list)):
+                        found = visit(child)
+                        if found:
+                            return found
+            elif isinstance(value, list):
+                for child in value:
+                    found = visit(child)
+                    if found:
+                        return found
+            return ""
+
+        return visit(content)
 
     def _deep_find(self, obj, key: str):
         """Recursively find the first occurrence of a key in a nested dict."""
@@ -811,7 +851,9 @@ class _PostCollector:
                         "shares": shares,
                         "view_count": view_count,
                         "caption": _safe_str(caption),
-                        "url": f"https://www.facebook.com/{pid}",
+                        "url": (
+                            f"{str(self._page_url).rstrip('/')}/posts/{pid}" if getattr(self, "_page_url", None) else f"https://www.facebook.com/{pid}"
+                        ),
                         "media_preview_url": media_preview_url,
                         "media_count": 1 if media_preview_url else 0,
                     }
@@ -847,6 +889,12 @@ class PageScraper:
     Intercepts GraphQL API responses to capture post data directly.
     Supports dedicated Chrome profiles per account.
     """
+
+    _SCROLL_POLL_INTERVAL_MS = 100
+    _SCROLL_INITIAL_WAIT_SECONDS = 0.8
+    _SCROLL_MAX_WAIT_SECONDS = 2.0
+    _SCROLL_SETTLE_SECONDS = 0.35
+    _SCROLL_EXHAUSTED_AFTER_SECONDS = 24.0
 
     def __init__(self, account: Optional[Dict] = None, cookies: Optional[Dict[str, str]] = None,
                  cdp_port: Optional[int] = None):
@@ -1335,17 +1383,29 @@ class PageScraper:
         posts are encountered consecutively.
         """
         no_new_count = 0
+        total_empty_scrolls = 0
         prev_count = collector.count
+        initial_count = prev_count
+        scroll_started_at = time.monotonic()
+        last_new_at = scroll_started_at
         max_scrolls = max(max_posts * 3, 50)
         last_pause_bucket = 0
 
         for i in range(max_scrolls):
             if self._stop_event.is_set():
                 logger.info("⏹ Đã dừng quét")
+                self._log_scroll_summary(
+                    "stopped", initial_count, collector.count, scroll_started_at,
+                    i, total_empty_scrolls,
+                )
                 return "stopped"
 
             if collector.count >= max_posts:
                 logger.info(f"Đã đạt {max_posts} bài")
+                self._log_scroll_summary(
+                    "limit", initial_count, collector.count, scroll_started_at,
+                    i, total_empty_scrolls,
+                )
                 return "limit"
 
             # Scroll both window AND #scrollview container
@@ -1360,14 +1420,30 @@ class PageScraper:
                     sv.dispatchEvent(new Event('scroll', {bubbles: true}));
                 }
             }""")
-            time.sleep(2.0)
+            current, _waited = self._wait_for_scroll_result(page, collector, prev_count, no_new_count)
 
-            current = collector.count
+            if self._stop_event.is_set():
+                logger.info("⏹ Đã dừng quét")
+                self._log_scroll_summary(
+                    "stopped", initial_count, current, scroll_started_at,
+                    i + 1, total_empty_scrolls,
+                )
+                return "stopped"
+
             if current > prev_count:
                 new = current - prev_count
+                empty_before_result = no_new_count
                 no_new_count = 0
+                last_new_at = time.monotonic()
+                elapsed = max(last_new_at - scroll_started_at, 0.001)
+                rate_per_minute = max(0, current - initial_count) * 60 / elapsed
+                empty_note = (
+                    f" · sau {empty_before_result} lượt không có dữ liệu"
+                    if empty_before_result else ""
+                )
                 logger.info(
                     f"Scroll #{i + 1}: +{new} bài (tổng: {current})"
+                    f" · {rate_per_minute:.0f} bài/phút{empty_note}"
                 )
                 if on_progress:
                     on_progress(min(current, max_posts), f"{current}/{max_posts}")
@@ -1380,6 +1456,10 @@ class PageScraper:
                     overlap = [pid for pid in recent_ids if pid in known_post_ids]
                     if overlap:
                         logger.info("🆕 Đã gặp mốc quét trước — dừng quét bài mới")
+                        self._log_scroll_summary(
+                            "boundary", initial_count, current, scroll_started_at,
+                            i + 1, total_empty_scrolls,
+                        )
                         return "boundary"
 
                 last_pause_bucket = self._maybe_rest_after_batch(
@@ -1389,12 +1469,89 @@ class PageScraper:
                 prev_count = current
             else:
                 no_new_count += 1
+                total_empty_scrolls += 1
 
-            # Stop if no new posts after many scrolls
-            if no_new_count >= 12:
+            # Preserve the former roughly-24-second grace period even though the
+            # adaptive wait can make early empty scrolls complete faster.
+            if (
+                no_new_count >= 12
+                and time.monotonic() - last_new_at >= self._SCROLL_EXHAUSTED_AFTER_SECONDS
+            ):
                 logger.info("Không còn bài mới")
+                self._log_scroll_summary(
+                    "exhausted", initial_count, current, scroll_started_at,
+                    i + 1, total_empty_scrolls,
+                )
                 return "exhausted"
+        self._log_scroll_summary(
+            "exhausted", initial_count, collector.count, scroll_started_at,
+            max_scrolls, total_empty_scrolls,
+        )
         return "exhausted"
+
+    def _wait_for_scroll_result(
+        self,
+        page,
+        collector: _PostCollector,
+        previous_count: int,
+        consecutive_empty_scrolls: int,
+    ) -> tuple[int, float]:
+        """Let Playwright process responses until a scroll result settles.
+
+        A Python ``time.sleep`` blocks the synchronous Playwright dispatcher.
+        Short Playwright waits keep response callbacks flowing while avoiding a
+        fixed two-second pause after every scroll. Empty rounds back off to the
+        prior conservative delay; once data arrives, a short settle window lets
+        a single GraphQL batch finish before the next scroll.
+        """
+        started_at = time.monotonic()
+        max_wait = min(
+            self._SCROLL_MAX_WAIT_SECONDS,
+            self._SCROLL_INITIAL_WAIT_SECONDS + max(0, consecutive_empty_scrolls) * 0.3,
+        )
+        last_observed_count = previous_count
+        last_change_at: Optional[float] = None
+
+        while not self._stop_event.is_set():
+            now = time.monotonic()
+            current = collector.count
+            if current > last_observed_count:
+                last_observed_count = current
+                last_change_at = now
+
+            deadline = (
+                last_change_at + self._SCROLL_SETTLE_SECONDS
+                if last_change_at is not None
+                else started_at + max_wait
+            )
+            remaining = deadline - now
+            if remaining <= 0:
+                break
+
+            page.wait_for_timeout(
+                max(1, min(self._SCROLL_POLL_INTERVAL_MS, round(remaining * 1000)))
+            )
+
+        return collector.count, max(0.0, time.monotonic() - started_at)
+
+    @staticmethod
+    def _log_scroll_summary(
+        reason: str,
+        initial_count: int,
+        current_count: int,
+        started_at: float,
+        total_scrolls: int,
+        total_empty_scrolls: int,
+    ) -> None:
+        """Log one compact, comparable summary for a scroll session."""
+        elapsed = max(time.monotonic() - started_at, 0.001)
+        added = max(0, current_count - initial_count)
+        rate_per_minute = added * 60 / elapsed
+        logger.info(
+            f"Tóm tắt cuộn ({reason}): +{added} bài trong {elapsed:.0f} giây"
+            f" · {rate_per_minute:.0f} bài/phút"
+            f" · {total_scrolls} lượt cuộn, {total_empty_scrolls} lượt không có dữ liệu"
+        )
 
     @staticmethod
     def _archive_candidates(raw: List[dict], known_ids: set, boundary_ids: set) -> tuple[bool, List[dict]]:
@@ -1420,12 +1577,20 @@ class PageScraper:
     ) -> str:
         """Seek the oldest saved boundary, then collect the next historical batch."""
         no_new_count = 0
+        total_empty_scrolls = 0
         previous_total = collector.count
+        initial_count = previous_total
+        scroll_started_at = time.monotonic()
+        last_new_at = scroll_started_at
         last_pause_bucket = 0
         max_scrolls = max(min((len(known_ids) + max_posts) * 3, 6000), 100)
 
         for index in range(max_scrolls):
             if self._stop_event.is_set():
+                self._log_scroll_summary(
+                    "stopped", initial_count, collector.count, scroll_started_at,
+                    index, total_empty_scrolls,
+                )
                 return "stopped"
             boundary_found, candidates = self._archive_candidates(
                 collector.get_posts(), known_ids, boundary_ids
@@ -1433,6 +1598,10 @@ class PageScraper:
             self.last_archive_boundary_found = boundary_found
             if boundary_found and len(candidates) >= max_posts:
                 logger.info(f"Đã lấy đủ {max_posts} bài cũ sau mốc lưu")
+                self._log_scroll_summary(
+                    "limit", initial_count, collector.count, scroll_started_at,
+                    index, total_empty_scrolls,
+                )
                 return "limit"
 
             page.evaluate("""() => {
@@ -1440,10 +1609,32 @@ class PageScraper:
                 const sv = document.getElementById('scrollview');
                 if (sv) { sv.scrollTop += 1200; sv.dispatchEvent(new Event('scroll', {bubbles: true})); }
             }""")
-            time.sleep(2.0)
-            current_total = collector.count
+            current_total, _waited = self._wait_for_scroll_result(
+                page, collector, previous_total, no_new_count
+            )
+
+            if self._stop_event.is_set():
+                self._log_scroll_summary(
+                    "stopped", initial_count, current_total, scroll_started_at,
+                    index + 1, total_empty_scrolls,
+                )
+                return "stopped"
+
             if current_total > previous_total:
+                added = current_total - previous_total
+                empty_before_result = no_new_count
                 no_new_count = 0
+                last_new_at = time.monotonic()
+                elapsed = max(last_new_at - scroll_started_at, 0.001)
+                rate_per_minute = max(0, current_total - initial_count) * 60 / elapsed
+                empty_note = (
+                    f" · sau {empty_before_result} lượt không có dữ liệu"
+                    if empty_before_result else ""
+                )
+                logger.info(
+                    f"Quét bài cũ · Scroll #{index + 1}: +{added} bài (tổng: {current_total})"
+                    f" · {rate_per_minute:.0f} bài/phút{empty_note}"
+                )
                 previous_total = current_total
                 boundary_found, candidates = self._archive_candidates(
                     collector.get_posts(), known_ids, boundary_ids
@@ -1459,8 +1650,21 @@ class PageScraper:
                     )
             else:
                 no_new_count += 1
-            if no_new_count >= 12:
+                total_empty_scrolls += 1
+            if (
+                no_new_count >= 12
+                and time.monotonic() - last_new_at >= self._SCROLL_EXHAUSTED_AFTER_SECONDS
+            ):
+                logger.info("Không còn bài mới")
+                self._log_scroll_summary(
+                    "exhausted", initial_count, current_total, scroll_started_at,
+                    index + 1, total_empty_scrolls,
+                )
                 return "exhausted"
+        self._log_scroll_summary(
+            "exhausted", initial_count, collector.count, scroll_started_at,
+            max_scrolls, total_empty_scrolls,
+        )
         return "exhausted"
 
     def _maybe_rest_after_batch(

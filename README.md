@@ -4,8 +4,16 @@
 khoản.
 
 Tab Quét Page hỗ trợ lưu Fanpage yêu thích, gán Chrome profile, quét tuần tự và
-chỉ lưu các bài mới kể từ mốc của lần quét thành công gần nhất. Danh sách yêu
-thích và mốc quét không bị xóa khi dọn Kho Dữ Liệu.
+chỉ lưu các bài mới kể từ mốc của lần quét thành công gần nhất.
+
+Khi bắt đầu, WebUI kiểm tra các thành phần cần thiết. Với luồng dùng Chrome
+Profile, hãy tạo account, đăng nhập Facebook trong profile rồi chạy **Check
+Preflight**. Trong **Quét Page**, có thể tắt **Tự tải media bài mới** để chỉ
+lưu dữ liệu vào Kho Bài Viết. Mục **Hoạt động gần đây** lưu kết quả tóm tắt của
+tải/quét và đánh dấu phiên bị gián đoạn khi ứng dụng khởi động lại; không lưu
+URL đầu vào, cookie hay credential. Luồng **Tìm Fanpage** cũng chạy preflight và
+được ghi lịch sử. Một Chrome profile chỉ được một tác vụ nền sử dụng tại một
+thời điểm; media tự tải sẽ xếp hàng nếu downloader đang bận.
 
 ## Yêu cầu
 
@@ -74,19 +82,6 @@ python manage_database.py restore --file "D:\backup\tinix.db.backup-YYYYMMDD_HHM
 
 Restore luôn tạo thêm một bản backup của database hiện tại trước khi ghi đè.
 Backup vẫn là dữ liệu nhạy cảm và không được commit hoặc gửi qua kênh công khai.
-
-## Dọn Kho Dữ Liệu
-
-Trong tab **Kho Dữ Liệu**, chọn Page rồi dùng **Xóa Pages đã chọn**, hoặc dùng
-**Dọn toàn bộ kho** để xóa mọi dữ liệu scraper. Mỗi thao tác hiển thị cửa sổ xác
-nhận cuối cùng và tự tạo/verify backup database trước khi xóa. Tài khoản, token
-và fanpage quản lý không thuộc phạm vi dọn kho.
-
-Tùy chọn **Xóa cả thư mục media đã tải** mặc định tắt. Khi bật, ứng dụng chỉ xóa
-đường dẫn nằm bên dưới thư mục output đã cấu hình, không xóa output root, không
-đi theo symlink ra ngoài và không xóa thư mục còn được bài khác tham chiếu.
-Backup SQLite không chứa media, nên media đã xóa không thể khôi phục từ file
-backup database.
 
 Chi tiết vận hành và xử lý sự cố nằm tại [docs/OPERATIONS.md](docs/OPERATIONS.md);
 quy trình phát hành tại [docs/RELEASE_CHECKLIST.md](docs/RELEASE_CHECKLIST.md).

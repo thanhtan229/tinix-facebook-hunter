@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
+from urllib.parse import urlparse
 
 from utils import logger
 from utils.chrome_profiles import browser_profile_dir
@@ -36,6 +37,7 @@ class PostData:
     """Parsed Facebook post data."""
     post_id: str = ""
     author: str = ""
+    author_url: str = ""
     timestamp: str = ""
     text: str = ""
     image_urls: List[str] = field(default_factory=list)
@@ -43,6 +45,7 @@ class PostData:
     video_url: str = ""
     original_url: str = ""
     error: Optional[str] = None
+    error_code: str = ""
 
     @property
     def is_valid(self) -> bool:
@@ -85,15 +88,25 @@ class BrowserManager:
         self._profile_dir = Path(profile_dir) if profile_dir else None
         self._cdp_port = cdp_port or CDP_PORT
         self._headless = headless
+        # Safe, user-facing diagnosis of the last startup failure.  Never put
+        # credential values in either field.
+        self.last_start_error_code = ""
+        self.last_start_error_message = ""
+        self.last_request_error_code = ""
+        self.last_request_error_message = ""
 
-    def start(self, cookies: Dict[str, str]) -> bool:
+    def start(self, cookies: Dict[str, str], require_authenticated: bool = False) -> bool:
         """Launch Chrome with remote debugging and connect Playwright."""
+        self.last_start_error_code = ""
+        self.last_start_error_message = ""
         try:
             from playwright.sync_api import sync_playwright
 
             chrome_path = _find_chrome()
             if not chrome_path:
                 logger.error("Không tìm thấy Chrome. Vui lòng cài đặt Google Chrome.")
+                self.last_start_error_code = "CHROME_NOT_FOUND"
+                self.last_start_error_message = "Không tìm thấy Google Chrome trên máy."
                 return False
 
             profile_dir = self._profile_dir or _get_profile_dir()
@@ -137,32 +150,109 @@ class BrowserManager:
             else:
                 self._context = self._browser.new_context()
 
-            # Inject cookies
-            pw_cookies = []
-            for name, value in cookies.items():
-                pw_cookies.append({
-                    "name": name,
-                    "value": value,
-                    "domain": ".facebook.com",
-                    "path": "/",
-                    "secure": True,
-                })
-            if pw_cookies:
-                self._context.add_cookies(pw_cookies)
+            # Prefer the session already stored in this account's persistent
+            # Chrome profile.  A manually renewed Facebook session can be
+            # newer than the optional cookie copied into the database; adding
+            # that stale cookie first overwrites the profile's c_user/xs pair
+            # and produces a false "Mất phiên" result.
+            authenticated = (
+                self._has_authenticated_facebook_session() if require_authenticated else False
+            )
+
+            # Dedicated cookie-mode profiles are empty, so use the saved
+            # cookie only when no valid profile session exists.
+            if cookies and not authenticated:
+                pw_cookies = []
+                for name, value in cookies.items():
+                    pw_cookies.append({
+                        "name": name,
+                        "value": value,
+                        "domain": ".facebook.com",
+                        "path": "/",
+                        "secure": True,
+                    })
+                if pw_cookies:
+                    self._context.add_cookies(pw_cookies)
+
+            if (cookies or require_authenticated) and not authenticated:
+                authenticated = self._has_authenticated_facebook_session()
+
+            if (cookies or require_authenticated) and not authenticated:
+                if cookies:
+                    message = "Cookie Facebook đã hết hạn hoặc cần xác nhận lại. Hãy cập nhật cookie trước khi tải."
+                    code = "AUTH_EXPIRED"
+                else:
+                    message = "Profile chưa có phiên đăng nhập Facebook hợp lệ. Hãy mở profile và đăng nhập trước khi tải."
+                    code = "AUTH_REQUIRED"
+                logger.error(message)
+                self.last_start_error_code = code
+                self.last_start_error_message = message
+                self.stop()
+                return False
 
             logger.info("Trình duyệt đã sẵn sàng")
             return True
 
         except Exception as e:
-            logger.error(f"Lỗi khởi động trình duyệt: {str(e)[:200]}")
+            message = f"Lỗi khởi động trình duyệt: {str(e)[:200]}"
+            logger.error(message)
+            self.last_start_error_code = "BROWSER_START_FAILED"
+            self.last_start_error_message = message
             self.stop()
             return False
+
+    def _has_authenticated_facebook_session(self) -> bool:
+        """Verify that Facebook resolves the current context to an account profile.
+
+        The public Facebook landing page is not a reliable authentication
+        signal: it can omit the login form even when a saved session has
+        expired.  ``/me/`` redirects an authenticated context to its profile,
+        while an anonymous or checkpointed context remains on the landing or
+        authentication flow.
+        """
+        if not self._context:
+            return False
+
+        page = None
+        try:
+            page = self._context.new_page()
+            page.goto("https://www.facebook.com/me/", wait_until="domcontentloaded", timeout=30000)
+            current_url = page.url or ""
+            parsed_url = urlparse(current_url)
+            hostname = (parsed_url.hostname or "").lower()
+            path = (parsed_url.path or "/").lower()
+
+            if hostname not in {"facebook.com", "www.facebook.com", "m.facebook.com"}:
+                logger.warning("Facebook chuyển hướng preflight sang trang không xác thực.")
+                return False
+
+            auth_paths = (
+                "/login", "/checkpoint", "/recover", "/two_step_verification",
+                "/confirmemail", "/auth/", "/security/",
+            )
+            if path in {"", "/", "/me", "/me/"} or any(marker in path for marker in auth_paths):
+                return False
+
+            return not bool(page.query_selector(
+                '#login_form, form[action*="login"], input[name="email"], input[name="pass"]'
+            ))
+        except Exception as exc:
+            logger.warning(f"Không kiểm tra được phiên Facebook: {str(exc)[:120]}")
+            return False
+        finally:
+            if page:
+                try:
+                    page.close()
+                except Exception:
+                    pass
 
     def download_file(self, url: str, save_path) -> bool:
         """
         Download a file using the browser's authenticated session.
         This uses the browser's cookies/session, bypassing CDN 403 errors.
         """
+        self.last_request_error_code = ""
+        self.last_request_error_message = ""
         if not self._context:
             return False
 
@@ -177,7 +267,7 @@ class BrowserManager:
             response = page.request.get(url, headers={
                 "Referer": "https://www.facebook.com/",
                 "Origin": "https://www.facebook.com",
-            })
+            }, timeout=120000)
 
             if response.ok:
                 body = response.body()
@@ -195,10 +285,14 @@ class BrowserManager:
                     return False
             else:
                 logger.error(f"Browser download failed: HTTP {response.status}")
+                self.last_request_error_code = "RATE_LIMITED" if response.status == 429 else "MEDIA_ACCESS_DENIED"
+                self.last_request_error_message = f"Browser download nhận HTTP {response.status}."
                 return False
 
         except Exception as e:
             logger.error(f"Browser download error: {str(e)[:150]}")
+            self.last_request_error_code = "NETWORK_TIMEOUT" if "timeout" in str(e).lower() else "DOWNLOAD_FAILED"
+            self.last_request_error_message = f"Browser download lỗi: {str(e)[:150]}"
             return False
         finally:
             if page:
@@ -206,6 +300,34 @@ class BrowserManager:
                     page.close()
                 except Exception:
                     pass
+
+    @staticmethod
+    def _detect_facebook_access_issue(current_url: str, body_text: str = "") -> tuple[str, str]:
+        """Classify login, checkpoint, and temporary-limit pages safely."""
+        lowered_url = str(current_url or "").lower()
+        lowered_body = str(body_text or "").lower()
+        if any(marker in lowered_url for marker in (
+            "/checkpoint", "/challenge", "/two_step_verification", "/recover", "/security/",
+        )) or any(marker in lowered_body for marker in (
+            "xác nhận danh tính", "confirm your identity", "security check",
+            "suspicious activity", "unusual activity",
+        )):
+            return "ACCOUNT_CHECKPOINT", "Facebook yêu cầu xác nhận danh tính hoặc checkpoint."
+        if "/login" in lowered_url or "/auth/" in lowered_url:
+            return "ACCOUNT_AUTH_EXPIRED", "Facebook chuyển phiên sang trang đăng nhập."
+        if any(marker in lowered_body for marker in (
+            "try again later", "temporarily blocked", "too many requests", "rate limit",
+            "vui lòng thử lại sau", "bạn đang thực hiện quá nhanh", "bạn tạm thời bị chặn",
+        )):
+            return "RATE_LIMITED", "Facebook đang giới hạn tạm thời các yêu cầu từ account này."
+        return "", ""
+
+    @staticmethod
+    def _set_post_access_error(post_data: PostData, code: str, message: str) -> PostData:
+        post_data.error_code = code
+        post_data.error = message
+        logger.warning(f"[{code}] {message}")
+        return post_data
 
     def fetch_post(self, url: str, post_id: str = "") -> PostData:
         """Fetch and parse a single Facebook post."""
@@ -245,15 +367,74 @@ class BrowserManager:
 
                 error_el = page.query_selector('text="Lỗi không xác định"')
                 if error_el:
-                    post_data.error = "Facebook hiển thị lỗi. Cookies có thể đã hết hạn."
-                    logger.error(post_data.error)
-                    return post_data
+                    return self._set_post_access_error(
+                        post_data, "DOWNLOAD_FAILED",
+                        "Facebook hiển thị lỗi sau khi tải lại trang bài viết.",
+                    )
 
-            # Check for login page
-            if "/login" in current_url:
-                post_data.error = "Cookies không hợp lệ, bị chuyển hướng tới trang đăng nhập."
-                logger.error(post_data.error)
-                return post_data
+                # A reload can redirect into a checkpoint or login flow.
+                current_url = page.url
+                title = page.title()
+
+            # Check for Facebook "content not available" on bare numeric URL or wrong path
+            page_body_text = ""
+            try:
+                page_body_text = page.evaluate("() => document.body ? document.body.innerText : ''") or ""
+            except Exception:
+                page_body_text = ""
+
+            access_code, access_message = self._detect_facebook_access_issue(current_url, page_body_text)
+            if access_code:
+                return self._set_post_access_error(post_data, access_code, access_message)
+
+            is_unavailable = any(
+                sig in page_body_text.lower() for sig in [
+                    "thay đổi người được xem", "đã xóa nội dung", "không khả dụng",
+                    "content isn't available", "content not found"
+                ]
+            )
+            clean_pid = re.sub(r"\D", "", post_id or "")
+            redirected_away = False
+            if clean_pid and len(clean_pid) >= 10:
+                is_watch_input = "/watch" in url
+                if is_watch_input and clean_pid not in current_url:
+                    try:
+                        has_pid_in_html = bool(page.evaluate("(pid) => document.documentElement.innerHTML.includes(pid)", clean_pid))
+                    except Exception:
+                        has_pid_in_html = True
+                    if not has_pid_in_html:
+                        redirected_away = True
+
+            if (is_unavailable or redirected_away) and clean_pid and len(clean_pid) >= 10:
+                fallback_post_url = f"https://www.facebook.com/{clean_pid}"
+                if current_url.rstrip("/") != fallback_post_url.rstrip("/"):
+                    logger.info(f"Trang {current_url} không khớp post_id {clean_pid} (bị chuyển hướng sang video khác hoặc không khả dụng), thử fallback sang: {fallback_post_url}")
+                    page.goto(fallback_post_url, wait_until="domcontentloaded", timeout=30000)
+                    current_url = page.url
+                    title = page.title()
+                    try:
+                        page.wait_for_selector('video, [role="article"], [role="dialog"], [role="main"]', timeout=5000)
+                    except Exception:
+                        pass
+                    try:
+                        page_body_text = page.evaluate("() => document.body ? document.body.innerText : ''") or ""
+                    except Exception:
+                        page_body_text = ""
+                    access_code, access_message = self._detect_facebook_access_issue(current_url, page_body_text)
+                    if access_code:
+                        return self._set_post_access_error(post_data, access_code, access_message)
+                    is_unavailable = any(
+                        sig in page_body_text.lower() for sig in [
+                            "thay đổi người được xem", "đã xóa nội dung", "không khả dụng",
+                            "content isn't available", "content not found",
+                        ]
+                    )
+
+            if is_unavailable:
+                return self._set_post_access_error(
+                    post_data, "POST_UNAVAILABLE",
+                    "Facebook báo bài viết không còn khả dụng hoặc đã thay đổi quyền xem.",
+                )
 
             # Click "Xem thêm" / "See more" to expand truncated text
             self._click_see_more(page)
@@ -281,7 +462,7 @@ class BrowserManager:
             logger.debug("Đã tìm thấy article container")
 
             # Parse post content
-            post_data.author = self._extract_author(article)
+            post_data.author, post_data.author_url = self._extract_author(article)
             post_data.timestamp = self._extract_timestamp(article)
 
             # Extract video ID from URL first (needed for text + video extraction)
@@ -292,25 +473,53 @@ class BrowserManager:
                 _qs = _parse_qs(_parsed.query)
                 if 'v' in _qs:
                     video_id = _qs['v'][0]
-                elif '/watch/' in current_url or '/videos/' in current_url:
+                elif '/watch/' in current_url or '/videos/' in current_url or '/reel/' in current_url:
                     import re as _re
                     _vid_match = _re.search(r'/(\d{10,})(?:/|$|\?)', current_url)
                     if _vid_match:
                         video_id = _vid_match.group(1)
-                if not video_id:
-                    video_id = post_id
             except Exception:
+                pass
+
+            # If video_id is not in URL, check if article has links to a specific reel or video
+            if not video_id and article:
+                try:
+                    art_media_link = article.evaluate(r"""(el) => {
+                        const links = Array.from(el.querySelectorAll('a[href]'));
+                        for (const a of links) {
+                            const href = a.getAttribute('href') || '';
+                            const m = href.match(/\/(?:reel|videos|watch\/?\?v=)(\d{10,})/);
+                            if (m && m[1]) return m[1];
+                        }
+                        return '';
+                    }""")
+                    if art_media_link:
+                        video_id = art_media_link
+                        logger.info(f"Tìm thấy video/reel ID từ bài viết: {video_id}")
+                except Exception:
+                    pass
+
+            # A post ID is useful for finding its caption, but it is not proof
+            # that the post is a video. Keep the confirmed media ID separate so
+            # page-level video data from an unrelated post cannot classify an
+            # image post as a video.
+            media_video_id = video_id
+            if not video_id:
                 video_id = post_id
 
             post_data.text = self._extract_text(article, page, video_id)
+            if self._is_ui_text(post_data.text):
+                post_data.text = ""
             json_caption = self._extract_caption_from_story_json(page_html, post_id, video_id)
-            if json_caption and (not post_data.text or len(json_caption) > len(post_data.text)):
+            if json_caption and not self._is_ui_text(json_caption) and (not post_data.text or len(json_caption) > len(post_data.text)):
                 post_data.text = json_caption
                 logger.info(f"Caption from Facebook JSON ({len(json_caption)} chars)")
-            post_data.image_urls = self._extract_images(article)
+            if self._is_ui_text(post_data.text):
+                post_data.text = ""
+            post_data.image_urls = self._extract_images(article, page_html=page_html, post_id=post_id)
 
             # Video detection — extracts URL from page source JS data
-            video_info = self._detect_video(article, page, video_id)
+            video_info = self._detect_video(article, page, media_video_id)
             post_data.has_video = video_info["has_video"]
             post_data.video_url = video_info["video_url"]
 
@@ -410,8 +619,11 @@ class BrowserManager:
         ui_phrases = (
             "like", "comment", "share", "see more", "write a comment",
             "thích", "bình luận", "chia sẻ", "xem thêm", "viết bình luận",
+            "thước phim", "thước phim và video ngắn", "video phổ biến", "tin nổi bật",
+            "trang chủ", "bài viết phổ biến", "gợi ý cho bạn", "theo dõi", "follow",
+            "reels", "watch", "lượt xem", "views",
         )
-        if len(text) < 60 and any(phrase == lowered or lowered.startswith(phrase) for phrase in ui_phrases):
+        if len(text) < 60 and any(phrase == lowered or lowered.startswith(phrase) or lowered.endswith(phrase) for phrase in ui_phrases):
             return False
         if re.fullmatch(r"[\d,.\s]+", text):
             return False
@@ -457,11 +669,23 @@ class BrowserManager:
         except Exception:
             pass
 
+        current_url = getattr(page, "url", "") or ""
+        is_video_layout = any(k in current_url for k in ("/watch", "/reel", "/videos"))
+        if is_video_layout:
+            main = page.query_selector('[role="main"]')
+            if main:
+                logger.debug("Detected video page layout — using role=main")
+                return main
+
         # Strategy 1: Post dialog modal (photo post permalinks)
         dialog = page.query_selector('[role="dialog"]')
         if dialog:
             inner_text = dialog.inner_text()
-            if len(inner_text) > 50:
+            is_login_dialog = any(
+                sig in inner_text.lower()
+                for sig in ["đăng nhập", "tạo tài khoản", "log in", "sign up", "cookie", "xác nhận danh tính"]
+            )
+            if len(inner_text) > 50 and not is_login_dialog:
                 logger.debug("Found post in dialog modal")
                 return dialog
 
@@ -488,8 +712,8 @@ class BrowserManager:
 
         return None
 
-    def _extract_author(self, article) -> str:
-        """Extract post author from the article container."""
+    def _extract_author(self, article) -> tuple[str, str]:
+        """Extract the post author name and its canonical Facebook URL."""
         try:
             selectors = [
                 'h2 a strong span',
@@ -503,10 +727,22 @@ class BrowserManager:
                 if el:
                     text = el.inner_text().strip()
                     if text and len(text) > 1:
-                        return text
+                        href = el.evaluate("el => (el.closest('a') || el).href || ''")
+                        if href:
+                            from urllib.parse import parse_qs, urlparse
+                            parsed = urlparse(href)
+                            if parsed.hostname and parsed.hostname.lower().endswith("facebook.com"):
+                                path = parsed.path.strip("/")
+                                if path == "profile.php":
+                                    profile_id = parse_qs(parsed.query).get("id", [""])[0]
+                                    if profile_id:
+                                        return text, f"https://www.facebook.com/profile.php?id={profile_id}"
+                                if path:
+                                    return text, f"https://www.facebook.com/{path.split('/')[0]}"
+                        return text, ""
         except Exception:
             pass
-        return "Unknown"
+        return "Unknown", ""
 
     def _extract_timestamp(self, article) -> str:
         """Extract post timestamp from the article container."""
@@ -554,7 +790,9 @@ class BrowserManager:
                                     'xem thêm','see more','gửi','send','video',
                                     'hãy là người đầu tiên','be the first',
                                     'lượt xem','views','reels','watch',
-                                    'người đăng','public','bạn bè','friends'];
+                                    'người đăng','public','bạn bè','friends',
+                                    'thước phim','thước phim và video ngắn','video phổ biến',
+                                    'tin nổi bật','trang chủ','bài viết phổ biến'];
                         for (let s of skip) {
                             if (l === s || l.startsWith(s) || l.endsWith(s)) return true;
                         }
@@ -688,7 +926,9 @@ class BrowserManager:
                                 'haha','wow','phẫn nộ','viết bình luận','write a comment',
                                 'xem tất cả','all comments','xem thêm bình luận',
                                 'người đăng:','public','bạn bè','friends',
-                                'lượt xem','views','video','reels','watch'];
+                                'lượt xem','views','video','reels','watch',
+                                'thước phim','thước phim và video ngắn','video phổ biến',
+                                'tin nổi bật','trang chủ','bài viết phổ biến'];
                     for (let s of skip) {
                         if (l === s || l.startsWith(s)) return true;
                     }
@@ -731,15 +971,23 @@ class BrowserManager:
                 page_obj = page if page else article
                 page_text = page_obj.evaluate(r"""(el) => {
                     let html = document.documentElement.innerHTML;
-                    let match = html.match(/"message":\s*\{"text":"((?:[^"\\]|\\.)*)"/);
-                    if (match && match[1] && match[1].length > 3) {
-                        return match[1]
+                    let re = /"message":\s*\{"text":"((?:[^"\\]|\\.)*)"/g;
+                    let m;
+                    let skipPhrases = ['thước phim', 'video phổ biến', 'tin nổi bật', 'xem thêm', 'thích', 'chia sẻ', 'bình luận', 'gợi ý cho bạn'];
+                    while ((m = re.exec(html)) !== null) {
+                        let candidate = m[1];
+                        if (candidate.length < 5) continue;
+                        let candDecoded = candidate
                             .replace(/\\n/g, '\n')
                             .replace(/\\u0026/g, '&')
                             .replace(/\\u003C/g, '<')
                             .replace(/\\u003E/g, '>')
                             .replace(/\\"/g, '"')
-                            .replace(/\\u([0-9a-fA-F]{4})/g, (m, c) => String.fromCharCode(parseInt(c, 16)));
+                            .replace(/\\u([0-9a-fA-F]{4})/g, (match, c) => String.fromCharCode(parseInt(c, 16)))
+                            .trim();
+                        let candLower = candDecoded.toLowerCase();
+                        if (candDecoded.length < 60 && skipPhrases.some(s => candLower === s || candLower.startsWith(s) || candLower.endsWith(s))) continue;
+                        return candDecoded;
                     }
                     return '';
                 }""")
@@ -752,15 +1000,184 @@ class BrowserManager:
             logger.debug(f"Error extracting text: {e}")
         return ""
 
-    def _extract_images(self, article) -> List[str]:
+    @staticmethod
+    def _image_identity(url: str) -> str:
+        """Return a stable identity for the same Facebook image at different sizes."""
+        return str(url or "").split("?", 1)[0].strip()
+
+    @staticmethod
+    def _decode_facebook_url(value: str) -> str:
+        """Decode the URL escapes commonly used in Facebook's inline JSON."""
+        decoded = str(value or "")
+        decoded = decoded.replace("\\/", "/").replace("\\u0026", "&").replace("\\u003A", ":")
+        decoded = decoded.replace("&amp;", "&")
+        return re.sub(
+            r"\\u([0-9a-fA-F]{4})",
+            lambda match: chr(int(match.group(1), 16)),
+            decoded,
+        )
+
+    @staticmethod
+    def _read_json_object(source: str, object_start: int) -> str:
+        """Return one JSON object without relying on a fragile fixed window."""
+        if object_start < 0 or object_start >= len(source) or source[object_start] != "{":
+            return ""
+        depth = 0
+        in_string = False
+        escaped = False
+        for index in range(object_start, len(source)):
+            char = source[index]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif char == "\\\\":
+                    escaped = True
+                elif char == '"':
+                    in_string = False
+                continue
+            if char == '"':
+                in_string = True
+            elif char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    return source[object_start:index + 1]
+        return ""
+
+    def _extract_attachment_gallery_urls(self, page_html: str, anchor_positions: List[int]) -> List[str]:
+        """Read exact ``all_subattachments`` data for this story when present."""
+        image_urls: List[str] = []
+        seen: set[str] = set()
+        marker = '"all_subattachments":'
+        for anchor_position in anchor_positions:
+            search_end = min(len(page_html), anchor_position + 90_000)
+            marker_position = page_html.find(marker, anchor_position, search_end)
+            if marker_position < 0:
+                continue
+            object_start = marker_position + len(marker)
+            while object_start < search_end and page_html[object_start].isspace():
+                object_start += 1
+            payload = self._read_json_object(page_html, object_start)
+            if not payload:
+                continue
+            try:
+                nodes = json.loads(payload).get("nodes") or []
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            for node in nodes:
+                media = node.get("media") if isinstance(node, dict) else None
+                if not isinstance(media, dict):
+                    continue
+                image = media.get("viewer_image") or media.get("image") or {}
+                candidate = self._decode_facebook_url(str(image.get("uri") or "")) if isinstance(image, dict) else ""
+                identity = self._image_identity(candidate)
+                if identity and identity not in seen:
+                    seen.add(identity)
+                    image_urls.append(candidate)
+            if image_urls:
+                # An album object is self-contained. Later occurrences of the
+                # post ID describe comments, tracking or UI and must not add
+                # media to this gallery.
+                return image_urls
+        return image_urls
+
+    def _extract_scoped_image_urls_from_html(self, page_html: str, post_id: str) -> List[str]:
+        """Find attachment image URLs only in page data belonging to ``post_id``.
+
+        Facebook can leave a photo gallery out of the active dialog while keeping
+        its attachment JSON in the page source. Scoping every candidate to an
+        exact post anchor avoids collecting profile or suggested-post images.
+        """
+        clean_post_id = re.sub(r"\D", "", str(post_id or ""))
+        if len(clean_post_id) < 10 or not page_html:
+            return []
+
+        anchor_patterns = (
+            f'"post_id":"{clean_post_id}"',
+            f'"post_id": "{clean_post_id}"',
+            f'"story_fbid":"{clean_post_id}"',
+            f'"story_fbid": "{clean_post_id}"',
+            f'"id":"{clean_post_id}"',
+            f'"id": "{clean_post_id}"',
+        )
+        windows: List[str] = []
+        anchor_positions: List[int] = []
+        for anchor in anchor_patterns:
+            start = 0
+            while True:
+                position = page_html.find(anchor, start)
+                if position < 0:
+                    break
+                anchor_positions.append(position)
+                windows.append(page_html[max(0, position - 120_000): position + 180_000])
+                start = position + len(anchor)
+
+        if not windows:
+            return []
+
+        attachment_urls = self._extract_attachment_gallery_urls(page_html, anchor_positions)
+        if attachment_urls:
+            return attachment_urls
+
+        image_urls: List[str] = []
+        seen: set[str] = set()
+        image_pattern = re.compile(
+            r'https?(?::|\\u003A)(?:/{2}|\\/\\/)[^"\'<>\s]+?\.(?:jpe?g|png|webp|gif)(?:\?[^"\'<>\s]*)?',
+            re.IGNORECASE,
+        )
+        excluded_context = ("profile_picture", "profile_pic", "avatar", "actor", "author", "emoji", "icon", "sticker", "badge")
+        included_context = ("attachment", "subattachment", "photo", "image", "media", "gallery", "album")
+        for window in windows:
+            # Page payloads can be encoded more than once (``\\\\/`` rather
+            # than ``\\/``). Normalize only slash escapes before matching so
+            # the URL pattern remains readable and works for both payloads.
+            for _ in range(3):
+                normalized_window = window.replace(r"\/", "/")
+                if normalized_window == window:
+                    break
+                window = normalized_window
+            for match in image_pattern.finditer(window):
+                leading_context = window[max(0, match.start() - 500):match.start()].lower()
+                last_excluded = max((leading_context.rfind(token) for token in excluded_context), default=-1)
+                last_included = max((leading_context.rfind(token) for token in included_context), default=-1)
+                # The key immediately preceding a URL identifies its role. Do
+                # not reject a gallery image merely because an avatar appears
+                # later in the same attachment payload.
+                if last_excluded > last_included:
+                    continue
+                if last_included < 0:
+                    continue
+                candidate = self._decode_facebook_url(match.group(0))
+                if "scontent" not in candidate and "fbcdn" not in candidate:
+                    continue
+                identity = self._image_identity(candidate)
+                if identity and identity not in seen:
+                    seen.add(identity)
+                    image_urls.append(candidate)
+        return image_urls
+
+    def _merge_image_urls(self, *sources: List[str]) -> List[str]:
+        """Merge image candidates while preserving source confidence and order."""
+        merged: List[str] = []
+        seen: set[str] = set()
+        for source in sources:
+            for url in source:
+                identity = self._image_identity(url)
+                if identity and identity not in seen:
+                    seen.add(identity)
+                    merged.append(url)
+        return merged
+
+    def _extract_images(self, article, page_html: str = "", post_id: str = "") -> List[str]:
         """
         Extract full-resolution image URLs.
         Strategy: find all substantial images in the article,
         check their parent <a> links for photo page URLs,
         navigate to each photo page to get the full-res image.
         """
-        image_urls = []
-        seen_hrefs = set()
+        image_urls: List[str] = []
+        scoped_urls = self._extract_scoped_image_urls_from_html(page_html, post_id)
 
         try:
             # Find all photo page URLs from the article
@@ -827,7 +1244,7 @@ class BrowserManager:
 
             if not photo_hrefs:
                 logger.debug("No photo links found, using fallback")
-                return self._extract_images_fallback(article)
+                return self._merge_image_urls(scoped_urls, self._extract_images_fallback(article))
 
             logger.info(f"Tìm thấy {len(photo_hrefs)} ảnh, đang lấy full-res...")
 
@@ -841,13 +1258,13 @@ class BrowserManager:
 
             if not image_urls:
                 logger.debug("Photo page approach failed, using fallback")
-                return self._extract_images_fallback(article)
+                return self._merge_image_urls(image_urls, scoped_urls, self._extract_images_fallback(article))
 
         except Exception as e:
             logger.debug(f"Error extracting images: {e}")
-            return self._extract_images_fallback(article)
+            return self._merge_image_urls(image_urls, scoped_urls, self._extract_images_fallback(article))
 
-        return image_urls
+        return self._merge_image_urls(image_urls, scoped_urls, self._extract_images_fallback(article))
 
     def _get_fullres_from_photo_page(self, photo_url: str, index: int) -> Optional[str]:
         """
@@ -968,6 +1385,11 @@ class BrowserManager:
         """
         result = {"has_video": False, "video_url": ""}
         try:
+            current_page_url = getattr(page, "url", "") or ""
+            is_watch_or_reel = any(k in current_page_url for k in ("/watch", "/reel", "/videos"))
+            if is_watch_or_reel:
+                result["has_video"] = True
+
             # Check for video element within the post article
             video = article.query_selector("video")
             if video:
@@ -998,21 +1420,41 @@ class BrowserManager:
             # Facebook often lazy-loads the player, so the post can be a video even
             # when no <video> element has been rendered yet. Look for video delivery
             # data close to this post/video id before giving up.
-            if not result["has_video"]:
+            if not result["has_video"] and video_id:
                 try:
                     result["has_video"] = bool(page.evaluate(r"""(videoId) => {
                         const html = document.documentElement.innerHTML;
                         const signals = [
                             'videoDeliveryLegacyFields', 'videoDeliveryResponseFragment',
                             'dash_manifest', 'playable_url', 'browser_native_hd_url',
-                            'video_redirect', 'video_id'
+                            'browser_native_sd_url', 'playable_url_quality_hd',
+                            'progressive_url', 'progressive_urls', 'playback_url',
+                            'video_redirect', 'video_id', 'story_token'
                         ];
-                        if (!videoId) return signals.some(signal => html.includes(signal));
-                        const anchors = [
-                            `"video_id":"${videoId}"`, `"video_id": "${videoId}"`,
-                            `"post_id":"${videoId}"`, `"post_id": "${videoId}"`,
-                            `/${videoId}`
-                        ];
+                        let checkIds = [videoId];
+                        try {
+                            let m = window.location.href.match(/\/(?:reel|videos|watch\/?\?v=)(\d{10,})/);
+                            if (m && m[1] && !checkIds.includes(m[1])) checkIds.push(m[1]);
+                        } catch (_) {}
+
+                        const anchors = [];
+                        for (const id of checkIds) {
+                            if (!id) continue;
+                            anchors.push(
+                                `"video_id":"${id}"`, `"video_id": "${id}"`,
+                                `"post_id":"${id}"`, `"post_id": "${id}"`,
+                                `"v":"${id}"`, `"v": "${id}"`,
+                                `"story_token":"${id}"`, `"story_token": "${id}"`,
+                                `"fbid":"${id}"`, `"fbid": "${id}"`,
+                                `"root_video_id":"${id}"`, `"root_video_id": "${id}"`,
+                                `"initial_node_id":"${id}"`, `"initial_node_id": "${id}"`,
+                                `/${id}`
+                            );
+                        }
+                        // A generic signal anywhere in Facebook's page source
+                        // can belong to a suggested reel or another post. It is
+                        // only evidence when it is near a confirmed media ID.
+                        if (anchors.length === 0) return false;
                         for (const anchor of anchors) {
                             let pos = html.indexOf(anchor);
                             while (pos >= 0) {
@@ -1036,14 +1478,90 @@ class BrowserManager:
             # Use video_id to scope the search to the correct video
             try:
                 video_url = page.evaluate(r"""(videoId) => {
+                    // 1. Check DOM video elements inside main article/dialog container first
+                    try {
+                        const articleContainer = document.querySelector('[role="article"], [role="dialog"], [role="main"]');
+                        const domVideos = articleContainer
+                            ? Array.from(articleContainer.querySelectorAll('video'))
+                            : Array.from(document.querySelectorAll('video'));
+                        for (const v of domVideos) {
+                            const s = v.src || (v.querySelector('source') ? v.querySelector('source').src : '');
+                            if (s && s.startsWith('http') && (s.includes('fbcdn') || s.includes('scontent') || s.includes('.mp4'))) {
+                                return s;
+                            }
+                        }
+                    } catch (_) {}
+
                     let html = document.documentElement.innerHTML;
-                    
-                    // Find all quoted strings containing scontent...mp4
+
+                    // 2. Search for Facebook video delivery fields (browser_native_hd_url, playable_url, progressive_url, etc.)
+                    const fieldPatterns = [
+                        /\"(?:browser_native_hd_url|playable_url_quality_hd|playable_url|browser_native_sd_url|progressive_url|hd_src|sd_src|hd_src_no_ratelimit|sd_src_no_ratelimit|playback_url)\"\s*:\s*\"(https?:[^\"]+)\"/g
+                    ];
+                    let directMatches = [];
+                    for (const pat of fieldPatterns) {
+                        let m;
+                        while ((m = pat.exec(html)) !== null) {
+                            let u = m[1]
+                                .replace(/\\\//g, '/')
+                                .replace(/\\u0025/g, '%')
+                                .replace(/&amp;/g, '&')
+                                .replace(/\\u0026/g, '&');
+                            if (u.startsWith('http') && (u.includes('fbcdn') || u.includes('scontent'))) {
+                                directMatches.push({ url: u, pos: m.index });
+                            }
+                        }
+                    }
+                    if (directMatches.length > 0) {
+                        let targetIds = [videoId];
+                        try {
+                            let m = window.location.href.match(/\/(?:reel|videos|watch\/?\?v=)(\d{10,})/);
+                            if (m && m[1] && !targetIds.includes(m[1])) targetIds.push(m[1]);
+                        } catch (_) {}
+
+                        // Anchor to specific JSON keys
+                        let bestAnchorPos = -1;
+                        for (const tid of targetIds) {
+                            if (!tid || tid.length <= 5) continue;
+                            const patterns = [
+                                `"video_id":"${tid}"`, `"video_id": "${tid}"`,
+                                `"injected_video_id":"${tid}"`, `"root_video_id":"${tid}"`,
+                                `"initial_node_id":"${tid}"`, `"story_token":"${tid}"`,
+                                `"post_id":"${tid}"`, `"fbid":"${tid}"`
+                            ];
+                            for (const pat of patterns) {
+                                let idx = html.indexOf(pat);
+                                if (idx >= 0) {
+                                    bestAnchorPos = idx;
+                                    break;
+                                }
+                            }
+                            if (bestAnchorPos >= 0) break;
+                        }
+
+                        if (bestAnchorPos >= 0) {
+                            directMatches.sort((a, b) => Math.abs(a.pos - bestAnchorPos) - Math.abs(b.pos - bestAnchorPos));
+                            return directMatches[0].url;
+                        }
+
+                        for (const tid of targetIds) {
+                            if (tid && tid.length > 5) {
+                                let idx = html.indexOf(tid);
+                                if (idx >= 0) {
+                                    directMatches.sort((a, b) => Math.abs(a.pos - idx) - Math.abs(b.pos - idx));
+                                    return directMatches[0].url;
+                                }
+                            }
+                        }
+                        return directMatches[0].url;
+                    }
+
+                    // 3. Find all quoted strings containing scontent...mp4
                     // URLs in innerHTML appear as: "https:\/\/scontent...mp4?..."
                     let allUrls = [];
                     
                     // Match quoted URLs: path up to 1500 chars + query up to 2000 chars
-                    let re = /\"(https?:[^\"]{10,1500}\.mp4\?[^\"]{10,2000})\"/g;
+                    let re = /\"(https?:[^\"]{10,1500}\.mp4(?:\?[^\"]*)?)\"/g;
                     let match;
                     
                     while ((match = re.exec(html)) !== null) {
@@ -1069,26 +1587,30 @@ class BrowserManager:
                     if (allUrls.length === 0) return '';
                     
                     // If we have a video ID, find URLs near that video's reference
-                    if (videoId && videoId.length > 5) {
-                        // Find ALL occurrences of video_id in the HTML
-                        let searchStr = '"video_id":"' + videoId + '"';
+                    let targetIds = [videoId];
+                    try {
+                        let m = window.location.href.match(/\/(?:reel|videos|watch\/?\?v=)(\d{10,})/);
+                        if (m && m[1] && !targetIds.includes(m[1])) targetIds.push(m[1]);
+                    } catch (_) {}
+
+                    for (const tid of targetIds) {
+                        if (!tid || tid.length <= 5) continue;
+                        let searchPatterns = [
+                            '"video_id":"' + tid + '"',
+                            '"video_id": "' + tid + '"',
+                            '"injected_video_id":"' + tid + '"',
+                            '"root_video_id":"' + tid + '"',
+                            '"initial_node_id":"' + tid + '"'
+                        ];
                         let vidRefs = [];
-                        let searchStart = 0;
-                        while (true) {
-                            let idx = html.indexOf(searchStr, searchStart);
-                            if (idx === -1) break;
-                            vidRefs.push(idx);
-                            searchStart = idx + 1;
-                        }
-                        
-                        // Also check injected_video_id
-                        searchStr = '"injected_video_id":"' + videoId + '"';
-                        searchStart = 0;
-                        while (true) {
-                            let idx = html.indexOf(searchStr, searchStart);
-                            if (idx === -1) break;
-                            vidRefs.push(idx);
-                            searchStart = idx + 1;
+                        for (const searchStr of searchPatterns) {
+                            let searchStart = 0;
+                            while (true) {
+                                let idx = html.indexOf(searchStr, searchStart);
+                                if (idx === -1) break;
+                                vidRefs.push(idx);
+                                searchStart = idx + 1;
+                            }
                         }
                         
                         if (vidRefs.length > 0) {
@@ -1108,15 +1630,11 @@ class BrowserManager:
                             }
                             
                             if (candidateUrls.length > 0) {
-                                // Prefer URLs with explicit bitrate (progressive downloads)
-                                // over DASH segments (bitrate=0)
                                 let withBitrate = candidateUrls.filter(u => u.bitrate > 0);
                                 if (withBitrate.length > 0) {
-                                    // Pick highest bitrate for best quality
                                     withBitrate.sort((a, b) => b.bitrate - a.bitrate);
                                     return withBitrate[0].url;
                                 }
-                                // Fall back to first candidate URL
                                 return candidateUrls[0].url;
                             }
                         }
@@ -1148,20 +1666,25 @@ class BrowserManager:
     @staticmethod
     def _is_ui_text(text: str) -> bool:
         """Check if text is UI/navigation text rather than post content."""
+        if not text:
+            return False
         ui_patterns = [
-            "Thích", "Bình luận", "Chia sẻ", "Gửi",
-            "Like", "Comment", "Share", "Send",
-            "Viết bình luận", "Write a comment",
-            "Xem thêm", "See more",
-            "Tất cả bình luận", "All comments",
+            "thích", "bình luận", "chia sẻ", "gửi",
+            "like", "comment", "share", "send",
+            "viết bình luận", "write a comment",
+            "xem thêm", "see more",
+            "tất cả bình luận", "all comments",
             "phản hồi", "reply",
-            "Haha", "Wow", "Buồn", "Phẫn nộ",
-            "Trả lời", "Reply",
+            "haha", "wow", "buồn", "phẫn nộ",
+            "trả lời", "thước phim", "thước phim và video ngắn",
+            "video phổ biến", "tin nổi bật", "trang chủ", "bài viết phổ biến",
+            "gợi ý cho bạn", "theo dõi", "follow", "lượt xem", "views",
+            "người đăng", "reels", "watch",
         ]
         text_lower = text.strip().lower()
-        if len(text) < 30:
+        if len(text_lower) < 60:
             for pattern in ui_patterns:
-                if text_lower == pattern.lower():
+                if text_lower == pattern or text_lower.startswith(pattern) or text_lower.endswith(pattern):
                     return True
         return False
 

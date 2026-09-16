@@ -25,12 +25,19 @@ if not defined PYTHON_CMD (
     exit /b 1
 )
 
+echo [Tinix] Dang dung phien ban dang chay truoc khi build...
+call "%~dp0STOP.bat" silent
+
 "%PYTHON_CMD%" scripts\build_app.py %*
 if errorlevel 1 (
     echo [ERROR] Build that bai!
+    echo [Tinix] Khong tu dong khoi dong lai vi build that bai.
     pause
     exit /b 1
 )
+
+echo [Tinix] Dang khoi dong lai app voi phien ban moi...
+start "" wscript.exe //nologo "%~dp0START.vbs"
 
 echo.
 ping 127.0.0.1 -n 3 >nul

@@ -124,7 +124,7 @@ def build(bump_type: str = "patch", set_version: str = None, no_bump: bool = Fal
 
     print("=" * 60)
     print(f"🎉 Build complete! Tinix-Facebook-Hunter v{new_ver}")
-    print(f"   Launcher : {os.path.join(BASE_DIR, 'START.bat')}")
+    print(f"   Launcher : {os.path.join(BASE_DIR, 'START.vbs')} (Silent) / START.bat")
     print(f"   App Mode : Standalone (Chrome / Edge)")
     print("=" * 60)
     return new_ver

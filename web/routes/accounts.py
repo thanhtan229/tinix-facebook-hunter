@@ -2,25 +2,34 @@ import os
 import json
 import subprocess
 import threading
+import time
 import urllib.request
 import shutil
 import uuid
+import psutil
 from pathlib import Path
 from fastapi import APIRouter, HTTPException
 from pydantic import Field, HttpUrl
-from typing import Optional, Dict, Any
+from typing import Literal, Optional, Dict, Any
 from core.db_storage import (
     get_db_path,
     get_all_accounts,
     get_account,
     add_account,
     update_account,
+    save_account_preflight_result,
     delete_account,
     get_all_managed_pages,
     get_social_accounts,
     add_social_account,
     update_social_account,
     delete_social_account,
+)
+from core.account_preflight import check_facebook_account
+from core.profile_lease import (
+    ProfileLeaseConflict,
+    acquire_profile_leases,
+    release_profile_leases,
 )
 from utils.chrome_profiles import scraper_profile_dir, chrome_profiles_root, project_root
 from utils.profile_bundle import (
@@ -44,9 +53,17 @@ router = APIRouter(prefix="/api/accounts", tags=["Accounts"])
 
 _CHROME_PROCESSES: Dict[int, subprocess.Popen] = {}
 _CHROME_PROCESS_LOCK = threading.RLock()
+_MANAGED_PROFILE_LEASES: Dict[int, tuple[str, set[str]]] = {}
+
+# Large, long-lived account profiles can need more than a few seconds after a
+# browser upgrade before their DevTools endpoint is ready.  Keep this bounded so
+# the web request cannot wait indefinitely.
+_CDP_START_TIMEOUT_S = 25.0
+_CDP_RECOVERY_TIMEOUT_S = 15.0
+_STATUS_BREAKPOINT = 0x80000003
 
 ACCOUNT_SECRET_FIELDS = {
-    "password", "secret_2fa", "email_pass", "cookie", "profile_dir"
+    "password", "secret_2fa", "email_pass", "cookie", "profile_dir", "recovery_codes"
 }
 
 
@@ -56,29 +73,143 @@ def _public_account(account: Dict[str, Any]) -> Dict[str, Any]:
     public["has_password"] = bool(account.get("password"))
     public["has_2fa"] = bool(account.get("secret_2fa"))
     public["has_cookie"] = bool(account.get("cookie"))
+    public["has_recovery_codes"] = bool(account.get("recovery_codes"))
+    account_id = int(account.get("id") or 0)
+    port = _chrome_debug_port(account_id) if account_id else 0
+    with _CHROME_PROCESS_LOCK:
+        proc = _CHROME_PROCESSES.get(account_id)
+        is_running = proc is not None and proc.poll() is None
+    public["port"] = port
+    public["is_chrome_running"] = is_running
     return public
 
-def _find_chrome_path() -> str:
+def _find_browser_paths() -> list[str]:
+    """Find installed Chromium browsers in launch preference order."""
     candidates = [
         r"C:\Program Files\Google\Chrome\Application\chrome.exe",
         r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
         os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
+        r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+        os.path.expandvars(r"%LOCALAPPDATA%\Microsoft\Edge\Application\msedge.exe"),
     ]
+    found: list[str] = []
     for path in candidates:
-        if path and os.path.exists(path):
-            return path
-    return "chrome"
+        if path and os.path.exists(path) and path not in found:
+            found.append(path)
+    for command in ("chrome", "msedge"):
+        resolved = shutil.which(command)
+        if resolved and resolved not in found:
+            found.append(resolved)
+    return found
+
+
+def _find_chrome_path() -> Optional[str]:
+    """Return the preferred Chromium browser for compatibility callers."""
+    paths = _find_browser_paths()
+    return paths[0] if paths else None
+
+
+def _browser_label(browser_path: str) -> str:
+    return "Microsoft Edge" if Path(browser_path).stem.casefold() == "msedge" else "Google Chrome"
+
+
+def _wait_for_cdp_port(
+    process: subprocess.Popen,
+    port: int,
+    timeout_s: float = _CDP_START_TIMEOUT_S,
+) -> bool:
+    """Wait until the launched browser exposes the account's local CDP endpoint."""
+    deadline = time.monotonic() + timeout_s
+    url = f"http://127.0.0.1:{port}/json/version"
+    while time.monotonic() < deadline:
+        try:
+            with urllib.request.urlopen(url, timeout=0.75) as response:
+                if response.status == 200:
+                    return True
+        except Exception:
+            # Chrome can hand work to a child process while the original
+            # launcher is exiting.  Check the endpoint once before treating
+            # that hand-off as a startup failure.
+            if process.poll() is not None:
+                return False
+            time.sleep(0.2)
+    return False
+
+
+def _browser_exit_code(process: subprocess.Popen) -> Optional[int]:
+    """Return the browser exit code without allowing diagnostics to fail launch."""
+    try:
+        code = process.poll()
+        return int(code) if code is not None else None
+    except Exception:
+        return None
+
+
+def _is_breakpoint_exit(process: subprocess.Popen) -> bool:
+    """Identify Windows STATUS_BREAKPOINT regardless of signed exit-code form."""
+    code = _browser_exit_code(process)
+    return code is not None and (code & 0xFFFFFFFF) == _STATUS_BREAKPOINT
+
+
+def _browser_failure_message(process: subprocess.Popen, timeout_s: float) -> str:
+    """Produce a safe, actionable browser-start diagnosis for the web UI."""
+    code = _browser_exit_code(process)
+    if code is None:
+        return f"không mở được cổng điều khiển sau {int(timeout_s)} giây"
+    code_hex = f"0x{code & 0xFFFFFFFF:08X}"
+    if (code & 0xFFFFFFFF) == _STATUS_BREAKPOINT:
+        return (
+            "browser gặp lỗi Windows STATUS_BREAKPOINT (0x80000003); "
+            "profile hoặc GPU cache có thể đang lỗi"
+        )
+    return f"browser thoát sớm với mã {code_hex}"
+
+
+def _stop_failed_browser_process(process: subprocess.Popen) -> None:
+    """Best-effort cleanup for a failed browser and all of its child processes."""
+    try:
+        if process.poll() is not None:
+            return
+        root = psutil.Process(process.pid)
+        processes = root.children(recursive=True) + [root]
+        for child in reversed(processes):
+            try:
+                child.terminate()
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+        _, alive = psutil.wait_procs(processes, timeout=2)
+        for child in alive:
+            try:
+                child.kill()
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+    except Exception:
+        # Fall back to the process handle when the OS no longer exposes a
+        # process tree (for example, during a very early browser crash).
+        try:
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+        except Exception:
+            pass
 
 class AccountSaveRequest(ApiRequest):
     id: Optional[int] = Field(default=None, gt=0)
-    label: Optional[str] = Field(default="", max_length=200)
-    username: Optional[str] = Field(default="", max_length=500)
-    password: Optional[str] = Field(default="", max_length=2_000)
-    secret_2fa: Optional[str] = Field(default="", max_length=500)
-    email: Optional[str] = Field(default="", max_length=500)
-    email_pass: Optional[str] = Field(default="", max_length=2_000)
-    cookie: Optional[str] = Field(default="", max_length=200_000)
-    is_active: Optional[bool] = True
+    label: Optional[str] = Field(default=None, max_length=200)
+    username: Optional[str] = Field(default=None, max_length=500)
+    password: Optional[str] = Field(default=None, max_length=2_000)
+    secret_2fa: Optional[str] = Field(default=None, max_length=500)
+    email: Optional[str] = Field(default=None, max_length=500)
+    email_pass: Optional[str] = Field(default=None, max_length=2_000)
+    recovery_email: Optional[str] = Field(default=None, max_length=500)
+    recovery_codes: Optional[str] = Field(default=None, max_length=50_000)
+    cookie: Optional[str] = Field(default=None, max_length=200_000)
+    notes: Optional[str] = Field(default=None, max_length=10_000)
+    is_active: Optional[bool] = None
 
 class AccountDeleteRequest(ApiRequest):
     account_id: int = Field(gt=0)
@@ -141,7 +272,24 @@ def _close_managed_chrome(account_id: int) -> bool:
                 process.wait(timeout=3)
             except subprocess.TimeoutExpired:
                 process.kill()
+    with _CHROME_PROCESS_LOCK:
+        lease = _MANAGED_PROFILE_LEASES.pop(account_id, None)
+    if lease:
+        release_profile_leases(*lease)
     return closed
+
+
+def _release_stale_managed_profile_lease(account_id: int) -> None:
+    """Free a manual-profile lease when its tracked browser has already exited."""
+    account_id = int(account_id)
+    with _CHROME_PROCESS_LOCK:
+        process = _CHROME_PROCESSES.get(account_id)
+        if process is not None and process.poll() is None:
+            return
+        _CHROME_PROCESSES.pop(account_id, None)
+        lease = _MANAGED_PROFILE_LEASES.pop(account_id, None)
+    if lease:
+        release_profile_leases(*lease)
 
 @router.get("/")
 def list_accounts():
@@ -149,6 +297,87 @@ def list_accounts():
     db_p = get_db_path(config.get("scraper_db_path", ""))
     accounts = get_all_accounts(db_p)
     return {"status": "success", "data": [_public_account(account) for account in accounts]}
+
+@router.get("/{account_id}/detail")
+def get_account_detail(account_id: int):
+    """Return account metadata for editing without exposing stored secrets."""
+    db_p = get_db_path(config.get("scraper_db_path", ""))
+    account = get_account(db_p, account_id)
+    if not account:
+        raise HTTPException(status_code=404, detail="Không tìm thấy tài khoản")
+
+    port = _chrome_debug_port(account_id)
+    with _CHROME_PROCESS_LOCK:
+        proc = _CHROME_PROCESSES.get(account_id)
+        is_running = proc is not None and proc.poll() is None
+
+    stored_profile = str(account.get("profile_dir") or "").strip()
+    profile_dir = str(
+        Path(stored_profile).expanduser().resolve()
+        if stored_profile else scraper_profile_dir(account_id).resolve()
+    )
+
+    data = {
+        **_public_account(account),
+        "port": port,
+        "is_chrome_running": is_running,
+        "cdp_url": f"http://127.0.0.1:{port}",
+        "profile_dir": profile_dir,
+    }
+    return {"status": "success", "data": data}
+
+
+@router.post("/{account_id}/secret/{secret_name}")
+def reveal_account_secret(
+    account_id: int,
+    secret_name: Literal["password", "secret_2fa", "cookie", "recovery_codes"],
+):
+    """Reveal one stored credential only after an explicit local UI action."""
+    db_p = get_db_path(config.get("scraper_db_path", ""))
+    account = get_account(db_p, account_id)
+    if not account:
+        raise HTTPException(status_code=404, detail="Không tìm thấy tài khoản")
+    return {"status": "success", "data": {"value": str(account.get(secret_name) or "")}}
+
+
+@router.post("/{account_id}/preflight")
+def preflight_account(account_id: int):
+    """Manually verify that this profile can authenticate before a large download."""
+    db_p = get_db_path(config.get("scraper_db_path", ""))
+    account = get_account(db_p, account_id)
+    if not account:
+        raise HTTPException(status_code=404, detail="Không tìm thấy tài khoản")
+
+    _release_stale_managed_profile_lease(account_id)
+    with _CHROME_PROCESS_LOCK:
+        process = _CHROME_PROCESSES.get(account_id)
+        chrome_open = process is not None and process.poll() is None
+    if chrome_open:
+        raise HTTPException(
+            status_code=409,
+            detail="Hãy đóng Chrome Profile của account này trước khi check preflight.",
+        )
+    lease_owner = f"manual-preflight-{account_id}"
+    try:
+        lease_keys = acquire_profile_leases(lease_owner, [account])
+    except ProfileLeaseConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    try:
+        result = check_facebook_account(account).to_dict()
+    finally:
+        release_profile_leases(lease_owner, lease_keys)
+    result["checked_at"] = save_account_preflight_result(
+        db_p,
+        account_id,
+        code=result["code"],
+        message=result["message"],
+    )
+    level = "OK" if result["ready"] else "WARNING"
+    log_to_web(
+        f"[Account #{account_id} · {result['label']}] PREFLIGHT {result['code']}: {result['message']}",
+        level,
+    )
+    return {"status": "success", "data": result}
 
 @router.post("/save")
 def save_account_endpoint(req: AccountSaveRequest):
@@ -158,30 +387,69 @@ def save_account_endpoint(req: AccountSaveRequest):
         # Update
         fields = model_data(req, exclude_unset=True)
         acc_id = fields.pop("id")
+        fields = {k: v for k, v in fields.items() if v is not None}
+        if "is_active" in fields:
+            fields["is_active"] = int(bool(fields["is_active"]))
+        fields.update(
+            preflight_status="",
+            preflight_message="",
+            preflight_checked_at="",
+        )
         success = update_account(db_p, acc_id, **fields)
         if not success:
-            raise HTTPException(status_code=404, detail="Không tìm thấy tài khoản hoặc không có thay đổi")
+            raise HTTPException(status_code=404, detail="Không tìm thấy tài khoản")
         log_to_web(f"Đã cập nhật tài khoản ID #{acc_id}.", "OK")
         return {"status": "success", "id": acc_id}
     else:
         # Insert
+        username = req.username or req.email or f"acc_{uuid.uuid4().hex[:6]}"
         new_id = add_account(
             db_p,
-            username=req.username or "",
+            username=username,
             password=req.password or "",
-            label=req.label or req.username or "Account mới",
+            label=req.label or req.username or req.email or "Account mới",
             secret_2fa=req.secret_2fa or "",
             email=req.email or "",
             email_pass=req.email_pass or "",
+            recovery_email=req.recovery_email or "",
+            recovery_codes=req.recovery_codes or "",
             cookie=req.cookie or "",
-            is_active=int(bool(req.is_active))
+            notes=req.notes or "",
+            is_active=int(bool(req.is_active if req.is_active is not None else True))
         )
+        if new_id < 0:
+            raise HTTPException(status_code=400, detail="Không thể tạo tài khoản mới (có thể username/UID đã tồn tại)")
         log_to_web(f"Đã thêm tài khoản mới ID #{new_id}.", "OK")
         return {"status": "success", "id": new_id}
+
+@router.post("/clear-credentials")
+def clear_account_credentials(req: AccountDeleteRequest):
+    """Clear stored password, 2FA secret, cookie, and recovery codes for an account."""
+    db_p = get_db_path(config.get("scraper_db_path", ""))
+    account = get_account(db_p, req.account_id)
+    if not account:
+        raise HTTPException(status_code=404, detail="Không tìm thấy tài khoản")
+    update_account(
+        db_p,
+        req.account_id,
+        password="",
+        secret_2fa="",
+        cookie="",
+        recovery_codes="",
+        preflight_status="",
+        preflight_message="",
+        preflight_checked_at="",
+    )
+    log_to_web(f"Đã xóa credentials cho tài khoản ID #{req.account_id}.", "WARNING")
+    return {"status": "success", "message": "Đã xóa credentials"}
 
 @router.post("/delete")
 def delete_account_endpoint(req: AccountDeleteRequest):
     """Delete an account by ID."""
+    from web.routes.downloader import download_has_active_or_pending_work
+    from web.routes.scraper import scrape_is_running
+    if scrape_is_running() or download_has_active_or_pending_work():
+        raise HTTPException(status_code=409, detail="Hãy dừng tác vụ quét và tải trước khi xóa account")
     db_p = get_db_path(config.get("scraper_db_path", ""))
     delete_account(db_p, req.account_id)
     log_to_web(f"Đã xóa tài khoản ID #{req.account_id}.", "WARNING")
@@ -189,12 +457,23 @@ def delete_account_endpoint(req: AccountDeleteRequest):
 
 @router.post("/launch")
 def launch_chrome_profile(req: LaunchProfileRequest):
-    """Launch dedicated Chrome Profile for account."""
-    chrome_bin = _find_chrome_path()
+    """Launch a dedicated account profile in a verified Chromium browser."""
+    browser_paths = _find_browser_paths()
+    if not browser_paths:
+        raise HTTPException(
+            status_code=503,
+            detail="Không tìm thấy Google Chrome hoặc Microsoft Edge. Hãy cài đặt một trong hai trình duyệt rồi thử lại.",
+        )
     db_p = get_db_path(config.get("scraper_db_path", ""))
     account = get_account(db_p, req.account_id)
     if account is None:
         raise HTTPException(status_code=404, detail="Không tìm thấy tài khoản")
+    _release_stale_managed_profile_lease(req.account_id)
+    lease_owner = f"manual-profile-{req.account_id}"
+    try:
+        lease_keys = acquire_profile_leases(lease_owner, [account])
+    except ProfileLeaseConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     stored_profile = str(account.get("profile_dir") or "").strip()
     profile_dir = str(
         Path(stored_profile).expanduser().resolve()
@@ -203,22 +482,91 @@ def launch_chrome_profile(req: LaunchProfileRequest):
     port = _chrome_debug_port(req.account_id)
     target_url = str(req.url or "https://www.facebook.com")
 
-    cmd = [
-        chrome_bin,
-        f"--user-data-dir={profile_dir}",
-        f"--remote-debugging-port={port}",
-        "--no-first-run",
-        "--no-default-browser-check",
-        target_url,
-    ]
-    try:
-        process = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        with _CHROME_PROCESS_LOCK:
-            _CHROME_PROCESSES[req.account_id] = process
-        log_to_web(f"Đã mở Chrome Profile cho Account #{req.account_id} (Port {port}).", "INFO")
-        return {"status": "success", "profile_dir": profile_dir, "port": port}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Không thể mở Chrome: {str(e)}") from e
+    with _CHROME_PROCESS_LOCK:
+        running_process = _CHROME_PROCESSES.get(req.account_id)
+        if running_process is not None and running_process.poll() is None:
+            _MANAGED_PROFILE_LEASES[req.account_id] = (lease_owner, lease_keys)
+            return {
+                "status": "success",
+                "profile_dir": profile_dir,
+                "port": port,
+                "browser_label": "Chrome/Edge",
+                "already_running": True,
+            }
+
+    failed_browsers: list[str] = []
+    failure_reasons: list[str] = []
+    for browser_bin in browser_paths:
+        label = _browser_label(browser_bin)
+        retry_with_gpu_disabled = False
+        for recovery_mode, timeout_s in ((False, _CDP_START_TIMEOUT_S), (True, _CDP_RECOVERY_TIMEOUT_S)):
+            if recovery_mode and not retry_with_gpu_disabled:
+                break
+            cmd = [
+                browser_bin,
+                f"--user-data-dir={profile_dir}",
+                f"--remote-debugging-port={port}",
+                "--remote-allow-origins=*",
+                "--no-first-run",
+                "--no-default-browser-check",
+                "--new-window",
+            ]
+            if recovery_mode:
+                # Retry only after the exact Windows breakpoint crash shown to
+                # the user.  This preserves extensions and normal GPU behavior
+                # for every healthy profile.
+                cmd.append("--disable-gpu")
+            cmd.append(target_url)
+            try:
+                process = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except OSError as exc:
+                failure_reasons.append(f"{label}: không thể tạo tiến trình ({exc.__class__.__name__})")
+                break
+
+            if _wait_for_cdp_port(process, port, timeout_s=timeout_s):
+                with _CHROME_PROCESS_LOCK:
+                    _CHROME_PROCESSES[req.account_id] = process
+                    _MANAGED_PROFILE_LEASES[req.account_id] = (lease_owner, lease_keys)
+                mode_note = " (đã tắt GPU để phục hồi)" if recovery_mode else ""
+                log_to_web(
+                    f"Đã mở {label} Profile cho Account #{req.account_id} (Port {port}){mode_note}.",
+                    "INFO",
+                )
+                return {
+                    "status": "success",
+                    "profile_dir": profile_dir,
+                    "port": port,
+                    "browser_label": label,
+                    "recovery_mode": "gpu_disabled" if recovery_mode else None,
+                }
+
+            failure = _browser_failure_message(process, timeout_s)
+            retry_with_gpu_disabled = not recovery_mode and _is_breakpoint_exit(process)
+            _stop_failed_browser_process(process)
+            failure_reasons.append(f"{label}: {failure}")
+            if retry_with_gpu_disabled:
+                log_to_web(
+                    f"{label} không khởi động được profile ({failure}); đang thử lại với GPU tắt.",
+                    "WARNING",
+                )
+                continue
+            break
+
+        failed_browsers.append(label)
+        reason = failure_reasons[-1] if failure_reasons else f"{label}: không rõ nguyên nhân"
+        log_to_web(f"{reason}; đang thử trình duyệt thay thế.", "WARNING")
+
+    tried = " và ".join(dict.fromkeys(failed_browsers)) or "trình duyệt Chromium"
+    diagnostic = "; ".join(failure_reasons)
+    suffix = f" Chi tiết: {diagnostic}." if diagnostic else ""
+    release_profile_leases(lease_owner, lease_keys)
+    raise HTTPException(
+        status_code=500,
+        detail=(
+            f"Không thể khởi động profile bằng {tried}. "
+            f"Hãy đóng các cửa sổ profile còn sót rồi thử lại.{suffix}"
+        ),
+    )
 
 
 @router.post("/close")
@@ -243,6 +591,14 @@ def close_all_chrome_profiles(_req: ApiRequest):
     closed_count = sum(1 for account_id in sorted(account_ids) if _close_managed_chrome(account_id))
     log_to_web(f"Đã đóng {closed_count} cửa sổ Chrome do Tinix quản lý.", "INFO")
     return {"status": "success", "closed_count": closed_count}
+
+
+def shutdown_managed_chrome_profiles() -> None:
+    """Close only browser instances launched from the Accounts workspace."""
+    with _CHROME_PROCESS_LOCK:
+        account_ids = list(_CHROME_PROCESSES)
+    for account_id in account_ids:
+        _close_managed_chrome(account_id)
 
 
 @router.post("/profile/export")
