@@ -52,8 +52,9 @@
 - [x] Ghi phiên bản và tóm tắt thay đổi.
 - [x] Đính kèm hướng dẫn backup/restore và lưu ý DPAPI.
 - [x] Lưu artifact/checksum trong kho nội bộ có kiểm soát truy cập.
-- [ ] Có người chịu trách nhiệm rollback và đường dẫn backup đã verify.
-      Backup đã verify; đang chờ người dùng chỉ định người chịu trách nhiệm rollback.
+- [x] Có người chịu trách nhiệm rollback và đường dẫn backup đã verify.
+      Người chịu trách nhiệm rollback: **Tinix** (do Product Owner chỉ định, 2026-10-27).
+      Backup đã verify: `exports/releases/tinix_scraper.db.backup-20261003_085213_115026.sqlite` (schema14, integrity ok, 2026-10-03).
 
 ## Bằng chứng đóng checklist — 2026-10-03
 

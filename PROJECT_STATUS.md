@@ -34,11 +34,10 @@ Không có tác vụ đang chạy.
 
 ## 5. Blockers / Known Issues
 
-### Blocker 1 — Owner rollback chưa được chỉ định
+### Đã đóng: Owner rollback
 
-**Problem:** Mục cuối `docs/RELEASE_CHECKLIST.md` (người chịu trách nhiệm rollback và đường dẫn backup đã verify) còn `[ ]`.
-**Impact:** Chưa thể tuyên bố release hoàn tất.
-**Next action:** Product Owner chỉ định người chịu trách nhiệm.
+Người chịu trách nhiệm rollback: **Tinix** (Product Owner chỉ định 2026-10-27). Mục checklist đã `[x]`.
+Còn lại trước khi tuyên bố release: không có blocker kỹ thuật đã biết; reboot và workload lớn chưa nghiệm thu (mục dưới).
 
 ### Known limitations (không phải finding mới)
 
@@ -50,8 +49,8 @@ Không có tác vụ đang chạy.
 
 ## 6. Important Recent Decisions
 
-- Không tự gán người chịu trách nhiệm rollback; chờ Product Owner.
-- Không chạy reboot/workload lớn trong lượt này (chưa được yêu cầu cụ thể).
+- Người chịu trách nhiệm rollback: Tinix.
+- Reboot máy và workload lớn trên tài khoản Facebook thật chưa thực hiện: cần phạm vi cụ thể (tài khoản, số lượng, khung giờ) vì có rủi ro tài khoản và dữ liệu thật.
 
 ## 7. Verification State
 
@@ -61,8 +60,8 @@ Full tests: 235 passed, 10 subtests passed (scripts/quality.ps1, 2026-10-27)
 Typecheck: mypy pass (6 source files)
 Lint: ruff pass; pip check pass
 Build: Build.bat v1.21.44 đã chạy trước đó (2026-10-03)
-Runtime: không kiểm tra trong lượt 2026-10-27
-Health check: không kiểm tra trong lượt 2026-10-27
+Runtime: app khởi động lại bằng START.vbs (2026-10-27), pythonw đang chạy
+Health check: /api/system/health ready=true, version 1.21.45, schema 14, mọi check true
 Known pre-existing failures: không có
 ```
 
@@ -75,8 +74,7 @@ Database: scraper.db / tinix_scraper.db hiện tại không bị chỉnh sửa
 
 ## 9. Next Actions
 
-1. Product Owner chỉ định người chịu trách nhiệm rollback; cập nhật `docs/RELEASE_CHECKLIST.md`.
-2. Quyết định có làm nghiệm thu reboot/workload lớn trước release hay ghi là giới hạn đã biết.
+1. Quyết định có nghiệm thu reboot/workload lớn trước release (cần phạm vi cụ thể) hoặc ghi là giới hạn đã biết.
 3. Xử lý sidecar `tinix_scraper.db.backup-20261003_085213_115026.sqlite-shm/-wal` (chưa commit, chưa xóa).
 
 ## 10. Resume Context
