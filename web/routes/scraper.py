@@ -7,6 +7,7 @@ from pydantic import Field, HttpUrl, model_validator
 from typing import List, Literal, Optional
 from core.page_scraper import PageScraper, is_valid_facebook_page_name
 from core.page_search import PageSearchEngine
+from core.url_handler import is_story_permalink_for_id, is_video_url_for_story_id, normalize_video_post_url, parse_urls
 from core.account_preflight import check_facebook_account
 from core.profile_lease import (
     ProfileLeaseConflict,
@@ -31,6 +32,8 @@ from core.db_storage import (
     find_page_by_url,
     get_page_post_ids,
     get_page_archive_cursor,
+    get_post_by_row_id,
+    get_post_row_id,
     mark_favorite_scan_started,
     reset_favorite_cursor,
     reset_favorite_cursors,
@@ -341,30 +344,63 @@ def _run_page_search(
         _release_scrape_profile_leases()
 
 
-def _downloadable_post_urls(posts: List[object]) -> List[str]:
-    """Return unique post URLs keyed by the stable ID persisted in Post Spy."""
-    urls: List[str] = []
-    seen: set[str] = set()
+def _downloadable_post_urls(posts: List[object], db_path: str = "", page_url: str = "") -> List[dict]:
+    """Return playable URLs paired with the exact Post Spy row they belong to."""
+    items: List[dict] = []
+    seen: set[tuple[str, object]] = set()
     for post in posts:
         post_id = str(getattr(post, "post_id", "") or "").strip()
-        # Scanner video links often use ``watch/?v=<video_id>`` while the
-        # database is keyed by the post ID.  A direct numeric URL lets the
-        # downloader resolve that same DB row and update its status correctly.
-        url = (
-            f"https://www.facebook.com/{post_id}"
-            if post_id.isdigit()
-            else str(getattr(post, "url", "") or "").strip()
-        )
-        if url and url not in seen:
-            seen.add(url)
-            urls.append(url)
-    return urls
+        if not post_id and str(getattr(post, "post_type", "")) == "Video":
+            logger.warning("Bỏ qua Auto Download cho video không có ID nguồn")
+            continue
+        scraped_url = str(getattr(post, "url", "") or "").strip()
+        row_id = get_post_row_id(db_path, page_url, post_id) if db_path and page_url and post_id else 0
+        saved_post = get_post_by_row_id(db_path, row_id) if db_path and row_id else None
+        # Prefer the attachment URL. If the scraper only has a story permalink,
+        # keep that fallback so the downloader can inspect the exact post.
+        if str(getattr(post, "post_type", "")) == "Video":
+            verified_candidates = (
+                (scraped_url, bool(getattr(post, "video_url_verified", False))),
+                (str((saved_post or {}).get("url") or ""), bool((saved_post or {}).get("video_url_verified"))),
+            )
+            url = next((canonical for candidate, verified in verified_candidates
+                        if (verified or is_video_url_for_story_id(candidate, post_id))
+                        and (canonical := normalize_video_post_url(candidate))), "")
+            if not url:
+                url = next((parsed[0] for candidate in (scraped_url, str((saved_post or {}).get("url") or ""))
+                            if is_story_permalink_for_id(candidate, post_id)
+                            and (parsed := parse_urls(candidate))), "")
+            if not url and post_id:
+                fallback = f"https://www.facebook.com/{post_id}"
+                url = fallback if is_story_permalink_for_id(fallback, post_id) else ""
+            if not url:
+                logger.warning(f"Bỏ qua Auto Download cho video {post_id or '(không rõ ID)'}: chưa có URL bài viết Facebook.")
+        elif post_id.isdigit():
+            url = f"https://www.facebook.com/{post_id}"
+        else:
+            url = scraped_url
+        key = ("row", row_id) if row_id else ("url", url)
+        if url and key not in seen:
+            seen.add(key)
+            items.append({"url": url, "source_post_row_id": row_id})
+    return items
 
 
-def _start_auto_download(urls: List[str], accounts: Optional[List[dict]] = None) -> bool:
+def _start_auto_download(urls: List[object], accounts: Optional[List[dict]] = None) -> bool:
     """Hand one deduplicated scrape result batch to the downloader account pool."""
-    unique_urls = list(dict.fromkeys(str(url).strip() for url in urls if str(url).strip()))
-    if not unique_urls:
+    items: List[dict] = []
+    seen: set[tuple[str, object]] = set()
+    for item in urls:
+        if isinstance(item, dict):
+            url = str(item.get("url") or "").strip()
+            row_id = int(item.get("source_post_row_id") or 0)
+        else:
+            url, row_id = str(item or "").strip(), 0
+        key = ("row", row_id) if row_id else ("url", url)
+        if url and key not in seen:
+            seen.add(key)
+            items.append({"url": url, "source_post_row_id": row_id})
+    if not items:
         return False
     try:
         from web.routes.downloader import enqueue_auto_download
@@ -385,8 +421,8 @@ def _start_auto_download(urls: List[str], accounts: Optional[List[dict]] = None)
             unique_accounts[key] = account
         active_accounts = list(unique_accounts.values())
         account_ids = [int(account.get("id") or 0) for account in active_accounts]
-        if enqueue_auto_download(unique_urls, account_ids):
-            log_to_web(f"⬇ Auto Download đã nhận {len(unique_urls)} bài vừa quét.", "OK")
+        if enqueue_auto_download(items, account_ids):
+            log_to_web(f"⬇ Auto Download đã nhận {len(items)} bài vừa quét.", "OK")
             return True
         log_to_web("Auto Download không thể khởi động; hãy kiểm tra Account hoặc cookie tải.", "WARNING")
         return False
@@ -403,7 +439,7 @@ def _run_scrape_worker(
     global _active_scraper, _scrape_status
 
     db_p = get_db_path(config.get("scraper_db_path", ""))
-    auto_download_urls: List[str] = []
+    auto_download_urls: List[dict] = []
     final_status = "completed"
     log_to_web(f"Khởi động trình duyệt quét Page: {page_url} (tối đa {limit} bài)...", "INFO")
 
@@ -454,7 +490,7 @@ def _run_scrape_worker(
                 follower_count=getattr(scraper, "last_follower_count", 0)
             )
             if download_media and not _stop_requested.is_set():
-                auto_download_urls = _downloadable_post_urls(posts)
+                auto_download_urls = _downloadable_post_urls(posts, db_p, page_url)
             scan_label = "bài cũ" if mode == "Older Posts" else "bài viết"
             log_to_web(f"✅ Đã quét xong {len(posts)} {scan_label}! Đã lưu {saved_count} bài vào cơ sở dữ liệu.", "OK")
         else:
@@ -585,7 +621,7 @@ def _run_quick_worker(queue: dict) -> int:
                     follower_count=getattr(scraper, "last_follower_count", 0),
                 )
                 if queue.get("download_media"):
-                    queue["download_urls"].extend(_downloadable_post_urls(posts))
+                    queue["download_urls"].extend(_downloadable_post_urls(posts, db_p, page_url))
                 log_to_web(f"✅ {page_name}: đã lưu {saved_count} bài.", "OK")
             else:
                 log_to_web(f"Không tìm thấy bài viết tại {page_url}.", "WARNING")
@@ -601,12 +637,19 @@ def _run_quick_worker(queue: dict) -> int:
         finally:
             try:
                 scraper.stop()
-            except Exception:
-                pass
+            except Exception as exc:
+                worker_failed = True
+                page_outcome = False
+                queue["download_urls"] = []
+                queue["profile_handoff_failed"] = True
+                _update_favorite_worker(worker_id, error=str(exc)[:200])
+                log_to_web(f"Không thể bàn giao Chrome profile: {str(exc)[:180]}", "ERROR")
             with _scrape_lock:
                 _active_favorite_scrapers.pop(worker_id, None)
             _record_scrape_page_result(page_outcome)
             _update_favorite_worker(worker_id, queue_completed=position, new_posts=total_saved)
+        if queue.get("profile_handoff_failed"):
+            break
 
     stopped = _stop_requested.is_set() or stop_event.is_set()
     _update_favorite_worker(
@@ -820,7 +863,7 @@ def _run_favorite_worker(queue: dict) -> int:
             complete = not cursor_ids or scraper.last_scan_complete
             stopped = _stop_requested.is_set() or stop_event.is_set() or reason == "stopped"
             if queue.get("download_media") and saved_count and not stopped:
-                queue.setdefault("download_urls", []).extend(_downloadable_post_urls(posts))
+                queue.setdefault("download_urls", []).extend(_downloadable_post_urls(posts, db_p, favorite["page_url"]))
             # A stopped or cursor-limited scan has no terminal Page result.
             page_outcome = True if complete and not stopped else None
 
@@ -887,8 +930,13 @@ def _run_favorite_worker(queue: dict) -> int:
         finally:
             try:
                 scraper.stop()
-            except Exception:
-                pass
+            except Exception as exc:
+                worker_failed = True
+                page_outcome = False
+                queue["download_urls"] = []
+                queue["profile_handoff_failed"] = True
+                _update_favorite_worker(worker_id, error=str(exc)[:200])
+                log_to_web(f"Không thể bàn giao Chrome profile: {str(exc)[:180]}", "ERROR")
             with _scrape_lock:
                 _active_favorite_scrapers.pop(worker_id, None)
                 _scrape_status["new_posts"] += total_new - int(
@@ -899,6 +947,9 @@ def _run_favorite_worker(queue: dict) -> int:
                 current_favorite_id=0,
             )
             _record_scrape_page_result(page_outcome)
+
+        if queue.get("profile_handoff_failed"):
+            break
 
     stopped = _stop_requested.is_set() or stop_event.is_set()
     final_status = "Đã dừng" if stopped else ("Lỗi" if worker_failed else "Hoàn tất")

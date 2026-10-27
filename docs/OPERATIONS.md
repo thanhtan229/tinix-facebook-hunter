@@ -18,7 +18,7 @@ hãy xóa biến trước khi chạy dữ liệu thật.
 
 ## Khởi động và dừng
 
-1. Chạy `python main.py` hoặc `Start Tinix FB Studio.bat`.
+1. Chạy `python main.py` hoặc `START.vbs` / `START.bat`.
 2. Xác nhận WebUI mở ở port cục bộ bắt đầu từ 7866, trạng thái Realtime là
    `Connected` và không có cảnh báo môi trường ở đầu trang.
    Tinix dùng cố định port 7866; nếu port này đang được ứng dụng khác sử dụng,
@@ -76,7 +76,15 @@ python manage_database.py restore --file "E:\Tinix Backups\tinix-2026-08-31.sqli
 ```
 
 CLI tạo một file `*.backup-*.sqlite` từ database hiện tại trước khi restore và
-in đường dẫn đó. Khởi động lại, mở dashboard và kiểm tra `/api/system/health`.
+in đường dẫn đó. Nếu database hiện tại bị corrupt, CLI dựng và verify bản thay
+thế trước, rồi giữ nguyên file gốc tại `*.corrupt-backup-*.sqlite` cùng các file
+`-wal`, `-shm`, `-journal` đang tồn tại. Nếu cài bản thay thế thất bại, các file
+gốc được đưa lại vị trí cũ. Không mở bản corrupt bằng ứng dụng trong lúc phục hồi.
+Khởi động lại, mở dashboard và kiểm tra `/api/system/health`.
+
+Nếu START/STOP/Build báo cổng 7866 vẫn bị chiếm dụng, kiểm tra tiến trình đang
+giữ cổng. Launcher chỉ dừng tiến trình được xác định thuộc project; không tự
+terminate dịch vụ khác chỉ vì dịch vụ đó dùng cùng cổng.
 
 ## Migration secrets
 

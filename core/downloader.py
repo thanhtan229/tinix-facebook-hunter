@@ -17,6 +17,9 @@ from urllib.parse import parse_qs, urlparse
 from core.url_handler import (
     get_original_url,
     extract_post_id,
+    is_story_permalink_for_id,
+    is_video_url_for_story_id,
+    normalize_video_post_url,
     parse_urls,
     validate_url,
 )
@@ -38,7 +41,10 @@ from core.media_downloader import (
 from core.db_storage import (
     get_db_path,
     get_post_by_id,
+    get_post_by_row_id,
+    post_file_key,
     mark_post_row_downloaded,
+    mark_post_row_download_status,
     mark_posts_download_status,
     register_downloaded_post_for_page,
     resolve_download_target,
@@ -112,6 +118,7 @@ class DownloadTask:
     last_error: str = ""
     last_error_code: str = ""
     thumbnail_only: bool = False
+    source_post_row_id: int = 0
 
 
 @dataclass
@@ -223,6 +230,7 @@ class DownloadOrchestrator:
         cookie_string: str,
         output_dir: str,
         max_threads: int = 1,
+        source_post_row_ids: Optional[List[int]] = None,
     ) -> bool:
         """
         Start the download process in a background thread.
@@ -245,6 +253,12 @@ class DownloadOrchestrator:
                 self._on_all_complete(False, "Không tìm thấy URL hợp lệ")
             self._notify_idle()
             return False
+        row_ids = [int(value or 0) for value in (source_post_row_ids or [])]
+        if row_ids and len(row_ids) != len(urls):
+            logger.error("Số ID bài nguồn không khớp với số URL")
+            return False
+        if not row_ids:
+            row_ids = [0] * len(urls)
 
         # Clear counters before a validation callback can complete this run.
         # Without this reset a bad cookie could inherit the previous run's totals.
@@ -289,12 +303,12 @@ class DownloadOrchestrator:
         self._pause_event.set()
         self._stop_event.clear()
         self._running = True
-        self._mark_urls_download_status(urls, "downloading")
+        self._mark_urls_download_status(urls, "downloading", source_post_row_ids=row_ids)
 
         # Start in background
         thread = threading.Thread(
             target=self._run_pipeline,
-            args=(urls,),
+            args=(urls, row_ids),
             daemon=True,
         )
         thread.start()
@@ -306,6 +320,7 @@ class DownloadOrchestrator:
         accounts: List[dict],
         output_dir: str,
         max_threads: int = 1,
+        source_post_row_ids: Optional[List[int]] = None,
     ) -> bool:
         """Preflight every active account, then use at most ``max_threads`` healthy workers."""
         if self._running:
@@ -319,6 +334,12 @@ class DownloadOrchestrator:
                 self._on_all_complete(False, "Không tìm thấy URL hợp lệ")
             self._notify_idle()
             return False
+        row_ids = [int(value or 0) for value in (source_post_row_ids or [])]
+        if row_ids and len(row_ids) != len(urls):
+            logger.error("Số ID bài nguồn không khớp với số URL")
+            return False
+        if not row_ids:
+            row_ids = [0] * len(urls)
 
         # Same early reset as cookie mode: preflight failures must not report
         # stale totals from an earlier download.
@@ -350,11 +371,11 @@ class DownloadOrchestrator:
         self._pause_event.set()
         self._stop_event.clear()
         self._running = True
-        self._mark_urls_download_status(urls, "downloading")
+        self._mark_urls_download_status(urls, "downloading", source_post_row_ids=row_ids)
 
         thread = threading.Thread(
             target=self._run_multi_account_pipeline,
-            args=(urls, live_accounts),
+            args=(urls, live_accounts, row_ids),
             daemon=True,
         )
         thread.start()
@@ -526,7 +547,7 @@ class DownloadOrchestrator:
 
     # --- Internal Pipeline ---
 
-    def _run_pipeline(self, urls: List[str]) -> None:
+    def _run_pipeline(self, urls: List[str], row_ids: Optional[List[int]] = None) -> None:
         """Main download pipeline (runs in background thread)."""
         try:
             logger.info("=" * 50)
@@ -534,7 +555,7 @@ class DownloadOrchestrator:
             logger.info("=" * 50)
 
             if self._max_threads > 1:
-                self._run_parallel(urls)
+                self._run_parallel(urls, row_ids or [0] * len(urls))
             else:
                 # Sync Playwright must be started and used in this same pipeline thread.
                 self._browser = BrowserManager()
@@ -542,7 +563,7 @@ class DownloadOrchestrator:
                     logger.error("Không thể khởi động trình duyệt!")
                     self._notify_download_complete()
                     return
-                self._run_sequential(urls)
+                self._run_sequential(urls, row_ids or [0] * len(urls))
 
             # Final summary
             if self._stop_event.is_set():
@@ -575,6 +596,7 @@ class DownloadOrchestrator:
                 "failed",
                 "Tác vụ tải kết thúc trước khi xử lý bài này",
                 only_if_status="downloading",
+                source_post_row_ids=row_ids,
             )
             # Always stop the browser
             if self._browser:
@@ -583,7 +605,7 @@ class DownloadOrchestrator:
             self._running = False
             self._notify_idle()
 
-    def _run_multi_account_pipeline(self, urls: List[str], accounts: List[dict]) -> None:
+    def _run_multi_account_pipeline(self, urls: List[str], accounts: List[dict], row_ids: Optional[List[int]] = None) -> None:
         """Preflight accounts, then let healthy workers consume one shared queue."""
         browsers: List[BrowserManager] = []
         self._browsers = browsers
@@ -625,7 +647,8 @@ class DownloadOrchestrator:
             if not ready_accounts:
                 error = "Không có account nào qua preflight; hãy đăng nhập/cập nhật cookie rồi thử lại."
                 for index, url in enumerate(urls, start=1):
-                    task = DownloadTask(index=index, url=url, last_error=error, last_error_code="NO_READY_ACCOUNT")
+                    row_id = (row_ids or [0] * len(urls))[index - 1]
+                    task = DownloadTask(index=index, url=url, source_post_row_id=row_id, last_error=error, last_error_code="NO_READY_ACCOUNT")
                     self._finalize_task_failure(task)
                 self._log_download_summary()
                 self._notify_download_complete()
@@ -708,6 +731,7 @@ class DownloadOrchestrator:
 
                             success, error = self._run_post_attempt(
                                 task.url, task.index, browser, cookies, label, account_id, task.attempts + 1,
+                                task.source_post_row_id,
                             )
                             if success:
                                 self._schedule_account_pacing(pacing, account_id, label, failed=False)
@@ -793,7 +817,8 @@ class DownloadOrchestrator:
             if not ready_worker_count:
                 error = "Các account qua preflight không thể khởi động worker tải."
                 for index, url in enumerate(urls, start=1):
-                    task = DownloadTask(index=index, url=url, last_error=error, last_error_code="NO_RUNNING_WORKER")
+                    row_id = (row_ids or [0] * len(urls))[index - 1]
+                    task = DownloadTask(index=index, url=url, source_post_row_id=row_id, last_error=error, last_error_code="NO_RUNNING_WORKER")
                     self._finalize_task_failure(task)
                 startup_gate.set()
                 for thread in threads:
@@ -807,7 +832,8 @@ class DownloadOrchestrator:
                 f"Đưa {len(urls)} bài vào hàng đợi chung."
             )
             for index, url in enumerate(urls, start=1):
-                task_queue.put(DownloadTask(index=index, url=url))
+                row_id = (row_ids or [0] * len(urls))[index - 1]
+                task_queue.put(DownloadTask(index=index, url=url, source_post_row_id=row_id))
             accept_tasks.set()
             startup_gate.set()
             task_queue.join()
@@ -832,6 +858,7 @@ class DownloadOrchestrator:
                 "failed",
                 "Tác vụ tải kết thúc trước khi xử lý bài này",
                 only_if_status="downloading",
+                source_post_row_ids=row_ids,
             )
             self._browsers = []
             self._running = False
@@ -839,12 +866,15 @@ class DownloadOrchestrator:
 
     def _run_post_attempt(
         self, url: str, index: int, browser: BrowserManager, cookies: Dict[str, str],
-        label: str, account_id: int, attempt: int,
+        label: str, account_id: int, attempt: int, source_post_row_id: int = 0,
     ) -> tuple[bool, str]:
         """Run a post without prematurely counting a retry as a final failure."""
-        self._attempt_local.context = {"defer_stats": True, "failed": None, "error": "", "account_id": account_id, "attempt": attempt}
+        self._attempt_local.context = {"defer_stats": True, "failed": None, "error": "", "account_id": account_id, "attempt": attempt, "source_post_row_id": source_post_row_id}
         try:
-            self._process_single_post(url, index, browser=browser, cookies=cookies, account_label=f"#{account_id} · {label}")
+            kwargs = {"browser": browser, "cookies": cookies, "account_label": f"#{account_id} · {label}"}
+            if source_post_row_id:
+                kwargs["source_post_row_id"] = source_post_row_id
+            self._process_single_post(url, index, **kwargs)
             context = self._attempt_local.context
             return context.get("failed") is False, str(context.get("error") or "")
         finally:
@@ -909,11 +939,11 @@ class DownloadOrchestrator:
         message = message or f"Lần {task.attempts + 1}: chuyển sang account khác sau lỗi {task.last_error_code}."
         logger.warning(f"[Post {task.index} · Account #{account_id} · Attempt {task.attempts}] RETRY: {message}")
         self._emit_download_item(task, account_id, label, "retrying", task.last_error_code, message)
-        self._mark_post_download_status(task.url, "downloading", "")
+        self._mark_post_download_status(task.url, "downloading", "", task.source_post_row_id)
 
     def _finalize_task_failure(self, task: DownloadTask) -> None:
         status = "thumbnail_only" if task.thumbnail_only else "failed"
-        self._mark_post_download_status(task.url, status, task.last_error)
+        self._mark_post_download_status(task.url, status, task.last_error, task.source_post_row_id)
         self._update_stats(failed=True)
         self._emit_download_item(task, task.tried_account_ids[-1] if task.tried_account_ids else 0, "", "failed", task.last_error_code, task.last_error)
 
@@ -1010,7 +1040,7 @@ class DownloadOrchestrator:
             label = str(payload.get("label") or f"Account #{account_id}")
             self._emit_account_status(account_id, label, state, code, message)
 
-    def _run_sequential(self, urls: List[str]) -> None:
+    def _run_sequential(self, urls: List[str], row_ids: Optional[List[int]] = None) -> None:
         """Process shared-cookie URLs one by one with the same safe pacing."""
         pacing = AccountPacingState()
         for i, url in enumerate(urls):
@@ -1026,20 +1056,25 @@ class DownloadOrchestrator:
             if not self._wait_for_account_slot(pacing, 0, "Cookie phiên"):
                 break
 
-            self._process_single_post(url, i + 1)
+            row_id = (row_ids or [0] * len(urls))[i]
+            if row_id:
+                self._process_single_post(url, i + 1, source_post_row_id=row_id)
+            else:
+                self._process_single_post(url, i + 1)
             if not self._stop_event.is_set():
                 # Cookie mode has one account only; pace every completed attempt
                 # even when the post itself was unavailable or its media failed.
                 self._schedule_account_pacing(pacing, 0, "Cookie phiên", failed=False)
 
-    def _run_parallel(self, urls: List[str]) -> None:
+    def _run_parallel(self, urls: List[str], row_ids: Optional[List[int]] = None) -> None:
         """Process URL chunks with one thread-owned Playwright browser per worker."""
         worker_count = max(1, min(self._max_threads, len(urls)))
-        chunks: List[List[tuple[int, str]]] = [[] for _ in range(worker_count)]
+        chunks: List[List[tuple[int, str, int]]] = [[] for _ in range(worker_count)]
         for index, url in enumerate(urls, start=1):
-            chunks[(index - 1) % worker_count].append((index, url))
+            row_id = (row_ids or [0] * len(urls))[index - 1]
+            chunks[(index - 1) % worker_count].append((index, url, row_id))
 
-        def worker(worker_index: int, items: List[tuple[int, str]]) -> None:
+        def worker(worker_index: int, items: List[tuple[int, str, int]]) -> None:
             browser = BrowserManager(
                 profile_dir=str(chrome_profile_dir(f"download_cookie_{worker_index}")),
                 cdp_port=9300 + worker_index,
@@ -1050,20 +1085,24 @@ class DownloadOrchestrator:
             try:
                 if not browser.start(self._cookies):
                     logger.error(f"Không thể khởi động trình duyệt tải #{worker_index}!")
-                    for index, url in items:
+                    for index, url, row_id in items:
+                        self._attempt_local.source_post_row_id = row_id
                         self._notify_post_failed(url, index, "Không thể khởi động trình duyệt")
                         self._update_stats(failed=True)
                     return
-                for index, url in items:
+                for index, url, row_id in items:
                     if self._stop_event.is_set():
                         break
                     self._pause_event.wait()
                     if self._stop_event.is_set():
                         break
-                    self._process_single_post(
-                        url, index, browser=browser, cookies=self._cookies,
-                        account_label=f"Luồng {worker_index}",
-                    )
+                    kwargs = {
+                        "browser": browser, "cookies": self._cookies,
+                        "account_label": f"Luồng {worker_index}",
+                    }
+                    if row_id:
+                        kwargs["source_post_row_id"] = row_id
+                    self._process_single_post(url, index, **kwargs)
             finally:
                 browser.stop()
                 with self._lock:
@@ -1090,6 +1129,7 @@ class DownloadOrchestrator:
         browser: Optional[BrowserManager] = None,
         cookies: Optional[Dict[str, str]] = None,
         account_label: str = "",
+        source_post_row_id: int = 0,
     ) -> None:
         """
         Process a single Facebook post URL.
@@ -1100,6 +1140,10 @@ class DownloadOrchestrator:
         logger.info(f"URL: {url[:80]}...")
         active_browser = browser or self._browser
         active_cookies = cookies if cookies is not None else self._cookies
+        context = getattr(self._attempt_local, "context", None)
+        if isinstance(context, dict):
+            source_post_row_id = int(source_post_row_id or context.get("source_post_row_id") or 0)
+        self._attempt_local.source_post_row_id = source_post_row_id
 
         # Validate
         is_valid, msg = validate_url(url)
@@ -1117,20 +1161,38 @@ class DownloadOrchestrator:
         try:
             # Extract post ID for folder naming
             post_id = extract_post_id(url)
-            self._mark_post_download_status(url, "downloading")
+            self._mark_post_download_status(url, "downloading", source_post_row_id=source_post_row_id)
 
             # Look up metadata from local database
+            video_url = normalize_video_post_url(url)
             db_path = get_db_path(config.get("scraper_db_path", ""))
-            db_post = get_post_by_id(db_path, post_id, url)
+            db_post = get_post_by_row_id(db_path, source_post_row_id) if source_post_row_id else None
+            if not db_post:
+                db_post = get_post_by_id(db_path, post_id, video_url or url)
+            source_post_id = str((db_post or {}).get("post_id") or post_id or "").strip()
+            if video_url and db_post and (
+                not (
+                    db_post.get("video_url_verified")
+                    or is_video_url_for_story_id(video_url, source_post_id)
+                )
+                or normalize_video_post_url(str(db_post.get("url") or "")) != video_url
+            ):
+                logger.warning("URL video không có xác nhận từ attachment của bài nguồn; dùng permalink nguồn")
+                video_url = ""
 
             # Resolve best URL
-            active_url = url
+            active_url = video_url or url
             is_bare_numeric = bool(re.match(r"^https?://(?:www\.|m\.|web\.)?facebook\.com/(\d{10,})/?(?:\?.*)?$", url.strip()))
-            if db_post and db_post.get("page_url") and post_id and post_id.isdigit():
-                canonical_page_url = _canonical_post_url(str(db_post["page_url"]), post_id)
-                if "watch/?v=" in url or is_bare_numeric or "/posts/" not in url:
+            if db_post and source_post_id:
+                canonical_page_url = (
+                    _canonical_post_url(str(db_post["page_url"]), source_post_id)
+                    if db_post.get("page_url") else f"https://www.facebook.com/{source_post_id}"
+                )
+                if not video_url and (
+                    is_bare_numeric or not is_story_permalink_for_id(url, source_post_id)
+                ):
                     active_url = canonical_page_url
-                    logger.info(f"Dùng link post chuẩn từ Fanpage: {active_url}")
+                    logger.info(f"Dùng link bài viết đã xác minh từ Fanpage: {active_url}")
             elif is_bare_numeric:
                 if db_post and db_post.get("page_url"):
                     active_url = _canonical_post_url(str(db_post["page_url"]), post_id)
@@ -1147,14 +1209,15 @@ class DownloadOrchestrator:
                 self._update_stats(failed=True)
                 return
 
-            post_data = active_browser.fetch_post(active_url, post_id)
+            active_post_id = extract_post_id(active_url) or post_id
+            post_data = active_browser.fetch_post(active_url, active_post_id)
 
             # Fallback if first attempt failed
-            if not post_data.is_valid and post_id.isdigit() and len(post_id) >= 10:
-                direct_url = f"https://www.facebook.com/{post_id}"
+            if not post_data.is_valid and active_post_id.isdigit() and len(active_post_id) >= 10:
+                direct_url = f"https://www.facebook.com/{active_post_id}"
                 if active_url != direct_url:
                     logger.info(f"Thử fallback sang direct post URL: {direct_url}")
-                    direct_data = active_browser.fetch_post(direct_url, post_id)
+                    direct_data = active_browser.fetch_post(direct_url, active_post_id)
                     if direct_data.is_valid:
                         post_data = direct_data
                         active_url = direct_url
@@ -1170,6 +1233,11 @@ class DownloadOrchestrator:
                     post_data.has_video = True
                 if post_data.error and (post_data.text or post_data.has_video or db_post.get("media_preview_url")):
                     post_data.error = None
+
+            # The watch URL uses the attachment ID for parsing. Keep the source
+            # story ID for flat filenames, status updates, and exact DB matching.
+            if source_post_id:
+                post_data.post_id = source_post_id
 
             stored_post_type = str((db_post or {}).get("post_type") or "").strip()
             has_explicit_video_url = any(
@@ -1402,6 +1470,17 @@ class DownloadOrchestrator:
                     )
 
                 if video_success:
+                    try:
+                        video_success = any(
+                            video_file.stat().st_size > 0
+                            for video_file in self._get_post_media_files(post_id, is_video_post=True)
+                        )
+                    except OSError:
+                        video_success = False
+                    if not video_success:
+                        logger.warning("Downloader báo thành công nhưng chưa có file video hợp lệ.")
+
+                if video_success:
                     with self._lock:
                         self.stats.downloaded_media += 1
                         vfiles = self._get_post_media_files(post_id, is_video_post=True)
@@ -1452,7 +1531,7 @@ class DownloadOrchestrator:
                         self._notify_post_failed(url, index, error_msg)
                         self._update_stats(failed=True)
             else:
-                self._mark_post_downloaded(post_data, self._output_dir, url, post_id=post_id)
+                self._mark_post_downloaded(post_data, self._output_dir, url, post_id=post_id, source_post_row_id=source_post_row_id)
                 self._update_stats(failed=False)
                 logger.info(f"✅ Post {index} hoàn thành → {post_id}")
 
@@ -1468,6 +1547,8 @@ class DownloadOrchestrator:
         Example: 836851975657298
         """
         if post_data.post_id:
+            if re.fullmatch(r"pfbid[A-Za-z0-9_-]{8,100}", post_data.post_id, re.IGNORECASE):
+                return post_data.post_id
             numeric_id = re.sub(r'\D', '', post_data.post_id)
             if numeric_id:
                 return numeric_id
@@ -1475,7 +1556,8 @@ class DownloadOrchestrator:
         return "post_unknown"
 
     def _mark_post_downloaded(
-        self, post_data: PostData, post_dir: Path, url: str, status: str = "downloaded", error: str = "", post_id: str = ""
+        self, post_data: PostData, post_dir: Path, url: str, status: str = "downloaded", error: str = "", post_id: str = "",
+        source_post_row_id: int = 0,
     ) -> None:
         """Mark or save a download only under its verified Facebook source page."""
         candidates = {
@@ -1485,16 +1567,27 @@ class DownloadOrchestrator:
         }
         if post_dir and post_dir.name and post_dir != self._output_dir:
             candidates.add(str(post_dir.name).strip())
-        candidates |= {re.sub(r"\D", "", c) for c in list(candidates) if c}
+        candidates |= {
+            re.sub(r"\D", "", c) for c in list(candidates)
+            if c and not c.lower().startswith("pfbid")
+        }
         post_ids = [c for c in candidates if c and c != "unknown"]
         if not post_ids:
             return
         try:
             db_path = get_db_path(config.get("scraper_db_path", ""))
+            source_post_row_id = int(source_post_row_id or getattr(self._attempt_local, "source_post_row_id", 0) or 0)
+            if source_post_row_id:
+                updated = mark_post_row_downloaded(
+                    db_path, source_post_row_id, str(post_dir), status=status, error=error
+                )
+                if updated:
+                    logger.info(f"Đã cập nhật trạng thái '{status}' cho đúng dòng Post Spy #{source_post_row_id}.")
+                return
             target = resolve_download_target(
                 db_path,
                 post_ids,
-                url=url,
+                url=normalize_video_post_url(url) or url,
                 page_url=getattr(post_data, "author_url", ""),
                 page_name=getattr(post_data, "author", ""),
                 caption=str(getattr(post_data, "text", "") or ""),
@@ -1511,7 +1604,7 @@ class DownloadOrchestrator:
                 created = register_downloaded_post_for_page(
                     db_path,
                     post_id or self._make_folder_name(post_data),
-                    url,
+                    normalize_video_post_url(url) or url,
                     post_data.text,
                     page_name=target.get("page_name", ""),
                     page_url=target["page_url"],
@@ -1532,15 +1625,26 @@ class DownloadOrchestrator:
     def _post_id_candidates(url: str) -> List[str]:
         """Build stable database identifiers from a Facebook post URL."""
         candidates = {str(extract_post_id(url) or "").strip()}
-        candidates |= {re.sub(r"\D", "", value) for value in list(candidates) if value}
+        candidates |= {
+            re.sub(r"\D", "", value) for value in list(candidates)
+            if value and not value.lower().startswith("pfbid")
+        }
         return [value for value in candidates if value and value != "unknown"]
 
-    def _mark_post_download_status(self, url: str, status: str, error: str = "") -> None:
-        post_ids = self._post_id_candidates(url)
-        if not post_ids:
-            return
+    def _mark_post_download_status(self, url: str, status: str, error: str = "", source_post_row_id: int = 0) -> None:
         try:
             db_path = get_db_path(config.get("scraper_db_path", ""))
+            source_post_row_id = int(source_post_row_id or getattr(self._attempt_local, "source_post_row_id", 0) or 0)
+            if source_post_row_id:
+                mark_post_row_download_status(db_path, source_post_row_id, status, error=error)
+                return
+            db_post = get_post_by_id(db_path, extract_post_id(url), normalize_video_post_url(url) or url)
+            if db_post and db_post.get("post_id"):
+                post_ids = self._post_id_candidates(str(db_post["post_id"]))
+            else:
+                post_ids = self._post_id_candidates(url)
+            if not post_ids:
+                return
             mark_posts_download_status(db_path, post_ids, status, error=error)
         except Exception as exc:
             logger.error(f"Không cập nhật trạng thái tải: {str(exc)[:200]}")
@@ -1552,17 +1656,31 @@ class DownloadOrchestrator:
         error: str = "",
         *,
         only_if_status: str = "",
+        source_post_row_ids: Optional[List[int]] = None,
     ) -> None:
         """Persist the state of every queued URL before worker threads start."""
-        post_ids = list(dict.fromkeys(
-            candidate
-            for url in urls
-            for candidate in self._post_id_candidates(url)
-        ))
-        if not post_ids:
-            return
         try:
             db_path = get_db_path(config.get("scraper_db_path", ""))
+            if source_post_row_ids and len(source_post_row_ids) == len(urls):
+                for row_id in source_post_row_ids:
+                    if row_id:
+                        mark_post_row_download_status(
+                            db_path, int(row_id), status, error=error, only_if_status=only_if_status,
+                        )
+                fallback = [url for url, row_id in zip(urls, source_post_row_ids, strict=True) if not row_id]
+                if not fallback:
+                    return
+                urls = fallback
+            post_ids: List[str] = []
+            for url in urls:
+                db_post = get_post_by_id(db_path, extract_post_id(url), normalize_video_post_url(url) or url)
+                if db_post and db_post.get("post_id"):
+                    post_ids.extend(self._post_id_candidates(str(db_post["post_id"])))
+                else:
+                    post_ids.extend(self._post_id_candidates(url))
+            post_ids = list(dict.fromkeys(post_ids))
+            if not post_ids:
+                return
             mark_posts_download_status(
                 db_path,
                 post_ids,
@@ -1575,7 +1693,7 @@ class DownloadOrchestrator:
 
     def _get_post_media_files(self, post_id: str, is_video_post: bool = False) -> List[Path]:
         """Find media files belonging to post_id in flat storage."""
-        clean_pid = re.sub(r"\D", "", str(post_id or "")).strip() or str(post_id or "").strip()
+        clean_pid = post_file_key(post_id)
         if not clean_pid or not self._output_dir.exists():
             return []
         video_exts = {".mp4", ".mov", ".webm", ".avi", ".mkv", ".m4v"}
@@ -1642,7 +1760,7 @@ class DownloadOrchestrator:
 
     def _clear_existing_post(self, post_id: str) -> None:
         """Remove existing downloaded files for a post before redownloading."""
-        clean_pid = re.sub(r"\D", "", str(post_id or "")).strip() or str(post_id or "").strip()
+        clean_pid = post_file_key(post_id)
         if not clean_pid or not self._output_dir.exists():
             return
         try:
@@ -1664,7 +1782,7 @@ class DownloadOrchestrator:
         """Remove partial files (like caption or incomplete media) if post download failed."""
         if self._post_has_media(post_id):
             return
-        clean_pid = re.sub(r"\D", "", str(post_id or "")).strip() or str(post_id or "").strip()
+        clean_pid = post_file_key(post_id)
         if not clean_pid or not self._output_dir.exists():
             return
         try:

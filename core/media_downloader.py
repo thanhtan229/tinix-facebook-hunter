@@ -100,6 +100,7 @@ def download_image(
         True if download was successful.
     """
     _set_last_download_error()
+    temporary_path: Optional[Path] = None
     try:
         save_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -120,19 +121,27 @@ def download_image(
                 total = int(response.headers.get("content-length", 0))
                 downloaded = 0
 
-                with open(save_path, "wb") as f:
+                with tempfile.NamedTemporaryFile(
+                    mode="wb", dir=save_path.parent, prefix=f".{save_path.name}.", suffix=".part", delete=False
+                ) as f:
+                    temporary_path = Path(f.name)
                     for chunk in response.iter_bytes(chunk_size=CHUNK_SIZE):
                         f.write(chunk)
                         downloaded += len(chunk)
                         if progress_callback and total > 0:
                             progress_callback(downloaded, total)
+                    f.flush()
+                    os.fsync(f.fileno())
+                if total > 0 and not response.headers.get("content-encoding") and downloaded != total:
+                    raise ValueError("Incomplete image response")
 
         # Verify file is not empty
-        if save_path.stat().st_size < 100:
+        if temporary_path.stat().st_size < 100:
             logger.warning(f"Ảnh tải về quá nhỏ, có thể bị lỗi: {save_path.name}")
             _set_last_download_error("MEDIA_ACCESS_DENIED", "Ảnh tải về quá nhỏ hoặc bị Facebook chặn.")
             return False
 
+        os.replace(temporary_path, save_path)
         logger.info(f"Đã tải ảnh: {save_path.name} ({_format_size(save_path.stat().st_size)})")
         return True
 
@@ -151,6 +160,12 @@ def download_image(
         logger.error(f"Lỗi tải ảnh {save_path.name}: {str(e)[:100]}")
         _set_last_download_error("DOWNLOAD_FAILED", f"Tải ảnh lỗi: {str(e)[:100]}")
         return False
+    finally:
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink(missing_ok=True)
+            except OSError as exc:
+                logger.warning(f"Không thể xóa file tải tạm: {str(exc)[:100]}")
 
 
 def download_video_direct(
@@ -173,6 +188,7 @@ def download_video_direct(
         True if download was successful.
     """
     _set_last_download_error()
+    temporary_path: Optional[Path] = None
     try:
         save_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -199,31 +215,37 @@ def download_video_direct(
                 total = int(response.headers.get("content-length", 0))
                 downloaded = 0
 
-                with open(save_path, "wb") as f:
+                with tempfile.NamedTemporaryFile(
+                    mode="wb", dir=save_path.parent, prefix=f".{save_path.name}.", suffix=".part", delete=False
+                ) as f:
+                    temporary_path = Path(f.name)
                     for chunk in response.iter_bytes(chunk_size=131072):  # 128KB chunks for video
                         f.write(chunk)
                         downloaded += len(chunk)
                         if progress_callback and total > 0:
                             progress_callback(downloaded, total)
+                    f.flush()
+                    os.fsync(f.fileno())
+                if total > 0 and not response.headers.get("content-encoding") and downloaded != total:
+                    raise ValueError("Incomplete video response")
 
-        file_size = save_path.stat().st_size
+        file_size = temporary_path.stat().st_size
         if file_size < 10000:  # Video should be at least 10KB
             logger.warning(f"Video tải về quá nhỏ ({_format_size(file_size)}), có thể bị lỗi")
             # Try to read content to see if it's an error page
             try:
-                with open(save_path, "r", encoding="utf-8", errors="ignore") as f:
+                with open(temporary_path, "r", encoding="utf-8", errors="ignore") as f:
                     content = f.read(500)
                 if "<html" in content.lower() or "error" in content.lower():
                     logger.error("File tải về là trang lỗi, không phải video")
-                    save_path.unlink(missing_ok=True)
                     _set_last_download_error("MEDIA_ACCESS_DENIED", "Facebook trả về trang lỗi thay vì video.")
                     return False
             except Exception:
                 pass
-            save_path.unlink(missing_ok=True)
             _set_last_download_error("MEDIA_ACCESS_DENIED", "Video tải về quá nhỏ hoặc không hợp lệ.")
             return False
 
+        os.replace(temporary_path, save_path)
         logger.info(f"Đã tải video: {save_path.name} ({_format_size(file_size)})")
         return True
 
@@ -242,6 +264,12 @@ def download_video_direct(
         logger.error(f"Lỗi tải video {save_path.name}: {str(e)[:100]}")
         _set_last_download_error("DOWNLOAD_FAILED", f"Tải video lỗi: {str(e)[:100]}")
         return False
+    finally:
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink(missing_ok=True)
+            except OSError as exc:
+                logger.warning(f"Không thể xóa file tải tạm: {str(exc)[:100]}")
 
 
 def download_video(
@@ -285,7 +313,12 @@ def download_video(
             cookie_file.close()
 
             # Build yt-dlp command
-            clean_pid = re.sub(r"\D", "", str(post_id or "")).strip()
+            raw_post_id = str(post_id or "").strip()
+            clean_pid = (
+                raw_post_id
+                if re.fullmatch(r"pfbid[A-Za-z0-9_-]{8,100}", raw_post_id, re.IGNORECASE)
+                else re.sub(r"\D", "", raw_post_id).strip()
+            )
             if clean_pid:
                 output_template = str(save_dir / f"{clean_pid}.%(ext)s")
             else:

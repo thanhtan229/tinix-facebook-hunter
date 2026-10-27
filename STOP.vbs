@@ -18,7 +18,11 @@ stopBat = currentDir & "\STOP.bat"
 
 If FSO.FileExists(stopBat) Then
     exitCode = WshShell.Run("cmd.exe /c """ & stopBat & """ silent", 0, True)
-    MsgBox "Da dung may chu Tinix-Facebook-Hunter thanh cong!", vbInformation, "Tinix - Facebook Hunter"
+    If exitCode = 0 Then
+        MsgBox "Da dung may chu Tinix-Facebook-Hunter thanh cong!", vbInformation, "Tinix - Facebook Hunter"
+    Else
+        MsgBox "Khong the dung server hoac cong 7866 dang duoc ung dung khac su dung.", vbExclamation, "Tinix - Facebook Hunter"
+    End If
 Else
     MsgBox "Khong tim thay tap tin STOP.bat tai:" & vbCrLf & currentDir, vbExclamation, "Tinix - Facebook Hunter"
 End If

@@ -17,12 +17,13 @@ from core.db_storage import (
     finish_task_run,
     get_all_accounts,
     get_db_path,
+    get_post_by_row_id,
     get_download_queue_status,
     set_download_queue_batch_status,
 )
 from core.downloader import DownloadOrchestrator
 from core.profile_lease import ProfileLeaseConflict, acquire_profile_leases, release_profile_leases
-from core.url_handler import parse_urls
+from core.url_handler import is_playable_video_url, is_story_permalink_for_id, is_video_url_for_story_id, parse_urls
 from utils import config
 from web.models import ApiRequest
 from web.ws_manager import account_status_to_web, download_item_to_web, log_to_web, progress_to_web
@@ -149,6 +150,7 @@ class DownloadStartRequest(ApiRequest):
     cookies: Optional[str] = Field(default=None, max_length=200_000)
     use_accounts: Optional[bool] = None
     account_ids: List[int] = Field(default_factory=list, max_length=20)
+    source_post_row_ids: List[int] = Field(default_factory=list, max_length=5_000)
 
 
 def _active_accounts_for_ids(db_path: str, account_ids: list[int]) -> list[dict]:
@@ -177,6 +179,7 @@ def _selected_download_accounts(db_path: str, account_ids: list[int]) -> list[di
 
 def _start_with_accounts_or_cookie(
     urls: list[str], accounts: list[dict], *, output_dir: str, max_threads: int, cookie_string: str = "",
+    source_post_row_ids: Optional[list[int]] = None,
 ) -> bool:
     """Start once and return whether the orchestrator accepted the run.
 
@@ -187,11 +190,13 @@ def _start_with_accounts_or_cookie(
     if accounts:
         started = orchestrator.start_with_accounts(
             urls_text="\n".join(urls), accounts=accounts, output_dir=output_dir, max_threads=max_threads,
+            source_post_row_ids=source_post_row_ids,
         )
     else:
         started = orchestrator.start(
             urls_text="\n".join(urls), cookie_string=cookie_string,
             output_dir=output_dir, max_threads=max_threads,
+            source_post_row_ids=source_post_row_ids,
         )
     return bool(orchestrator.is_running) if started is None else bool(started)
 
@@ -201,6 +206,7 @@ def _start_claimed_auto_batch(batch: dict) -> bool:
     global _active_task_run_id, _active_queue_batch_id, _download_stop_requested
     global _active_profile_lease_owner, _active_profile_lease_keys
     urls = list(batch.get("urls") or [])
+    source_post_row_ids = list(batch.get("source_post_row_ids") or [0] * len(urls))
     if not urls:
         set_download_queue_batch_status(_db_path(), int(batch["id"]), "failed", error_message="Batch không có URL hợp lệ", purge_payload=True)
         return False
@@ -238,6 +244,7 @@ def _start_claimed_auto_batch(batch: dict) -> bool:
             urls, accounts, output_dir=config.get("output_dir", ".") or ".",
             max_threads=max(1, min(int(config.get("max_threads", 3) or 3), 20)),
             cookie_string=config.get("saved_cookies", ""),
+            source_post_row_ids=source_post_row_ids,
         )
     except Exception as exc:
         set_download_queue_batch_status(db_path, _active_queue_batch_id, "failed", error_message="Không thể khởi động Auto Download", purge_payload=True)
@@ -284,7 +291,7 @@ def _retry_pending_auto_download() -> None:
         _start_pending_auto_download()
 
 
-def enqueue_auto_download(urls: list[str], account_ids: list[int]) -> bool:
+def enqueue_auto_download(urls: list[object], account_ids: list[int]) -> bool:
     """Persist scan output first, then let the single coordinator start it."""
     batch_id = enqueue_download_queue_batch(_db_path(), urls, account_ids, source="auto")
     if not batch_id:
@@ -304,6 +311,33 @@ def start_download(req: DownloadStartRequest):
     urls = parse_urls(req.urls)
     if not urls:
         raise HTTPException(status_code=422, detail="Không tìm thấy URL Facebook hợp lệ")
+    if req.source_post_row_ids and len(req.source_post_row_ids) != len(urls):
+        raise HTTPException(status_code=422, detail="Số ID bài viết nguồn không khớp với danh sách URL")
+    if req.source_post_row_ids:
+        for index, row_id in enumerate(req.source_post_row_ids):
+            row = get_post_by_row_id(_db_path(), row_id)
+            if not row:
+                raise HTTPException(status_code=404, detail="Không tìm thấy bài viết nguồn đã chọn")
+            if row.get("post_type") != "Video":
+                continue
+            saved_url = str(row.get("url") or "").strip()
+            saved_post_urls = parse_urls(saved_url)
+            if not saved_post_urls or urls[index] != saved_post_urls[0]:
+                raise HTTPException(
+                    status_code=409,
+                    detail="URL video không khớp với bài viết nguồn đã chọn.",
+                )
+            if is_playable_video_url(saved_url) and (
+                row.get("video_url_verified")
+                or is_video_url_for_story_id(saved_url, str(row.get("post_id") or ""))
+            ):
+                urls[index] = saved_post_urls[0]
+            else:
+                source_id = str(row.get("post_id") or "").strip()
+                fallback_url = f"https://www.facebook.com/{source_id}"
+                if not is_story_permalink_for_id(fallback_url, source_id):
+                    raise HTTPException(status_code=409, detail="Bài video này chưa có ID nguồn hợp lệ để tải lại.")
+                urls[index] = saved_post_urls[0] if is_story_permalink_for_id(saved_url, source_id) else fallback_url
     out_dir = req.output_dir or config.get("output_dir", ".")
     threads = req.max_threads or config.get("max_threads", 3)
     if not isinstance(threads, int) or not 1 <= threads <= 20:
@@ -352,6 +386,7 @@ def start_download(req: DownloadStartRequest):
             started = _start_with_accounts_or_cookie(
                 urls, accounts if use_accounts else [], output_dir=out_dir,
                 max_threads=threads, cookie_string=cookies_str,
+                source_post_row_ids=req.source_post_row_ids or None,
             )
         except Exception:
             if _active_task_run_id:

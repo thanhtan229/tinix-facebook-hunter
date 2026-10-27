@@ -109,6 +109,10 @@ exit /b 0
 :start_background_server
 echo [Tinix] Dang kiem tra va don dep phien lam viec cu...
 "%PYTHON_CMD%" utils\process_cleanup.py --skip-windows >nul 2>nul
+if errorlevel 1 (
+    echo [LOI] Cong %TINIX_PORT% van dang duoc su dung. Khong dung tien trinh ngoai project.
+    exit /b 1
+)
 
 echo [Tinix] Dang khoi dong may chu ngam (port %TINIX_PORT%)...
 set "TINIX_NO_BROWSER=1"

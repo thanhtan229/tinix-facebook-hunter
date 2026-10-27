@@ -1,7 +1,51 @@
 from __future__ import annotations
 
 import sys
+import subprocess
+import time
+import urllib.request
 from pathlib import Path
+
+
+def shutdown_owned_chrome(browser, process, cdp_port: int, timeout: float = 10.0) -> None:
+    """Close worker-owned Chrome and wait before handing off its profile.
+
+    Closing an attached Playwright browser can only disconnect the client.
+    Use Browser.close to shut down Chrome itself. Never call for reused Chrome.
+    """
+    if browser is not None:
+        try:
+            browser.new_browser_cdp_session().send("Browser.close")
+        except Exception:
+            # Chrome may disconnect before acknowledging Browser.close.
+            pass
+        try:
+            browser.close()
+        except Exception:
+            pass
+    if process is not None:
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
+
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{cdp_port}/json/version", timeout=0.5):
+                running = True
+        except OSError:
+            running = False
+        if not running:
+            return
+        if time.monotonic() >= deadline:
+            raise RuntimeError("Chrome worker chưa đóng hoàn toàn; chưa thể bàn giao profile.")
+        time.sleep(0.1)
 
 
 def project_root() -> Path:

@@ -2565,7 +2565,16 @@ function selectAllSpyPosts(checked) {
 }
 
 async function startSpyPostDownloads(posts) {
-  const urls = [...new Set(posts.map(post => safeFacebookPostUrl(post.url)).filter(Boolean))];
+  const downloads = [];
+  const seenPostIds = new Set();
+  posts.forEach(post => {
+    const url = safeFacebookPostUrl(post.url);
+    const rowId = Number(post.id) || 0;
+    if (!url || !rowId || seenPostIds.has(rowId)) return;
+    seenPostIds.add(rowId);
+    downloads.push({ url, rowId });
+  });
+  const urls = downloads.map(item => item.url);
   if (!urls.length) {
     showToast("Bài đã chọn không có link Facebook hợp lệ", "warning");
     return;
@@ -2583,14 +2592,15 @@ async function startSpyPostDownloads(posts) {
         urls: urlsText,
         max_threads: parseInt(document.getElementById("dl-threads")?.value) || 3,
         use_accounts: Boolean(document.getElementById("dl-use-accounts")?.checked),
-        account_ids: selectedDownloadAccountIds()
+        account_ids: selectedDownloadAccountIds(),
+        source_post_row_ids: downloads.map(item => item.rowId)
       })
     });
     const result = await response.json();
     if (!response.ok) throw new Error(result.detail || "Không thể bắt đầu tải");
-    const startedUrls = new Set(urls);
+    const startedPostIds = new Set(downloads.map(item => item.rowId));
     state.spyPosts.forEach(post => {
-      if (startedUrls.has(safeFacebookPostUrl(post.url))) {
+      if (startedPostIds.has(Number(post.id))) {
         post.download_status = "downloading";
         post.download_error = "";
         post.downloaded = 0;
@@ -2598,7 +2608,7 @@ async function startSpyPostDownloads(posts) {
       }
     });
     syncSpyPostSelectionUi();
-    showToast(`Đã bắt đầu Download ${urls.length} bài`, "success");
+    showToast(`Đã bắt đầu Download ${downloads.length} bài`, "success");
   } catch (error) {
     showToast(error.message || "Lỗi kết nối khi tải bài", "error");
   }

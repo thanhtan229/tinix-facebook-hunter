@@ -56,6 +56,7 @@ from web.routes import spy as spy_routes
 from web.routes.system import _public_config
 from web.security import register_media_root, resolve_media_file
 from core import downloader as core_downloader
+from core import media_downloader
 from core.page_search import parse_follower_count, _facebook_target_url
 from core.page_scraper import (
     PageScraper, _PostCollector, _parse_metric_number, is_valid_facebook_page_name,
@@ -67,6 +68,34 @@ from utils import config as app_config
 
 
 class SecurityHelpersTest(unittest.TestCase):
+    def test_ytdlp_uses_full_pfbid_for_video_filename(self):
+        post_id = "pfbid" + "A1b2C3d4" * 6
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir)
+            captured = {}
+
+            def fake_run(command, **_kwargs):
+                template = command[command.index("-o") + 1]
+                captured["template"] = template
+                Path(template.replace("%(ext)s", "mp4")).write_bytes(b"video")
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            with patch.object(media_downloader, "_get_ytdlp_path", return_value="yt-dlp"), patch.object(
+                media_downloader.subprocess, "run", side_effect=fake_run
+            ):
+                self.assertTrue(media_downloader.download_video(
+                    "https://www.facebook.com/watch/?v=9876543210987", output_dir, {}, post_id=post_id,
+                ))
+
+            video_path = output_dir / f"{post_id}.mp4"
+            orchestrator = core_downloader.DownloadOrchestrator()
+            orchestrator._output_dir = output_dir
+            self.assertEqual(captured["template"], str(output_dir / f"{post_id}.%(ext)s"))
+            self.assertEqual(
+                orchestrator._get_post_media_files(post_id, is_video_post=True),
+                [video_path],
+            )
+
     def test_video_detection_uses_page_data_when_player_is_lazy(self):
         class EmptyArticle:
             @staticmethod
@@ -492,6 +521,50 @@ class SecurityHelpersTest(unittest.TestCase):
 
         self.assertEqual(post["post_type"], "Video")
         self.assertEqual(post["url"], "https://www.facebook.com/watch/?v=1734567890123456")
+        self.assertTrue(post["video_url_verified"])
+
+    def test_video_attachment_verification_survives_story_merge(self):
+        story_id = "1644427817693826"
+        collector = _PostCollector()
+        collector._page_url = "https://www.facebook.com/demo-page"
+        collector._extract_from_text(
+            f'"post_id":"{story_id}","creation_time":1750000000,"message":{{"text":"Video caption"}}'
+        )
+        collector._extract_from_json({"post_id": story_id, "comet_sections": {
+            "content": {"story": {"message": {"text": "Video caption"}, "attachments": [{
+                "media": {"__typename": "Video", "id": "1734567890123456"},
+            }]}},
+            "feedback": {},
+        }})
+
+        post = collector.get_posts()[0]
+        self.assertEqual(post["url"], "https://www.facebook.com/watch/?v=1734567890123456")
+        self.assertTrue(post["video_url_verified"])
+
+    def test_graphql_video_does_not_use_an_unrelated_video_url(self):
+        story_id = "1644427817693826"
+        story = {
+            "post_id": story_id,
+            "comet_sections": {
+                "content": {"story": {
+                    "message": {"text": "Video caption"},
+                    "playable_url": "https://video.example/stream.mp4",
+                    "attachments": [{
+                        "related": {"__typename": "Video", "id": "9876543210987"},
+                        "media": {"__typename": "Photo", "id": "1111111111111"},
+                    }],
+                }},
+                "feedback": {"suggestion": {
+                    "url": "https://www.facebook.com/other-page/videos/9876543210987",
+                }},
+            },
+        }
+
+        post = _PostCollector()._parse_story_node(story)
+
+        self.assertEqual(post["post_type"], "Video")
+        self.assertEqual(post["url"], f"https://www.facebook.com/{story_id}")
+        self.assertFalse(post["video_url_verified"])
 
     def test_page_name_rejects_facebook_detail_label_and_uses_graphql_name(self):
         class FakePage:
@@ -926,11 +999,32 @@ class DatabaseBootstrapTest(unittest.TestCase):
             resumed = downloader_routes.claim_next_download_queue_batch(db_path)
             self.assertEqual(resumed["urls"], ["https://www.facebook.com/12345678901"])
 
+    def test_durable_auto_queue_keeps_shared_url_items_by_source_row(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "shared-url-auto-queue.db")
+            url = "https://www.facebook.com/watch/?v=9876543210987"
+            batch_id = downloader_routes.enqueue_download_queue_batch(
+                db_path,
+                [
+                    {"url": url, "source_post_row_id": 41},
+                    {"url": url, "source_post_row_id": 42},
+                    {"url": url, "source_post_row_id": 41},
+                ],
+                [],
+            )
+            batch = downloader_routes.claim_next_download_queue_batch(db_path)
+            self.assertEqual(batch["id"], batch_id)
+            self.assertEqual(batch["urls"], [url, url])
+            self.assertEqual(batch["source_post_row_ids"], [41, 42])
+
     def test_stop_all_cancels_persisted_batches_without_starting_them(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = str(Path(temp_dir) / "stop-all-auto-queue.db")
             downloader_routes.enqueue_download_queue_batch(
                 db_path, ["https://www.facebook.com/12345678901"], [], source="auto"
+            )
+            downloader_routes.enqueue_download_queue_batch(
+                db_path, ["https://www.facebook.com/22345678901"], [], source="auto"
             )
             previous_running = downloader_routes.orchestrator._running
             previous_stop_all = downloader_routes._stop_all_requested
@@ -938,7 +1032,7 @@ class DatabaseBootstrapTest(unittest.TestCase):
                 downloader_routes.orchestrator._running = False
                 with patch.object(downloader_routes, "_db_path", return_value=db_path):
                     result = downloader_routes.stop_all_downloads()
-                    self.assertEqual(result["cancelled_batches"], 1)
+                    self.assertEqual(result["cancelled_batches"], 2)
                     self.assertFalse(downloader_routes.download_has_active_or_pending_work())
             finally:
                 downloader_routes.orchestrator._running = previous_running
@@ -971,6 +1065,9 @@ class DatabaseBootstrapTest(unittest.TestCase):
             downloader_routes.enqueue_download_queue_batch(
                 db_path, ["https://www.facebook.com/12345678901"], [], source="auto"
             )
+            downloader_routes.enqueue_download_queue_batch(
+                db_path, ["https://www.facebook.com/22345678901"], [], source="auto"
+            )
             previous_running = downloader_routes.orchestrator._running
             previous_stop_requested = downloader_routes._download_stop_requested
             try:
@@ -981,7 +1078,7 @@ class DatabaseBootstrapTest(unittest.TestCase):
                     result = downloader_routes.stop_download()
                     self.assertEqual(result["message"], "Đã dừng tác vụ tải hiện tại")
                     stop.assert_called_once()
-                    self.assertEqual(downloader_routes.get_download_queue_status(db_path)["batches"], 1)
+                    self.assertEqual(downloader_routes.get_download_queue_status(db_path)["batches"], 2)
             finally:
                 downloader_routes.orchestrator._running = previous_running
                 downloader_routes._download_stop_requested = previous_stop_requested
@@ -1373,6 +1470,29 @@ class DatabaseBootstrapTest(unittest.TestCase):
             self.assertEqual(states[post_ids[1]]["download_status"], "failed")
             self.assertIn("gián đoạn", states[post_ids[1]]["download_error"])
 
+    def test_recovery_protects_structured_queue_by_source_row_id(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "interrupted-video-queue.db")
+            watch_url = "https://www.facebook.com/watch/?v=9876543210987"
+            story_ids = ["1111111111111", "2222222222222"]
+            save_posts(db_path, "Demo", "https://www.facebook.com/demo", [
+                SimpleNamespace(
+                    post_id=post_id, date="", post_type="Video", engagement=0, comments=0,
+                    shares=0, view_count=0, caption=post_id, url=watch_url,
+                ) for post_id in story_ids
+            ])
+            rows = query_posts_for_spy(db_path, ["Demo"])
+            row_by_post_id = {row["post_id"]: row for row in rows}
+            mark_posts_download_status(db_path, story_ids, "downloading")
+            enqueue_download_queue_batch(db_path, [
+                {"url": watch_url, "source_post_row_id": row_by_post_id[story_ids[0]]["id"]}
+            ], [])
+
+            self.assertEqual(recover_interrupted_downloads(db_path), 1)
+            states = {row["post_id"]: row["download_status"] for row in query_posts_for_spy(db_path, ["Demo"])}
+            self.assertEqual(states[story_ids[0]], "downloading")
+            self.assertEqual(states[story_ids[1]], "failed")
+
     def test_archive_scan_uses_oldest_boundary_and_persists_separate_cursor(self):
         raw = [
             {"post_id": "new"}, {"post_id": "edge-1"}, {"post_id": "edge-2"},
@@ -1581,25 +1701,409 @@ class DatabaseBootstrapTest(unittest.TestCase):
         ]
         self.assertEqual(
             scraper_routes._downloadable_post_urls(posts),
-            ["https://facebook.com/posts/1", "https://facebook.com/posts/2"],
+            [
+                {"url": "https://facebook.com/posts/1", "source_post_row_id": 0},
+                {"url": "https://facebook.com/posts/2", "source_post_row_id": 0},
+            ],
         )
         request = scraper_routes.ScrapeStartRequest(page_urls=["https://facebook.com/demo"])
         self.assertTrue(request.download_media)
         self.assertTrue(scraper_routes.FavoriteScanRequest().download_media)
 
-    def test_auto_download_uses_post_id_instead_of_a_distinct_watch_video_id(self):
+    def test_auto_download_keeps_watch_url_when_video_id_differs_from_story_id(self):
         urls = scraper_routes._downloadable_post_urls([
             SimpleNamespace(
                 post_id="1234567890123",
+                post_type="Video",
                 url="https://www.facebook.com/watch/?v=9876543210987",
+                video_url_verified=True,
             ),
-            SimpleNamespace(post_id="", url="https://www.facebook.com/watch/?v=9876543210987"),
+            SimpleNamespace(post_id="", url="https://www.facebook.com/watch/?v=1111111111111"),
         ])
 
         self.assertEqual(urls, [
-            "https://www.facebook.com/1234567890123",
-            "https://www.facebook.com/watch/?v=9876543210987",
+            {"url": "https://www.facebook.com/watch/?v=9876543210987", "source_post_row_id": 0},
+            {"url": "https://www.facebook.com/watch/?v=1111111111111", "source_post_row_id": 0},
         ])
+
+    def test_auto_download_preserves_distinct_rows_that_share_a_watch_url(self):
+        watch_url = "https://www.facebook.com/watch/?v=9876543210987"
+        posts = [
+            SimpleNamespace(post_id="1111111111111", post_type="Video", url=watch_url, video_url_verified=True),
+            SimpleNamespace(post_id="2222222222222", post_type="Video", url=watch_url, video_url_verified=True),
+        ]
+        with patch.object(scraper_routes, "get_post_row_id", side_effect=[41, 42]), patch.object(
+            scraper_routes, "get_post_by_row_id", return_value=None
+        ):
+            items = scraper_routes._downloadable_post_urls(
+                posts, "scraper.db", "https://www.facebook.com/demo"
+            )
+        self.assertEqual(items, [
+            {"url": watch_url, "source_post_row_id": 41},
+            {"url": watch_url, "source_post_row_id": 42},
+        ])
+
+    def test_auto_download_reuses_saved_watch_url_after_rescan_misses_video_id(self):
+        video_id = "9876543210987"
+        watch_url = f"https://www.facebook.com/watch/?v={video_id}"
+        variants = (
+            watch_url,
+            f"https://www.facebook.com/watch?v={video_id}",
+            f"https://m.facebook.com/reel/{video_id}/",
+            f"https://www.facebook.com/demo-page/videos/{video_id}/",
+        )
+        for scraped_url in variants:
+            with self.subTest(scraped_url=scraped_url), tempfile.TemporaryDirectory() as temp_dir:
+                db_path = str(Path(temp_dir) / "rescan-watch-url.db")
+                page_url = "https://www.facebook.com/demo"
+                story_id = "1234567890123"
+                save_posts(db_path, "Demo", page_url, [SimpleNamespace(
+                    post_id=story_id, date="", post_type="Video", engagement=0, comments=0,
+                    shares=0, view_count=0, caption="Video", url=scraped_url, video_url_verified=True,
+                )])
+                row_id = query_posts_for_spy(db_path, ["Demo"])[0]["id"]
+                self.assertEqual(scraper_routes._downloadable_post_urls([
+                    SimpleNamespace(post_id=story_id, post_type="Video", url=scraped_url, video_url_verified=True)
+                ], db_path, page_url), [{"url": watch_url, "source_post_row_id": row_id}])
+                save_posts(db_path, "Demo", page_url, [SimpleNamespace(
+                    post_id=story_id, date="", post_type="Video", engagement=0, comments=0,
+                    shares=0, view_count=0, caption="Video", url="",
+                )])
+
+                items = scraper_routes._downloadable_post_urls([
+                    SimpleNamespace(post_id=story_id, post_type="Video", url=f"{page_url}/posts/{story_id}")
+                ], db_path, page_url)
+
+                self.assertEqual(items, [{
+                    "url": watch_url,
+                    "source_post_row_id": row_id,
+                }])
+
+    def test_auto_download_falls_back_to_story_permalink_without_attachment_id(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "video-story-fallback.db")
+            page_url = "https://www.facebook.com/demo-page"
+            story_id = "1234567890123"
+            story_url = f"{page_url}/posts/{story_id}"
+            save_posts(db_path, "Demo", page_url, [SimpleNamespace(
+                post_id=story_id, date="", post_type="Video", engagement=0, comments=0,
+                shares=0, view_count=0, caption="Video without visible attachment id", url=story_url,
+            )])
+            row_id = query_posts_for_spy(db_path, ["Demo"])[0]["id"]
+
+            items = scraper_routes._downloadable_post_urls([
+                SimpleNamespace(post_id=story_id, post_type="Video", url=story_url)
+            ], db_path, page_url)
+
+            self.assertEqual(items, [{"url": story_url, "source_post_row_id": row_id}])
+
+    def test_long_pfbid_story_permalink_works_across_video_download_routes(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "pfbid-story.db")
+            page_url = "https://www.facebook.com/demo-page"
+            story_id = "pfbid" + "A1b2C3d4" * 6
+            story_url = f"{page_url}/posts/{story_id}"
+            save_posts(db_path, "Demo", page_url, [SimpleNamespace(
+                post_id=story_id, date="", post_type="Video", engagement=0, comments=0,
+                shares=0, view_count=0, caption="Video", url=story_url,
+            )])
+            row = query_posts_for_spy(db_path, ["Demo"])[0]
+            self.assertEqual(row["url"], story_url)
+            self.assertEqual(scraper_routes._downloadable_post_urls([
+                SimpleNamespace(post_id=story_id, post_type="Video", url=story_url)
+            ], db_path, page_url), [{"url": story_url, "source_post_row_id": row["id"]}])
+
+            request = downloader_routes.DownloadStartRequest(
+                urls=story_url, source_post_row_ids=[row["id"]],
+                use_accounts=False, cookies="c_user=1; xs=token",
+            )
+            class FakeOrchestrator:
+                is_running = False
+                _max_threads = 1
+
+            with patch.object(downloader_routes, "orchestrator", FakeOrchestrator()), patch.object(
+                downloader_routes.config, "get",
+                side_effect=lambda key, default=None: db_path if key == "scraper_db_path" else default,
+            ), patch.object(downloader_routes, "validate_cookies", return_value=(True, "valid")), patch.object(
+                downloader_routes, "create_task_run", return_value=0
+            ), patch.object(downloader_routes, "_start_with_accounts_or_cookie", return_value=True) as start_mock:
+                result = downloader_routes.start_download(request)
+
+            self.assertEqual(result["state"], "started")
+            self.assertEqual(start_mock.call_args.args[0], [story_url])
+            mark_posts_download_status(db_path, [story_id], "failed", error="Network timeout")
+            with patch.object(spy_routes.config, "get", side_effect=lambda key, default=None: db_path if key == "scraper_db_path" else default), patch.object(
+                spy_routes, "start_download", return_value={"status": "success", "state": "started"}
+            ) as retry_mock:
+                spy_routes.retry_posts(spy_routes.RetryPostsRequest(post_row_ids=[row["id"]]))
+
+            self.assertEqual(retry_mock.call_args.args[0].urls, story_url)
+            numeric_shadow = "1234" * 6
+            save_posts(db_path, "Other", "https://www.facebook.com/other", [SimpleNamespace(
+                post_id=numeric_shadow, date="", post_type="Text", engagement=0, comments=0,
+                shares=0, view_count=0, caption="Other", url="",
+            )])
+            with patch.object(core_downloader.config, "get", return_value=db_path):
+                core_downloader.DownloadOrchestrator()._mark_post_download_status(story_url, "downloading")
+            self.assertEqual(query_posts_for_spy(db_path, ["Other"])[0]["download_status"], "not_downloaded")
+            self.assertEqual(
+                core_downloader.DownloadOrchestrator()._make_folder_name(PostData(post_id=story_id)),
+                story_id,
+            )
+            output_dir = Path(temp_dir) / "downloads"
+            output_dir.mkdir()
+            (output_dir / f"{story_id}.mp4").write_bytes(b"video")
+            self.assertEqual(sync_downloaded_posts_from_folder(db_path, str(output_dir)), 1)
+            self.assertEqual(query_posts_for_spy(db_path, ["Demo"])[0]["download_status"], "downloaded")
+
+    def test_auto_download_rejects_permalink_for_a_different_story(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "video-story-mismatch.db")
+            page_url = "https://www.facebook.com/demo-page"
+            story_id = "1234567890123"
+            foreign_url = "https://www.facebook.com/other-page/posts/9876543210987"
+            save_posts(db_path, "Demo", page_url, [SimpleNamespace(
+                post_id=story_id, date="", post_type="Video", engagement=0, comments=0,
+                shares=0, view_count=0, caption="Video", url=foreign_url,
+            )])
+            row = query_posts_for_spy(db_path, ["Demo"])[0]
+            self.assertEqual(row["url"], f"https://www.facebook.com/{story_id}")
+
+            items = scraper_routes._downloadable_post_urls([
+                SimpleNamespace(post_id=story_id, post_type="Video", url=foreign_url)
+            ], db_path, page_url)
+
+            self.assertEqual(items, [{"url": f"https://www.facebook.com/{story_id}", "source_post_row_id": row["id"]}])
+
+    def test_unverified_video_link_is_not_saved_or_queued_for_another_story(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "unverified-video-link.db")
+            page_url = "https://www.facebook.com/demo-page"
+            story_id = "1234567890123"
+            foreign_video_url = "https://www.facebook.com/other-page/videos/9876543210987"
+            post = SimpleNamespace(
+                post_id=story_id, date="", post_type="Video", engagement=0, comments=0,
+                shares=0, view_count=0, caption="Video", url=foreign_video_url,
+                video_url_verified=False,
+            )
+            save_posts(db_path, "Demo", page_url, [post])
+            row = query_posts_for_spy(db_path, ["Demo"])[0]
+            self.assertEqual(row["url"], f"https://www.facebook.com/{story_id}")
+            self.assertEqual(scraper_routes._downloadable_post_urls([post], db_path, page_url), [{
+                "url": f"https://www.facebook.com/{story_id}",
+                "source_post_row_id": row["id"],
+            }])
+
+    def test_selected_video_rejects_a_permalink_for_a_different_story(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "video-story-selection-mismatch.db")
+            page_url = "https://www.facebook.com/demo-page"
+            story_id = "1234567890123"
+            save_posts(db_path, "Demo", page_url, [SimpleNamespace(
+                post_id=story_id, date="", post_type="Video", engagement=0, comments=0,
+                shares=0, view_count=0, caption="Video", url=f"{page_url}/posts/{story_id}",
+            )])
+            row_id = query_posts_for_spy(db_path, ["Demo"])[0]["id"]
+
+            request = downloader_routes.DownloadStartRequest(
+                urls="https://www.facebook.com/other-page/posts/9876543210987",
+                source_post_row_ids=[row_id],
+            )
+            with patch.object(downloader_routes.config, "get", return_value=db_path):
+                with self.assertRaises(HTTPException) as raised:
+                    downloader_routes.start_download(request)
+
+            self.assertEqual(raised.exception.status_code, 409)
+
+    def test_downloader_replaces_foreign_story_permalink_from_exact_source_row(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "video-story-download-mismatch.db")
+            output_dir = Path(temp_dir) / "downloads"
+            page_url = "https://www.facebook.com/demo-page"
+            story_id = "1234567890123"
+            save_posts(db_path, "Demo", page_url, [SimpleNamespace(
+                post_id=story_id, date="", post_type="Video", engagement=0, comments=0,
+                shares=0, view_count=0, caption="Video", url=f"{page_url}/posts/{story_id}",
+            )])
+            row_id = query_posts_for_spy(db_path, ["Demo"])[0]["id"]
+            expected_url = f"{page_url}/posts/{story_id}"
+            fetched = []
+
+            class FakeBrowser:
+                @staticmethod
+                def fetch_post(url, post_id):
+                    fetched.append((url, post_id))
+                    return PostData(
+                        post_id=post_id, text="Video", has_video=True,
+                        video_url="https://cdn.example/video.mp4",
+                    )
+
+                @staticmethod
+                def download_file(_url, path):
+                    path.write_bytes(b"video")
+                    return True
+
+            orchestrator = core_downloader.DownloadOrchestrator()
+            orchestrator._output_dir = output_dir
+            orchestrator.stats = core_downloader.DownloadStats(total_posts=1, start_time=time.time())
+            with patch.object(core_downloader.config, "get", return_value=db_path), patch.object(
+                orchestrator, "_mark_post_download_status"
+            ), patch.object(orchestrator, "_mark_post_downloaded"), patch.object(
+                orchestrator, "_notify_stats"
+            ):
+                orchestrator._process_single_post(
+                    "https://www.facebook.com/other-page/posts/9876543210987",
+                    1,
+                    browser=FakeBrowser(),
+                    source_post_row_id=row_id,
+                )
+
+            self.assertEqual(fetched, [(expected_url, story_id)])
+            self.assertTrue((output_dir / f"{story_id}.mp4").is_file())
+            self.assertEqual(orchestrator.stats.success_posts, 1)
+
+    def test_legacy_unverified_watch_url_uses_source_story_on_selected_download(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "legacy-watch-url.db")
+            output_dir = Path(temp_dir) / "downloads"
+            output_dir.mkdir()
+            page_url = "https://www.facebook.com/demo-page"
+            story_id = "1234567890123"
+            foreign_watch_url = "https://www.facebook.com/watch/?v=9876543210987"
+            save_posts(db_path, "Demo", page_url, [SimpleNamespace(
+                post_id=story_id, date="", post_type="Video", engagement=0, comments=0,
+                shares=0, view_count=0, caption="Video", url=f"{page_url}/posts/{story_id}",
+            )])
+            row_id = query_posts_for_spy(db_path, ["Demo"])[0]["id"]
+            conn = _get_conn(db_path)
+            conn.execute("UPDATE posts SET url = ?, video_url_verified = 0 WHERE id = ?", (foreign_watch_url, row_id))
+            conn.commit()
+            conn.close()
+
+            request = downloader_routes.DownloadStartRequest(
+                urls=foreign_watch_url, source_post_row_ids=[row_id],
+                use_accounts=False, cookies="c_user=1; xs=token",
+            )
+            class FakeOrchestrator:
+                is_running = False
+                _max_threads = 1
+
+            with patch.object(downloader_routes, "orchestrator", FakeOrchestrator()), patch.object(
+                downloader_routes.config, "get",
+                side_effect=lambda key, default=None: db_path if key == "scraper_db_path" else default,
+            ), patch.object(downloader_routes, "validate_cookies", return_value=(True, "valid")), patch.object(
+                downloader_routes, "create_task_run", return_value=0
+            ), patch.object(downloader_routes, "_start_with_accounts_or_cookie", return_value=True) as start_mock:
+                downloader_routes.start_download(request)
+
+            self.assertEqual(start_mock.call_args.args[0], [f"https://www.facebook.com/{story_id}"])
+
+            fetched = []
+            class FakeBrowser:
+                @staticmethod
+                def fetch_post(url, post_id):
+                    fetched.append((url, post_id))
+                    return PostData(post_id=post_id, text="Video", has_video=True,
+                                    video_url="https://cdn.example/video.mp4")
+
+                @staticmethod
+                def download_file(_url, path):
+                    path.write_bytes(b"video")
+                    return True
+
+            orchestrator = core_downloader.DownloadOrchestrator()
+            orchestrator._output_dir = output_dir
+            orchestrator.stats = core_downloader.DownloadStats(total_posts=1, start_time=time.time())
+            with patch.object(core_downloader.config, "get", return_value=db_path), patch.object(
+                orchestrator, "_mark_post_download_status"
+            ), patch.object(orchestrator, "_mark_post_downloaded"), patch.object(
+                orchestrator, "_notify_stats"
+            ):
+                orchestrator._process_single_post(
+                    foreign_watch_url, 1, browser=FakeBrowser(), source_post_row_id=row_id,
+                )
+
+            self.assertEqual(fetched, [(f"{page_url}/posts/{story_id}", story_id)])
+            self.assertEqual(orchestrator.stats.success_posts, 1)
+
+    def test_schema_upgrade_does_not_trust_legacy_watch_urls(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "legacy-watch-schema.db")
+            story_id = "1234567890123"
+            watch_url = "https://www.facebook.com/watch/?v=9876543210987"
+            save_posts(db_path, "Demo", "https://www.facebook.com/demo", [SimpleNamespace(
+                post_id=story_id, date="", post_type="Video", engagement=0, comments=0,
+                shares=0, view_count=0, caption="Video", url=f"https://www.facebook.com/{story_id}",
+            )])
+            matching_story_id = "1111111111111"
+            save_posts(db_path, "Other", "https://www.facebook.com/other", [SimpleNamespace(
+                post_id=matching_story_id, date="", post_type="Video", engagement=0, comments=0,
+                shares=0, view_count=0, caption="Other video", url=f"https://www.facebook.com/{matching_story_id}",
+            )])
+            conn = _get_conn(db_path)
+            conn.execute("UPDATE posts SET url = ? WHERE post_id = ?", (watch_url, story_id))
+            conn.execute(
+                "UPDATE posts SET url = ? WHERE post_id = ?",
+                (f"https://www.facebook.com/watch/?v={matching_story_id}", matching_story_id),
+            )
+            conn.execute("ALTER TABLE posts DROP COLUMN video_url_verified")
+            conn.execute("PRAGMA user_version=13")
+            conn.commit()
+            conn.close()
+
+            self.assertEqual(initialize_database(db_path, force=True), SCHEMA_VERSION)
+            conn = _get_conn(db_path)
+            rows = dict(conn.execute("SELECT post_id, video_url_verified FROM posts").fetchall())
+            conn.close()
+            self.assertEqual(rows, {story_id: 0, matching_story_id: 1})
+            self.assertEqual(len(list(Path(temp_dir).glob("legacy-watch-schema.db.pre-schema-v14-*.sqlite"))), 1)
+            conn = _get_conn(db_path)
+            conn.execute("UPDATE posts SET video_url_verified = 0 WHERE post_id = ?", (matching_story_id,))
+            conn.commit()
+            conn.close()
+            save_posts(db_path, "Other", "https://www.facebook.com/other", [SimpleNamespace(
+                post_id=matching_story_id, date="", post_type="Video", engagement=0, comments=0,
+                shares=0, view_count=0, caption="Other video", url=f"https://www.facebook.com/{matching_story_id}",
+            )])
+            conn = _get_conn(db_path)
+            preserved = conn.execute(
+                "SELECT url, video_url_verified FROM posts WHERE post_id = ?", (matching_story_id,)
+            ).fetchone()
+            conn.close()
+            self.assertEqual(preserved, (f"https://www.facebook.com/watch/?v={matching_story_id}", 1))
+
+    def test_selected_video_uses_saved_story_permalink_without_attachment_id(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "legacy-video-selection.db")
+            page_url = "https://www.facebook.com/demo"
+            story_id = "1234567890123"
+            story_url = f"{page_url}/posts/{story_id}"
+            save_posts(db_path, "Demo", page_url, [SimpleNamespace(
+                post_id=story_id, date="", post_type="Video", engagement=0, comments=0,
+                shares=0, view_count=0, caption="Video without attachment ID", url=story_url,
+            )])
+            row_id = query_posts_for_spy(db_path, ["Demo"])[0]["id"]
+            request = downloader_routes.DownloadStartRequest(
+                urls=story_url,
+                source_post_row_ids=[row_id],
+                use_accounts=False,
+                cookies="c_user=1; xs=token",
+            )
+            class FakeOrchestrator:
+                is_running = False
+                _max_threads = 1
+
+            with patch.object(downloader_routes, "orchestrator", FakeOrchestrator()), patch.object(
+                downloader_routes.config, "get",
+                side_effect=lambda key, default=None: db_path if key == "scraper_db_path" else default,
+            ), patch.object(downloader_routes, "validate_cookies", return_value=(True, "valid")), patch.object(
+                downloader_routes, "create_task_run", return_value=0
+            ), patch.object(downloader_routes, "_start_with_accounts_or_cookie", return_value=True) as start_mock:
+                result = downloader_routes.start_download(request)
+
+            self.assertEqual(result["state"], "started")
+            self.assertEqual(start_mock.call_args.args[0], [story_url])
+            self.assertEqual(start_mock.call_args.kwargs["source_post_row_ids"], [row_id])
 
     def test_quick_scan_distributes_multiple_urls_across_account_queues(self):
         urls = [
@@ -1648,7 +2152,7 @@ class DatabaseBootstrapTest(unittest.TestCase):
                 "https://facebook.com/posts/1",
             ])
         self.assertTrue(started)
-        enqueue.assert_called_once_with(["https://facebook.com/posts/1"], [7])
+        enqueue.assert_called_once_with([{"url": "https://facebook.com/posts/1", "source_post_row_id": 0}], [7])
 
     def test_auto_download_keeps_single_account_scan_pool_isolated(self):
         scan_account = {"id": 1, "username": "scanner", "is_active": 1}
@@ -1658,7 +2162,7 @@ class DatabaseBootstrapTest(unittest.TestCase):
             )
 
         self.assertTrue(started)
-        enqueue.assert_called_once_with(["https://facebook.com/posts/1"], [1])
+        enqueue.assert_called_once_with([{"url": "https://facebook.com/posts/1", "source_post_row_id": 0}], [1])
 
     def test_stopping_one_favorite_worker_keeps_other_queue_running(self):
         class FakeActiveScraper:

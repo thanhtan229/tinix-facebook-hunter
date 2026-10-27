@@ -357,7 +357,9 @@ def cleanup_previous_sessions(
                 if conn.laddr and conn.laddr.port == port and conn.status == psutil.CONN_LISTEN:
                     if conn.pid and conn.pid not in exclude_pids:
                         try:
-                            backend_procs.append(psutil.Process(conn.pid))
+                            listener = psutil.Process(conn.pid)
+                            if is_workspace_python_process(listener, ws, exclude_pids):
+                                backend_procs.append(listener)
                         except (psutil.NoSuchProcess, psutil.AccessDenied):
                             pass
         except Exception:
@@ -433,14 +435,15 @@ def main():
 
     ws_path = Path(args.workspace) if args.workspace else get_workspace_root()
     should_close_windows = args.close_windows and not args.skip_windows
-    cleanup_previous_sessions(
+    result = cleanup_previous_sessions(
         port=args.port,
         workspace_root=ws_path,
         timeout=args.timeout,
         close_windows=should_close_windows,
         verbose=not args.quiet,
     )
+    return 0 if result["port_freed"] else 1
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional
 
 from utils import logger
-from utils.chrome_profiles import scraper_profile_dir
+from utils.chrome_profiles import scraper_profile_dir, shutdown_owned_chrome
 
 
 @dataclass
@@ -37,6 +37,7 @@ class ScrapedPost:
     caption: str = ""
     page_name: str = ""
     url: str = ""
+    video_url_verified: bool = False
     media_preview_url: str = ""
     media_count: int = 0
 
@@ -274,6 +275,7 @@ class _PostCollector:
                             or ("watch" in post["url"] and "watch" not in existing.get("url", ""))
                         ):
                             existing["url"] = post["url"]
+                            existing["video_url_verified"] = bool(post.get("video_url_verified", False))
                         if post.get("media_preview_url") and not existing.get("media_preview_url"):
                             existing["media_preview_url"] = post["media_preview_url"]
                         if post.get("media_count", 0) > existing.get("media_count", 0):
@@ -487,6 +489,10 @@ class _PostCollector:
         video_id = self._extract_primary_video_id(content) if post_type == "Video" else ""
         if video_id:
             url = f"https://www.facebook.com/watch/?v={video_id}"
+        elif post_type == "Video":
+            url = f"https://www.facebook.com/{post_id}" if re.fullmatch(
+                r"(?:\d{10,}|pfbid[A-Za-z0-9_-]{8,})", post_id, re.IGNORECASE
+            ) else ""
         else:
             node_str_for_url = json.dumps(node, default=str)
             url_match = re.search(
@@ -521,34 +527,49 @@ class _PostCollector:
             "view_count": view_count,
             "caption": caption,
             "url": url,
+            "video_url_verified": bool(video_id),
             "media_preview_url": media_preview_url,
             "media_count": media_count,
         }
 
     @staticmethod
     def _extract_primary_video_id(content: object) -> str:
-        """Return the first actual video attachment ID from a story's content."""
-        def visit(value: object) -> str:
-            if isinstance(value, dict):
-                is_video = str(value.get("__typename", "")) == "Video"
-                if is_video:
-                    for key in ("id", "video_id", "fbid"):
-                        candidate = str(value.get(key, "") or "")
-                        if candidate.isdigit() and len(candidate) >= 10:
-                            return candidate
-                for child in value.values():
-                    if isinstance(child, (dict, list)):
-                        found = visit(child)
-                        if found:
-                            return found
-            elif isinstance(value, list):
-                for child in value:
-                    found = visit(child)
-                    if found:
-                        return found
+        """Return a video ID only from this story's media attachments."""
+        def direct_video_id(value: object) -> str:
+            if not isinstance(value, dict) or value.get("__typename") != "Video":
+                return ""
+            for key in ("id", "video_id", "fbid"):
+                candidate = str(value.get(key, "") or "")
+                if candidate.isdigit() and len(candidate) >= 10:
+                    return candidate
             return ""
 
-        return visit(content)
+        def visit_attachment(value: object) -> str:
+            if isinstance(value, list):
+                return next((found for item in value if (found := visit_attachment(item))), "")
+            if not isinstance(value, dict):
+                return ""
+            direct = direct_video_id(value) or direct_video_id(value.get("media"))
+            if direct:
+                return direct
+            for key in ("attachments", "all_subattachments", "subattachments", "nodes", "edges", "node"):
+                found = visit_attachment(value.get(key))
+                if found:
+                    return found
+            return ""
+
+        story = content.get("story") if isinstance(content, dict) else None
+        if not isinstance(story, dict):
+            return ""
+        video_id = direct_video_id(story.get("media"))
+        if video_id:
+            return video_id
+        for key, value in story.items():
+            if "attachment" in str(key).lower():
+                video_id = visit_attachment(value)
+                if video_id:
+                    return video_id
+        return ""
 
     def _deep_find(self, obj, key: str):
         """Recursively find the first occurrence of a key in a nested dict."""
@@ -1042,31 +1063,24 @@ class PageScraper:
     def stop(self):
         """Shutdown browser."""
         self._stop_event.set()
+        shutdown_error = None
         try:
-            if self._browser and not self._reused_browser:
-                self._browser.close()
-        except Exception:
-            pass
+            if not self._reused_browser and (self._browser is not None or self._chrome_process is not None):
+                shutdown_owned_chrome(self._browser, self._chrome_process, self._cdp_port)
+        except Exception as exc:
+            shutdown_error = exc
         try:
             if self._pw_instance:
                 self._pw_instance.stop()
         except Exception:
             pass
-        try:
-            if self._chrome_process:
-                self._chrome_process.terminate()
-                self._chrome_process.wait(timeout=5)
-        except Exception:
-            try:
-                if self._chrome_process:
-                    self._chrome_process.kill()
-            except Exception:
-                pass
         self._browser = None
         self._context = None
         self._chrome_process = None
         self._pw_instance = None
         self._reused_browser = False
+        if shutdown_error is not None:
+            raise shutdown_error
 
     def _inject_cookies_cdp(self) -> None:
         """Inject cookies via CDP for reliable authentication in Chrome.
@@ -2027,6 +2041,7 @@ class PageScraper:
                 view_count=item.get("view_count", 0),
                 caption=item.get("caption", ""),
                 url=item.get("url", ""),
+                video_url_verified=bool(item.get("video_url_verified", False)),
                 media_preview_url=item.get("media_preview_url", ""),
                 media_count=item.get("media_count", 0),
                 page_name=page_name,

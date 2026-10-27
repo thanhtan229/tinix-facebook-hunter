@@ -17,7 +17,7 @@ from typing import Dict, List, Optional
 from urllib.parse import urlparse
 
 from utils import logger
-from utils.chrome_profiles import browser_profile_dir
+from utils.chrome_profiles import browser_profile_dir, shutdown_owned_chrome
 
 # Suppress warnings
 import warnings
@@ -140,7 +140,7 @@ class BrowserManager:
             # Connect Playwright via CDP
             self._pw_instance = sync_playwright().start()
             self._browser = self._pw_instance.chromium.connect_over_cdp(
-                f"http://localhost:{self._cdp_port}",
+                f"http://127.0.0.1:{self._cdp_port}",
                 timeout=15000,
             )
 
@@ -1691,28 +1691,16 @@ class BrowserManager:
     def stop(self) -> None:
         """Shut down browser and Chrome process."""
         try:
-            if self._browser:
-                self._browser.close()
-        except Exception:
-            pass
+            if self._browser is not None or self._chrome_process is not None:
+                shutdown_owned_chrome(self._browser, self._chrome_process, self._cdp_port)
+        except Exception as exc:
+            logger.warning(f"Không thể đóng Chrome worker: {str(exc)[:150]}")
 
         try:
             if self._pw_instance:
                 self._pw_instance.stop()
         except Exception:
             pass
-
-        try:
-            if self._chrome_process:
-                self._chrome_process.terminate()
-                self._chrome_process.wait(timeout=5)
-        except Exception:
-            try:
-                if self._chrome_process:
-                    self._chrome_process.kill()
-            except Exception:
-                pass
-
         self._browser = None
         self._context = None
         self._chrome_process = None

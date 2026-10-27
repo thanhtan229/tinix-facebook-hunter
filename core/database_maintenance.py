@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import sqlite3
+import os
+import tempfile
 from datetime import datetime
 from pathlib import Path
 
@@ -18,7 +20,7 @@ def inspect_database(path: str | Path) -> dict[str, object]:
     database = Path(path).expanduser().resolve()
     if not database.is_file():
         raise FileNotFoundError(database)
-    connection = sqlite3.connect(str(database), timeout=30)
+    connection = sqlite3.connect(database.as_uri() + "?mode=ro", uri=True, timeout=30)
     try:
         integrity = str(connection.execute("PRAGMA quick_check").fetchone()[0])
         version = int(connection.execute("PRAGMA user_version").fetchone()[0])
@@ -59,6 +61,41 @@ def create_database_backup(path: str | Path, destination: str | Path | None = No
     return str(backup_path)
 
 
+def _restore_corrupt_database(database: Path, backup: Path) -> str:
+    """Stage a verified restore before quarantining the offline corrupt DB and sidecars."""
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    safety_backup = database.with_name(f"{database.name}.corrupt-backup-{stamp}.sqlite")
+    with tempfile.NamedTemporaryFile(dir=database.parent, suffix=".restore.sqlite", delete=False) as handle:
+        staged = Path(handle.name)
+    moved: list[tuple[Path, Path]] = []
+    try:
+        source = sqlite3.connect(str(backup), timeout=30)
+        target = sqlite3.connect(str(staged), timeout=30)
+        try:
+            source.backup(target)
+            target.commit()
+        finally:
+            target.close()
+            source.close()
+        if not inspect_database(staged)["supported"]:
+            raise RuntimeError("Staged restore failed verification")
+        try:
+            for suffix in ("", "-wal", "-shm", "-journal"):
+                original = Path(str(database) + suffix)
+                preserved = Path(str(safety_backup) + suffix)
+                if original.exists():
+                    os.replace(original, preserved)
+                    moved.append((original, preserved))
+            os.replace(staged, database)
+        except Exception:
+            for original, preserved in reversed(moved):
+                os.replace(preserved, original)
+            raise
+        return str(safety_backup)
+    finally:
+        staged.unlink(missing_ok=True)
+
+
 def restore_database(path: str | Path, backup: str | Path) -> str:
     """Restore a verified backup and return the automatic pre-restore backup path."""
     database = Path(path).expanduser().resolve()
@@ -66,6 +103,15 @@ def restore_database(path: str | Path, backup: str | Path) -> str:
     details = inspect_database(backup_path)
     if not details["supported"]:
         raise RuntimeError("Backup is corrupt or uses an unsupported schema")
+    if backup_path == database:
+        raise ValueError("Restore source must differ from the live database")
+    if database.exists():
+        try:
+            corrupt = inspect_database(database)["integrity"] != "ok"
+        except sqlite3.DatabaseError:
+            corrupt = True
+        if corrupt:
+            return _restore_corrupt_database(database, backup_path)
     safety_backup = create_database_backup(database)
     source = sqlite3.connect(str(backup_path), timeout=30)
     target = sqlite3.connect(str(database), timeout=30)

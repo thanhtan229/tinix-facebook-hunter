@@ -15,12 +15,13 @@ from pathlib import Path
 from typing import Dict, List, Optional, Any
 
 from core.page_scraper import is_valid_facebook_page_name
+from core.url_handler import get_original_url, is_story_permalink_for_id, is_video_url_for_story_id, normalize_video_post_url
 from utils import logger
 from utils.secure_store import is_protected, protect_secret, reveal_secret
 
 
 ACCOUNT_SECRET_FIELDS = {"password", "secret_2fa", "email_pass", "cookie", "recovery_codes"}
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 14
 _SCHEMA_LOCK = threading.RLock()
 _SCHEMA_READY: set[str] = set()
 
@@ -138,6 +139,7 @@ def _initialize_schema(db_path: str) -> sqlite3.Connection:
             view_count     INTEGER NOT NULL DEFAULT 0,
             caption       TEXT    NOT NULL DEFAULT '',
             url           TEXT    NOT NULL DEFAULT '',
+            video_url_verified INTEGER NOT NULL DEFAULT 0,
             media_preview_url TEXT NOT NULL DEFAULT '',
             media_count   INTEGER NOT NULL DEFAULT 0,
             scraped_at    TEXT    NOT NULL DEFAULT '',
@@ -261,6 +263,18 @@ def _initialize_schema(db_path: str) -> sqlite3.Connection:
         conn.commit()
     except Exception:
         pass
+
+    # This provenance marker gates saved watch URLs, so an incomplete upgrade
+    # must fail rather than mark the database as current without the column.
+    post_columns = {row[1] for row in conn.execute("PRAGMA table_info(posts)").fetchall()}
+    if "video_url_verified" not in post_columns:
+        conn.execute("ALTER TABLE posts ADD COLUMN video_url_verified INTEGER NOT NULL DEFAULT 0")
+        conn.execute(
+            """UPDATE posts SET video_url_verified = 1
+               WHERE post_type = 'Video'
+                 AND url = 'https://www.facebook.com/watch/?v=' || post_id"""
+        )
+        conn.commit()
 
     # Migration: add follower_count to pages table
     try:
@@ -1329,15 +1343,31 @@ def save_posts(
     try:
         for post in posts:
             pid = post.post_id if hasattr(post, 'post_id') else ""
-            numeric_id = pid if pid and pid.isdigit() else ""
-            post_url = f"https://www.facebook.com/{numeric_id}" if numeric_id else ""
+            story_id = str(pid or "").strip()
+            is_safe_story_id = bool(re.fullmatch(r"(?:\d{10,}|pfbid[A-Za-z0-9_-]{8,})", story_id, re.IGNORECASE))
+            post_url = f"https://www.facebook.com/{story_id}" if is_safe_story_id else ""
+            scraped_url = str(getattr(post, "url", "") or "").strip()
+            video_url_verified = 0
+            # Video posts can have a story ID that differs from the playable
+            # attachment ID. Keep the story ID as the row key, but retain the
+            # best available URL so downloads can open the actual video.
+            if str(getattr(post, "post_type", "")) == "Video":
+                video_url = normalize_video_post_url(scraped_url)
+                if video_url and (
+                    bool(getattr(post, "video_url_verified", False))
+                    or is_video_url_for_story_id(video_url, story_id)
+                ):
+                    post_url = video_url
+                    video_url_verified = 1
+                elif is_story_permalink_for_id(scraped_url, story_id):
+                    post_url = get_original_url(scraped_url)
 
             conn.execute("""
                 INSERT INTO posts
                     (page_name, page_url, group_name, post_id, date, post_type,
                      engagement, comments, shares, view_count, caption, url,
-                     media_preview_url, media_count, scraped_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     media_preview_url, media_count, scraped_at, video_url_verified)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(page_name, post_id) DO UPDATE SET
                     page_url = excluded.page_url,
                     group_name = excluded.group_name,
@@ -1348,7 +1378,22 @@ def save_posts(
                     shares = excluded.shares,
                     view_count = CASE WHEN excluded.view_count > posts.view_count THEN excluded.view_count ELSE posts.view_count END,
                     caption = excluded.caption,
-                    url = excluded.url,
+                    url = CASE
+                        WHEN excluded.post_type = 'Video'
+                             AND (posts.video_url_verified = 1
+                                  OR posts.url = 'https://www.facebook.com/watch/?v=' || posts.post_id)
+                             AND excluded.video_url_verified = 0
+                        THEN posts.url
+                        ELSE excluded.url
+                    END,
+                    video_url_verified = CASE
+                        WHEN excluded.post_type = 'Video'
+                             AND (posts.video_url_verified = 1
+                                  OR posts.url = 'https://www.facebook.com/watch/?v=' || posts.post_id)
+                             AND excluded.video_url_verified = 0
+                        THEN 1
+                        ELSE excluded.video_url_verified
+                    END,
                     media_preview_url = CASE
                         WHEN excluded.media_preview_url != '' THEN excluded.media_preview_url
                         ELSE posts.media_preview_url
@@ -1374,6 +1419,7 @@ def save_posts(
                 getattr(post, 'media_preview_url', ''),
                 max(0, int(getattr(post, 'media_count', 0) or 0)),
                 now,
+                video_url_verified,
             ))
             saved += 1
 
@@ -1400,7 +1446,9 @@ def save_posts(
         conn.commit()
         logger.info(f"💾 Đã lưu {saved} bài vào database")
     except Exception as e:
+        conn.rollback()
         logger.error(f"Lỗi lưu database: {str(e)[:200]}")
+        raise
     finally:
         conn.close()
 
@@ -1463,28 +1511,69 @@ def get_post_by_id(db_path: str, post_id: str, url: str = "") -> Optional[dict]:
         conn = _get_conn(db_path)
         cursor = conn.execute("""
             SELECT post_id, page_name, page_url, date, post_type,
-                   caption, url, media_preview_url, media_count
+                   caption, url, media_preview_url, media_count, video_url_verified
             FROM posts
             WHERE post_id = ? OR url = ?
-            ORDER BY id DESC LIMIT 1
-        """, (str(post_id or ""), str(url or "")))
+            ORDER BY (CASE WHEN ? != '' AND url = ? THEN 1 ELSE 0 END) DESC,
+                     id DESC LIMIT 1
+        """, (str(post_id or ""), str(url or ""), str(url or ""), str(url or "")))
         row = cursor.fetchone()
         conn.close()
         if not row:
             return None
         return {
-            "post_id": row[0],
-            "page_name": row[1],
-            "page_url": row[2],
-            "date": row[3],
-            "post_type": row[4],
-            "caption": row[5],
-            "url": row[6],
-            "media_preview_url": row[7],
-            "media_count": row[8],
+            "post_id": row[0], "page_name": row[1], "page_url": row[2], "date": row[3],
+            "post_type": row[4], "caption": row[5], "url": row[6],
+            "media_preview_url": row[7], "media_count": row[8],
+            "video_url_verified": bool(row[9]),
         }
     except Exception as e:
         logger.debug(f"Lỗi đọc post by id: {str(e)[:150]}")
+        return None
+
+
+def get_post_row_id(db_path: str, page_url: str, post_id: str) -> int:
+    """Resolve the exact scraped row for one page and stable story ID."""
+    if not page_url or not post_id:
+        return 0
+    try:
+        canonical_page_url = normalize_page_url(page_url)
+        conn = _get_conn(db_path)
+        try:
+            row = conn.execute(
+                "SELECT id FROM posts WHERE page_url = ? AND post_id = ? ORDER BY id DESC LIMIT 1",
+                (canonical_page_url, str(post_id)),
+            ).fetchone()
+            return int(row[0]) if row else 0
+        finally:
+            conn.close()
+    except Exception as exc:
+        logger.debug(f"Không tìm được ID dòng bài viết: {str(exc)[:150]}")
+        return 0
+
+
+def get_post_by_row_id(db_path: str, row_id: int) -> Optional[dict]:
+    """Return download metadata from one exact Post Spy row."""
+    try:
+        conn = _get_conn(db_path)
+        try:
+            row = conn.execute(
+                """SELECT post_id, page_name, page_url, date, post_type, caption, url,
+                          media_preview_url, media_count, video_url_verified FROM posts WHERE id = ?""",
+                (int(row_id),),
+            ).fetchone()
+            if not row:
+                return None
+            return {
+                "post_id": row[0], "page_name": row[1], "page_url": row[2], "date": row[3],
+                "post_type": row[4], "caption": row[5], "url": row[6],
+                "media_preview_url": row[7], "media_count": row[8],
+                "video_url_verified": bool(row[9]),
+            }
+        finally:
+            conn.close()
+    except Exception as exc:
+        logger.debug(f"Không đọc được dòng bài viết: {str(exc)[:150]}")
         return None
 
 
@@ -1642,8 +1731,26 @@ _DOWNLOAD_QUEUE_ACTIVE_STATUSES = {"queued", "starting", "running"}
 _DOWNLOAD_QUEUE_TERMINAL_STATUSES = {"completed", "failed", "cancelled"}
 
 
-def _normalize_download_queue_urls(urls: List[str]) -> List[str]:
-    return list(dict.fromkeys(str(url).strip() for url in urls if str(url).strip()))
+def _normalize_download_queue_items(items: List[object]) -> List[dict]:
+    normalized: List[dict] = []
+    seen: set[tuple[str, object]] = set()
+    for item in items:
+        if isinstance(item, dict):
+            url = str(item.get("url") or "").strip()
+            try:
+                row_id = max(0, int(item.get("source_post_row_id") or item.get("post_row_id") or 0))
+            except (TypeError, ValueError):
+                row_id = 0
+        else:
+            url, row_id = str(item or "").strip(), 0
+        if not url:
+            continue
+        key = ("row", row_id) if row_id else ("url", url)
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized.append({"url": url, "source_post_row_id": row_id})
+    return normalized
 
 
 def _normalize_download_queue_account_ids(account_ids: List[int]) -> List[int]:
@@ -1652,14 +1759,14 @@ def _normalize_download_queue_account_ids(account_ids: List[int]) -> List[int]:
 
 def enqueue_download_queue_batch(
     db_path: str,
-    urls: List[str],
+    urls: List[object],
     account_ids: List[int],
     *,
     source: str = "auto",
 ) -> int:
     """Persist one Auto Download batch before it is eligible to start."""
-    normalized_urls = _normalize_download_queue_urls(urls)
-    if not normalized_urls:
+    normalized_items = _normalize_download_queue_items(urls)
+    if not normalized_items:
         return 0
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     conn = _get_conn(db_path)
@@ -1669,8 +1776,8 @@ def enqueue_download_queue_batch(
                (source, status, item_count, urls_json, account_ids_json, created_at, updated_at)
                VALUES (?, 'queued', ?, ?, ?, ?, ?)""",
             (
-                str(source or "auto")[:40], len(normalized_urls),
-                json.dumps(normalized_urls, ensure_ascii=False),
+                str(source or "auto")[:40], len(normalized_items),
+                json.dumps(normalized_items, ensure_ascii=False),
                 json.dumps(_normalize_download_queue_account_ids(account_ids), ensure_ascii=False),
                 now, now,
             ),
@@ -1713,13 +1820,15 @@ def claim_next_download_queue_batch(db_path: str) -> Optional[dict]:
         if changed != 1:
             return None
         try:
-            urls = _normalize_download_queue_urls(json.loads(row[3] or "[]"))
+            items = _normalize_download_queue_items(json.loads(row[3] or "[]"))
             account_ids = _normalize_download_queue_account_ids(json.loads(row[4] or "[]"))
         except (TypeError, ValueError, json.JSONDecodeError):
-            urls, account_ids = [], []
+            items, account_ids = [], []
         return {
             "id": int(row[0]), "source": str(row[1] or "auto"),
-            "item_count": int(row[2] or 0), "urls": urls, "account_ids": account_ids,
+            "item_count": int(row[2] or 0), "urls": [item["url"] for item in items],
+            "items": items, "source_post_row_ids": [item["source_post_row_id"] for item in items],
+            "account_ids": account_ids,
         }
     finally:
         conn.close()
@@ -1959,6 +2068,40 @@ def mark_post_row_downloaded(
         return False
 
 
+def mark_post_row_download_status(
+    db_path: str, row_id: int, status: str, *, error: str = "", folder_path: str = "", only_if_status: str = ""
+) -> bool:
+    """Update the download lifecycle state for one exact Post Spy row."""
+    allowed = {"not_downloaded", "downloading", "failed", "thumbnail_only", "downloaded"}
+    if not row_id or status not in allowed:
+        return False
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    complete = int(status in {"downloaded", "thumbnail_only"})
+    try:
+        conn = _get_conn(db_path)
+        try:
+            guard = " AND download_status = ?" if only_if_status else ""
+            params = [complete, status, str(error or "")[:1000], status, str(folder_path or ""), str(folder_path or ""),
+                      status, now, status, int(row_id)]
+            if only_if_status:
+                params.append(only_if_status)
+            cur = conn.execute(
+                """UPDATE posts SET downloaded = ?, download_status = ?, download_error = ?,
+                   download_path = CASE WHEN ? = 'failed' THEN '' WHEN ? = '' THEN download_path ELSE ? END,
+                   downloaded_at = CASE WHEN ? IN ('downloaded', 'thumbnail_only') THEN ?
+                                        WHEN ? = 'failed' THEN '' ELSE downloaded_at END
+                   WHERE id = ?""" + guard,
+                params,
+            )
+            conn.commit()
+            return cur.rowcount == 1
+        finally:
+            conn.close()
+    except Exception as exc:
+        logger.error(f"Không cập nhật trạng thái dòng bài viết: {str(exc)[:200]}")
+        return False
+
+
 def register_downloaded_post_for_page(
     db_path: str,
     post_id: str,
@@ -1974,7 +2117,7 @@ def register_downloaded_post_for_page(
     error: str = "",
 ) -> bool:
     """Save a download under its verified Facebook source page, never a synthetic page."""
-    normalized_id = re.sub(r"\D", "", str(post_id or "")).strip()
+    normalized_id = post_file_key(post_id)
     canonical_page_url = normalize_page_url(page_url) if page_url else ""
     clean_page_name = str(page_name or "").strip()
     if len(normalized_id) < 10 or not canonical_page_url or not clean_page_name or clean_page_name == "Unknown":
@@ -2002,6 +2145,10 @@ def register_downloaded_post_for_page(
             ON CONFLICT(page_name, post_id) DO UPDATE SET
                 caption = CASE WHEN excluded.caption != '' THEN excluded.caption ELSE posts.caption END,
                 url = CASE WHEN excluded.url != '' THEN excluded.url ELSE posts.url END,
+                video_url_verified = CASE
+                    WHEN excluded.url = '' OR excluded.url = posts.url THEN posts.video_url_verified
+                    ELSE 0
+                END,
                 media_count = MAX(posts.media_count, excluded.media_count),
                 scraped_at = excluded.scraped_at, downloaded = 1,
                 download_path = excluded.download_path, downloaded_at = excluded.downloaded_at,
@@ -2025,10 +2172,17 @@ def register_downloaded_post_for_page(
         logger.error(f"Không lưu được bài tải vào page nguồn: {str(exc)[:200]}")
         return False
 
+def post_file_key(post_id: str) -> str:
+    """Keep full pfbid identities; numeric stories retain their existing file key."""
+    raw_post_id = str(post_id or "").strip()
+    if re.fullmatch(r"pfbid[A-Za-z0-9_-]{8,100}", raw_post_id, re.IGNORECASE):
+        return raw_post_id
+    return re.sub(r"\D", "", raw_post_id).strip() or raw_post_id
+
+
 def _media_preview_key(post_id: str) -> str:
     """Return the filename key used by flat media storage for a post."""
-    raw_post_id = str(post_id or "").strip()
-    return re.sub(r"\D", "", raw_post_id).strip() or raw_post_id
+    return post_file_key(post_id)
 
 
 def _index_flat_media_files(output_dir: Path, post_ids: List[str]) -> Dict[str, List[Path]]:
@@ -2392,6 +2546,7 @@ def recover_interrupted_downloads(db_path: str) -> int:
     """Fail stale in-progress rows, except URLs retained by a durable queue."""
     conn = _get_conn(db_path)
     try:
+        queued_row_ids: set[int] = set()
         queued_post_ids: set[str] = set()
         queued_rows = conn.execute(
             "SELECT urls_json FROM download_queue_batches WHERE status IN ('queued', 'starting', 'running')"
@@ -2401,14 +2556,29 @@ def recover_interrupted_downloads(db_path: str) -> int:
                 urls = json.loads(urls_json or "[]")
             except (TypeError, ValueError, json.JSONDecodeError):
                 continue
-            for url in urls if isinstance(urls, list) else []:
-                queued_post_ids.update(re.findall(r"\d{10,}", str(url or "")))
+            for item in urls if isinstance(urls, list) else []:
+                if isinstance(item, dict):
+                    try:
+                        row_id = int(item.get("source_post_row_id") or item.get("post_row_id") or 0)
+                    except (TypeError, ValueError):
+                        row_id = 0
+                    url = item.get("url") or ""
+                else:
+                    row_id, url = 0, item
+                if row_id > 0:
+                    queued_row_ids.add(row_id)
+                else:
+                    queued_post_ids.update(re.findall(r"\d{10,}", str(url or "")))
 
-        protected_clause = ""
-        params: list[str] = []
+        protected_clauses: list[str] = []
+        params: list[object] = []
+        if queued_row_ids:
+            protected_clauses.append(f"id NOT IN ({','.join('?' for _ in queued_row_ids)})")
+            params.extend(sorted(queued_row_ids))
         if queued_post_ids:
-            protected_clause = f" AND post_id NOT IN ({','.join('?' for _ in queued_post_ids)})"
-            params = sorted(queued_post_ids)
+            protected_clauses.append(f"post_id NOT IN ({','.join('?' for _ in queued_post_ids)})")
+            params.extend(sorted(queued_post_ids))
+        protected_clause = " AND " + " AND ".join(protected_clauses) if protected_clauses else ""
         cursor = conn.execute(
             """
             UPDATE posts
@@ -2462,6 +2632,15 @@ def sync_downloaded_posts_from_folder(db_path: str, output_dir: str) -> int:
         post_folders: dict[str, tuple[str, bool, int]] = {}
         legacy_pending: dict[str, str] = {}
         numeric_legacy_dirs: dict[str, tuple[str, list[os.DirEntry[str]]]] = {}
+        lookup = _get_conn(db_path)
+        try:
+            pfbid_post_ids = {
+                str(row[0]) for row in lookup.execute(
+                    "SELECT post_id FROM posts WHERE post_id LIKE 'pfbid%'"
+                ).fetchall()
+            }
+        finally:
+            lookup.close()
 
         flat_by_pid: dict[str, list[str]] = {}
         for entry in os.scandir(output_dir):
@@ -2470,6 +2649,11 @@ def sync_downloaded_posts_from_folder(db_path: str, output_dir: str) -> int:
                 if match:
                     pid = match.group(1)
                     flat_by_pid.setdefault(pid, []).append(entry.name)
+                else:
+                    stem = Path(entry.name).stem
+                    pfbid_id = stem if stem in pfbid_post_ids else stem.rsplit("_", 1)[0]
+                    if pfbid_id in pfbid_post_ids:
+                        flat_by_pid.setdefault(pfbid_id, []).append(entry.name)
             elif entry.is_dir():
                 post_id = entry.name.strip()
                 if post_id:
@@ -2590,6 +2774,34 @@ def sync_downloaded_posts_from_folder(db_path: str, output_dir: str) -> int:
         return 0
 
 
+def unreferenced_media_paths(conn: sqlite3.Connection, paths: List[str], output_root: Path) -> List[str]:
+    """Keep media referenced by surviving rows, including shared flat-storage files."""
+    root = output_root.expanduser().resolve()
+    rows = conn.execute("SELECT DISTINCT post_id, download_path FROM posts").fetchall()
+    surviving_keys = {post_file_key(row[0]).lower() for row in rows if post_file_key(row[0])}
+    referenced_paths = {
+        Path(row[1]).expanduser().resolve() for row in rows if row[1]
+    } - {root}
+    safe_paths = []
+    for raw_path in dict.fromkeys(paths):
+        candidate = Path(raw_path).expanduser().resolve()
+        if candidate == root:
+            continue
+        if any(
+            candidate == reference or reference in candidate.parents or candidate in reference.parents
+            for reference in referenced_paths
+        ):
+            continue
+        name = candidate.name.lower()
+        if candidate.parent == root and (
+            candidate.stem.lower() in surviving_keys
+            or any(name[:index] in surviving_keys for index, char in enumerate(name) if char in "_.")
+        ):
+            continue
+        safe_paths.append(str(candidate))
+    return safe_paths
+
+
 def bulk_delete_posts(db_path: str, post_ids: List[str]) -> dict:
     """Delete posts by post_id. Returns {deleted: int, paths: [str]}."""
     if not post_ids:
@@ -2605,7 +2817,7 @@ def bulk_delete_posts(db_path: str, post_ids: List[str]) -> dict:
         )
         paths: set[str] = set()
         for pid, dl_path in cursor.fetchall():
-            clean_pid = re.sub(r"\D", "", str(pid or "")).strip() or str(pid or "").strip()
+            clean_pid = post_file_key(pid)
             target_dir = Path(dl_path).expanduser().resolve() if dl_path else out_dir
             if not target_dir.exists():
                 target_dir = out_dir
@@ -2627,18 +2839,12 @@ def bulk_delete_posts(db_path: str, post_ids: List[str]) -> dict:
             elif target_dir.is_file():
                 paths.add(str(target_dir))
 
-        paths = {
-            path for path in paths
-            if path != str(out_dir) and conn.execute(
-                "SELECT 1 FROM posts WHERE download_path = ? LIMIT 1", (path,)
-            ).fetchone() is None
-        }
-
         cur = conn.execute(
             f"DELETE FROM posts WHERE post_id IN ({placeholders})",
             post_ids,
         )
         deleted = cur.rowcount
+        paths = set(unreferenced_media_paths(conn, sorted(paths), out_dir))
         conn.commit()
         conn.close()
         logger.info(f"🗑 Đã xóa {deleted} bài viết từ database")
@@ -2658,6 +2864,7 @@ def bulk_delete_post_rows(db_path: str, row_ids: List[int]) -> dict:
         from utils import config
         out_dir = Path(config.get("output_dir", ".")).expanduser().resolve()
 
+        conn.execute("BEGIN IMMEDIATE")
         page_urls: set[str] = set()
         paths: set[str] = set()
         deleted = 0
@@ -2671,7 +2878,7 @@ def bulk_delete_post_rows(db_path: str, row_ids: List[int]) -> dict:
             for pid, page_url, dl_path in rows:
                 if page_url:
                     page_urls.add(page_url)
-                clean_pid = re.sub(r"\D", "", str(pid or "")).strip() or str(pid or "").strip()
+                clean_pid = post_file_key(pid)
                 target_dir = Path(dl_path).expanduser().resolve() if dl_path else out_dir
                 if not target_dir.exists():
                     target_dir = out_dir
@@ -2706,12 +2913,7 @@ def bulk_delete_post_rows(db_path: str, row_ids: List[int]) -> dict:
                 """,
                 (page_url,),
             )
-        paths = {
-            path for path in paths
-            if path != str(out_dir) and conn.execute(
-                "SELECT 1 FROM posts WHERE download_path = ? LIMIT 1", (path,)
-            ).fetchone() is None
-        }
+        paths = set(unreferenced_media_paths(conn, sorted(paths), out_dir))
         conn.commit()
         logger.info(f"🗑 Đã xóa {deleted} bài viết được chọn khỏi database")
         return {"deleted": int(deleted), "paths": sorted(paths)}

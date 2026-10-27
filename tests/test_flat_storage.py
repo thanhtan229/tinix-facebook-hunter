@@ -23,6 +23,7 @@ from core.db_storage import (
     _get_conn,
     get_scraped_pages_full,
     mark_post_row_downloaded,
+    mark_post_row_download_status,
     mark_posts_download_status,
     query_posts_for_spy,
     register_downloaded_post_for_page,
@@ -134,6 +135,139 @@ class FlatStorageTest(unittest.TestCase):
                 "https://www.facebook.com/permalink.php?story_fbid=122126610032883555&id=61576506666779",
             )
             self.assertEqual(orchestrator.stats.success_posts, 1)
+
+    def test_distinct_video_id_download_uses_watch_url_and_story_id_for_storage(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            db_path = str(root / "video-link.db")
+            output_dir = root / "downloads"
+            output_dir.mkdir()
+            page_url = "https://www.facebook.com/demo-page"
+            story_id = "1234567890123"
+            video_id = "9876543210987"
+            watch_url = f"https://www.facebook.com/watch/?v={video_id}"
+            input_url = f"https://www.facebook.com/watch?v={video_id}"
+            save_posts(
+                db_path, "Demo Page", page_url,
+                [SimpleNamespace(
+                    post_id=story_id, date="01/01/2026", post_type="Video",
+                    engagement=0, comments=0, shares=0, view_count=0,
+                    caption="Video caption", url=watch_url, media_count=1, video_url_verified=True,
+                )],
+            )
+            # A later scrape that misses the attachment ID must keep the
+            # previously known playable URL for retrying this video.
+            save_posts(
+                db_path, "Demo Page", page_url,
+                [SimpleNamespace(
+                    post_id=story_id, date="01/01/2026", post_type="Video",
+                    engagement=0, comments=0, shares=0, view_count=0,
+                    caption="Video caption", url="", media_count=1,
+                )],
+            )
+
+            class FakeBrowser:
+                fetch_call = None
+
+                def fetch_post(self, url, post_id):
+                    self.fetch_call = (url, post_id)
+                    return PostData(
+                        post_id=post_id, author="Demo Page", author_url=page_url,
+                        text="Video caption", has_video=True,
+                        video_url="https://video-cdn.example/video.mp4",
+                    )
+
+            browser = FakeBrowser()
+            orchestrator = core_downloader.DownloadOrchestrator()
+            orchestrator._output_dir = output_dir
+            orchestrator.stats = core_downloader.DownloadStats(total_posts=1, start_time=time.time())
+
+            def fake_download(_url, save_path, _cookies):
+                save_path.write_bytes(b"video")
+                return True
+
+            config_values = {"scraper_db_path": db_path}
+            with patch.object(core_downloader.config, "get", side_effect=lambda key, default=None: config_values.get(key, default)), patch.object(
+                core_downloader, "download_video_direct", side_effect=fake_download
+            ):
+                orchestrator._process_single_post(
+                    input_url, 1, browser=browser, cookies={"c_user": "1"},
+                )
+
+            self.assertEqual(browser.fetch_call, (watch_url, video_id))
+            self.assertTrue((output_dir / f"{story_id}.mp4").is_file())
+            saved = query_posts_for_spy(db_path, ["Demo Page"])[0]
+            self.assertEqual(saved["url"], watch_url)
+            self.assertEqual(saved["download_status"], "downloaded")
+
+    def test_video_is_not_marked_downloaded_when_downloader_creates_no_file(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            db_path = str(root / "missing-video-file.db")
+            output_dir = root / "downloads"
+            output_dir.mkdir()
+            page_url = "https://www.facebook.com/demo"
+            story_id = "1234567890123"
+            watch_url = "https://www.facebook.com/watch/?v=9876543210987"
+            save_posts(db_path, "Demo", page_url, [SimpleNamespace(
+                post_id=story_id, date="", post_type="Video", engagement=0, comments=0,
+                shares=0, view_count=0, caption="Video", url=watch_url, video_url_verified=True,
+            )])
+            row_id = query_posts_for_spy(db_path, ["Demo"])[0]["id"]
+
+            class FakeBrowser:
+                def fetch_post(self, _url, post_id):
+                    return PostData(
+                        post_id=post_id, text="Video", has_video=True,
+                        video_url="https://video-cdn.example/video.mp4",
+                    )
+
+            orchestrator = core_downloader.DownloadOrchestrator()
+            orchestrator._output_dir = output_dir
+            orchestrator.stats = core_downloader.DownloadStats(total_posts=1, start_time=time.time())
+            with patch.object(
+                core_downloader.config, "get",
+                side_effect=lambda key, default=None: db_path if key == "scraper_db_path" else default,
+            ), patch.object(core_downloader, "download_video_direct", return_value=True), patch.object(
+                core_downloader, "download_video", return_value=False
+            ):
+                orchestrator._process_single_post(
+                    watch_url, 1, browser=FakeBrowser(), cookies={"c_user": "1"},
+                    source_post_row_id=row_id,
+                )
+
+            saved = query_posts_for_spy(db_path, ["Demo"])[0]
+            self.assertFalse((output_dir / f"{story_id}.mp4").exists())
+            self.assertEqual(saved["download_status"], "failed")
+            self.assertEqual(orchestrator.stats.failed_posts, 1)
+
+    def test_manual_url_change_invalidates_verified_video_attachment(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "video-provenance.db")
+            page_url = "https://www.facebook.com/demo-page"
+            story_id = "1234567890123"
+            watch_url = "https://www.facebook.com/watch/?v=9876543210987"
+            save_posts(db_path, "Demo", page_url, [SimpleNamespace(
+                post_id=story_id, date="", post_type="Video", engagement=0, comments=0,
+                shares=0, view_count=0, caption="Video", url=watch_url,
+                video_url_verified=True,
+            )])
+
+            for replacement, expected_verified in (
+                (watch_url, 1),
+                ("https://www.facebook.com/watch/?v=1111111111111", 0),
+            ):
+                self.assertTrue(register_downloaded_post_for_page(
+                    db_path, story_id, replacement, "Video", page_name="Demo",
+                    page_url=page_url, post_type="Video", media_count=1,
+                    folder_path=temp_dir,
+                ))
+                conn = _get_conn(db_path)
+                row = conn.execute(
+                    "SELECT url, video_url_verified FROM posts WHERE post_id = ?", (story_id,)
+                ).fetchone()
+                conn.close()
+                self.assertEqual(row, (replacement, expected_verified))
 
     def test_verified_download_is_saved_under_its_source_page(self):
         """A download with a verified source is never assigned to a synthetic page."""
@@ -411,6 +545,84 @@ class FlatStorageTest(unittest.TestCase):
             self.assertIn("1111111111111", request.urls)
             self.assertNotIn("2222222222222", request.urls)
             self.assertEqual(request.account_ids, [7])
+
+    def test_retry_endpoint_uses_saved_video_attachment_url(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "retry-video.db")
+            story_id = "1234567890123"
+            watch_url = "https://www.facebook.com/watch/?v=9876543210987"
+            save_posts(
+                db_path, "Demo", "https://www.facebook.com/demo",
+                [SimpleNamespace(
+                    post_id=story_id, date="01/01/2026", post_type="Video",
+                    engagement=0, comments=0, shares=0, view_count=0,
+                    caption="Failed video", url=watch_url, media_count=1, video_url_verified=True,
+                )],
+            )
+            post = query_posts_for_spy(db_path, ["Demo"])[0]
+            mark_posts_download_status(db_path, [story_id], "failed", error="Network timeout")
+
+            config_values = {"scraper_db_path": db_path}
+            with patch.object(spy_routes.config, "get", side_effect=lambda key, default=None: config_values.get(key, default)), patch.object(
+                spy_routes, "start_download", return_value={"status": "success", "state": "started"}
+            ) as start_mock:
+                retry_posts(RetryPostsRequest(post_row_ids=[post["id"]], max_threads=1))
+
+            request = start_mock.call_args.args[0]
+            self.assertEqual(request.urls, watch_url)
+            self.assertEqual(request.source_post_row_ids, [post["id"]])
+
+    def test_retry_endpoint_accepts_saved_story_permalink_without_attachment_id(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "retry-story-fallback.db")
+            story_id = "1234567890123"
+            story_url = f"https://www.facebook.com/demo/posts/{story_id}"
+            save_posts(
+                db_path, "Demo", "https://www.facebook.com/demo",
+                [SimpleNamespace(
+                    post_id=story_id, date="01/01/2026", post_type="Video",
+                    engagement=0, comments=0, shares=0, view_count=0,
+                    caption="Video without attachment ID", url=story_url, media_count=1,
+                )],
+            )
+            post = query_posts_for_spy(db_path, ["Demo"])[0]
+            mark_post_row_download_status(db_path, post["id"], "failed", error="No attachment ID")
+            values = {"scraper_db_path": db_path}
+            with patch.object(spy_routes.config, "get", side_effect=lambda key, default=None: values.get(key, default)), patch.object(
+                spy_routes, "start_download", return_value={"status": "success", "state": "started"}
+            ) as start_mock:
+                retry_posts(RetryPostsRequest(post_row_ids=[post["id"]], max_threads=1))
+
+            request = start_mock.call_args.args[0]
+            self.assertEqual(request.urls, story_url)
+            self.assertEqual(request.source_post_row_ids, [post["id"]])
+
+    def test_retry_preserves_two_rows_sharing_one_playable_url(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = str(Path(temp_dir) / "retry-shared-url.db")
+            shared_url = "https://www.facebook.com/watch/?v=9876543210987"
+            save_posts(db_path, "Page One", "https://www.facebook.com/page-one", [SimpleNamespace(
+                post_id="1111111111111", date="", post_type="Video", engagement=0, comments=0,
+                shares=0, view_count=0, caption="One", url=shared_url, media_count=1, video_url_verified=True,
+            )])
+            save_posts(db_path, "Page Two", "https://www.facebook.com/page-two", [SimpleNamespace(
+                post_id="2222222222222", date="", post_type="Video", engagement=0, comments=0,
+                shares=0, view_count=0, caption="Two", url=shared_url, media_count=1, video_url_verified=True,
+            )])
+            rows = query_posts_for_spy(db_path, ["Page One", "Page Two"])
+            row_ids = sorted(row["id"] for row in rows)
+            mark_post_row_download_status(db_path, row_ids[0], "failed", error="retry")
+            mark_post_row_download_status(db_path, row_ids[1], "thumbnail_only", error="retry")
+            values = {"scraper_db_path": db_path}
+            with patch.object(spy_routes.config, "get", side_effect=lambda key, default=None: values.get(key, default)), patch.object(
+                spy_routes, "start_download", return_value={"status": "success", "state": "started"}
+            ) as start_mock:
+                result = retry_posts(RetryPostsRequest(post_row_ids=row_ids, max_threads=1))
+
+            request = start_mock.call_args.args[0]
+            self.assertEqual(result["retrying"], 2)
+            self.assertEqual(request.urls.splitlines(), [shared_url, shared_url])
+            self.assertEqual(request.source_post_row_ids, row_ids)
 
     def test_video_detector_ignores_page_video_without_confirmed_media_id(self):
         """A global player must not turn an image post into a video post."""

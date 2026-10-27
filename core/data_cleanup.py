@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
-import re
 import shutil
 from pathlib import Path
 from typing import Iterable
 
 from core.database_maintenance import create_database_backup
-from core.db_storage import _get_conn
+from core.db_storage import _get_conn, post_file_key, unreferenced_media_paths
 
 
 def _normalized_urls(page_urls: Iterable[str]) -> list[str]:
@@ -93,7 +92,7 @@ def _delete_scraped_records(
 
         media_paths = []
         for pid, dl_path in post_rows:
-            clean_pid = re.sub(r"\D", "", str(pid or "")).strip() or str(pid or "").strip()
+            clean_pid = post_file_key(pid)
             target_dir = Path(dl_path).expanduser().resolve() if dl_path else out_root
             if not target_dir.exists():
                 target_dir = out_root
@@ -116,16 +115,7 @@ def _delete_scraped_records(
                 media_paths.append(str(target_dir))
 
         if media_paths:
-            media_placeholders = ",".join("?" for _ in media_paths)
-            still_referenced = {
-                row[0]
-                for row in connection.execute(
-                    f"SELECT DISTINCT download_path FROM posts "
-                    f"WHERE download_path IN ({media_placeholders})",
-                    media_paths,
-                ).fetchall()
-            }
-            media_paths = [path for path in media_paths if path not in still_referenced and path != str(out_root)]
+            media_paths = unreferenced_media_paths(connection, media_paths, out_root)
         connection.commit()
         return int(pages_deleted), int(posts_deleted), media_paths
     except Exception:

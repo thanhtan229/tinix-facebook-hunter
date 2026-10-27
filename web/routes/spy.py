@@ -18,6 +18,7 @@ from core.db_storage import (
     sync_downloaded_posts_from_folder,
 )
 from core.data_cleanup import cleanup_scraped_data, delete_downloaded_media, preview_scraped_cleanup
+from core.url_handler import is_playable_video_url, is_story_permalink_for_id
 from utils import config
 from web.ws_manager import log_to_web
 from web.models import ApiRequest
@@ -248,20 +249,28 @@ def retry_posts(req: RetryPostsRequest):
     db_p = get_db_path(config.get("scraper_db_path", ""))
     retryable_statuses = {"failed", "thumbnail_only"}
     urls: List[str] = []
-    seen_urls: set[str] = set()
+    source_post_row_ids: List[int] = []
+    seen_row_ids: set[int] = set()
     skipped = 0
 
     for row_id in dict.fromkeys(req.post_row_ids):
         post = get_spy_post_by_row_id(db_p, row_id)
-        if not post or post.get("download_status") not in retryable_statuses:
+        if not post or post.get("download_status") not in retryable_statuses or int(post.get("id") or 0) in seen_row_ids:
             skipped += 1
             continue
         url = str(post.get("url") or "").strip()
-        if not url or url in seen_urls:
+        if not url:
             skipped += 1
             continue
-        seen_urls.add(url)
+        if post.get("post_type") == "Video" and not is_playable_video_url(url) and not is_story_permalink_for_id(url, str(post.get("post_id") or "")):
+            raise HTTPException(
+                status_code=409,
+                detail="Bài video này chưa lưu URL Facebook hợp lệ để tải lại.",
+            )
+        row_id = int(post.get("id") or 0)
+        seen_row_ids.add(row_id)
         urls.append(url)
+        source_post_row_ids.append(row_id)
 
     if not urls:
         raise HTTPException(status_code=422, detail="Chỉ có thể thử lại bài Tải lỗi hoặc Thiếu video có link Facebook hợp lệ")
@@ -271,6 +280,7 @@ def retry_posts(req: RetryPostsRequest):
         max_threads=req.max_threads,
         use_accounts=req.use_accounts,
         account_ids=req.account_ids,
+        source_post_row_ids=source_post_row_ids,
     ))
     result["retrying"] = len(urls)
     result["skipped"] = skipped

@@ -27,6 +27,10 @@ if not defined PYTHON_CMD (
 
 echo [Tinix] Dang dung phien ban dang chay truoc khi build...
 call "%~dp0STOP.bat" silent
+if errorlevel 1 (
+    echo [ERROR] Khong the dung server an toan. Build da dung.
+    exit /b 1
+)
 
 "%PYTHON_CMD%" scripts\build_app.py %*
 if errorlevel 1 (

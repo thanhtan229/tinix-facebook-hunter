@@ -134,7 +134,7 @@ def normalize_to_mbasic(url: str) -> str:
 def get_original_url(url: str) -> str:
     """
     Convert any Facebook URL back to www.facebook.com format.
-    Also converts /reel/ and /videos/ URLs to /watch/?v= format.
+    Also converts video URLs to /watch/?v= format.
     Strips Facebook tracking parameters.
     """
     url = url.strip()
@@ -147,6 +147,10 @@ def get_original_url(url: str) -> str:
     if "fb.watch" in host:
         return url  # Keep as-is
 
+    video_url = normalize_video_post_url(url)
+    if video_url:
+        return video_url
+
     new_netloc = "www.facebook.com"
     if parsed.port:
         new_netloc += f":{parsed.port}"
@@ -154,26 +158,13 @@ def get_original_url(url: str) -> str:
     path = parsed.path
     query = parsed.query
 
-    # Convert /reel/ID to /watch/?v=ID
-    reel_match = _PATTERN_REEL.search(url)
-    if reel_match:
-        video_id = reel_match.group(1)
-        path = "/watch/"
-        query = f"v={video_id}"
-    else:
-        # Convert /username/videos/ID to /watch/?v=ID
-        videos_match = _PATTERN_VIDEOS.search(url)
-        if videos_match:
-            video_id = videos_match.group(2)
-            path = "/watch/"
-            query = f"v={video_id}"
-        elif query:
-            # Strip ALL Facebook tracking parameters, keep only essential ones
-            from urllib.parse import parse_qsl, urlencode
-            essential_keys = {'v', 'id', 'fbid', 'story_fbid', 'set', 'type', 'pfbid'}
-            params = parse_qsl(query, keep_blank_values=True)
-            clean_params = [(k, v) for k, v in params if k in essential_keys]
-            query = urlencode(clean_params)
+    if query:
+        # Strip ALL Facebook tracking parameters, keep only essential ones
+        from urllib.parse import parse_qsl, urlencode
+        essential_keys = {'v', 'id', 'fbid', 'story_fbid', 'set', 'type', 'pfbid'}
+        params = parse_qsl(query, keep_blank_values=True)
+        clean_params = [(k, v) for k, v in params if k in essential_keys]
+        query = urlencode(clean_params)
 
     return urlunparse((
         "https",
@@ -195,7 +186,7 @@ def extract_post_id(url: str) -> str:
     # Try pfbid pattern first (most common in share links)
     match = _PATTERN_GENERIC_PFBID.search(url)
     if match:
-        return match.group(1)[:30]  # Truncate long pfbids
+        return match.group(1)
 
     # Try /posts/ID
     match = _PATTERN_POSTS.search(url)
@@ -228,9 +219,78 @@ def extract_post_id(url: str) -> str:
     # Fallback: use last path segment
     path_parts = [p for p in parsed.path.split("/") if p]
     if path_parts:
-        return path_parts[-1][:30]
+        return path_parts[-1]
 
     return "unknown"
+
+
+def normalize_video_post_url(url: str) -> str:
+    """Return a canonical watch URL for a Facebook video attachment."""
+    clean_url = str(url or "").strip()
+    if not clean_url:
+        return ""
+    parsed = urlparse(clean_url if "://" in clean_url else f"https://{clean_url}")
+    host = (parsed.hostname or "").lower()
+    if not (host in {"facebook.com", "fb.com"} or host.endswith((".facebook.com", ".fb.com"))):
+        return ""
+
+    segments = [segment for segment in parsed.path.split("/") if segment]
+    video_id = ""
+    if len(segments) == 1 and segments[0].lower() == "watch":
+        video_id = parse_qs(parsed.query).get("v", [""])[0]
+    else:
+        for index, segment in enumerate(segments[:-1]):
+            if segment.lower() in {"reel", "videos"}:
+                video_id = segments[index + 1]
+                break
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", video_id):
+        return ""
+    return f"https://www.facebook.com/watch/?v={video_id}"
+
+
+def is_playable_video_url(url: str) -> bool:
+    """Return whether a Facebook URL carries an addressable video attachment."""
+    return bool(normalize_video_post_url(url))
+
+
+def is_video_url_for_story_id(url: str, post_id: str) -> bool:
+    """Accept a video URL without provenance when its attachment ID is the story ID."""
+    canonical = normalize_video_post_url(url)
+    return bool(canonical and str(post_id or "").strip() == extract_post_id(canonical))
+
+
+def is_story_permalink_for_id(url: str, post_id: str) -> bool:
+    """Return whether a non-video Facebook permalink identifies the given story."""
+    expected_id = str(post_id or "").strip()
+    clean_url = str(url or "").strip()
+    if not expected_id or not clean_url or normalize_video_post_url(clean_url):
+        return False
+    try:
+        parsed = urlparse(clean_url if "://" in clean_url else f"https://{clean_url}")
+        host = (parsed.hostname or "").lower()
+    except ValueError:
+        return False
+    is_facebook_host = (
+        host in {"facebook.com", "fb.com"}
+        or host.endswith((".facebook.com", ".fb.com"))
+    )
+    if not is_facebook_host:
+        return False
+    segments = [segment for segment in parsed.path.split("/") if segment]
+    query = parse_qs(parsed.query)
+    if len(segments) == 1 and segments[0].lower() in {"permalink.php", "story.php"}:
+        candidates = query.get("story_fbid", [])
+    elif len(segments) == 1 and segments[0].lower() in {"photo", "photo.php"}:
+        candidates = query.get("fbid", [])
+    elif len(segments) >= 2 and segments[-2].lower() == "posts":
+        candidates = [segments[-1]]
+    elif len(segments) == 3 and [part.lower() for part in segments[:2]] == ["share", "p"]:
+        candidates = [segments[-1]]
+    elif len(segments) == 1 or (len(segments) == 2 and segments[-1].lower().startswith("pfbid")):
+        candidates = [segments[-1]]
+    else:
+        candidates = []
+    return expected_id in candidates
 
 
 def parse_urls(text: str) -> list[str]:
