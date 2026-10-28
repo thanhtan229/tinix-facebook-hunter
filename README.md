@@ -23,6 +23,17 @@ thời điểm; media tự tải sẽ xếp hàng nếu downloader đang bận.
 
 ## Cài đặt
 
+Cách khuyến nghị cho máy mới: cài Python 3.11, tải mã nguồn về, rồi chạy
+`install.bat` trong thư mục dự án. Script tạo `.venv`, cài `requirements.txt`,
+tải Chromium cho Playwright và kiểm tra lại. Chạy lại script an toàn; script
+không tạo dữ liệu, tài khoản hay `.env`.
+
+```powershell
+.\install.bat
+```
+
+Cài thủ công (tương đương):
+
 ```powershell
 python -m venv .venv
 .venv\Scripts\Activate.ps1
@@ -34,6 +45,8 @@ Sao chép `.env.template` thành `.env` nếu sử dụng Facebook App OAuth. Kh
 commit hoặc chia sẻ `.env`, `config.json`, database và thư mục Chrome Profiles.
 
 ## Chạy
+
+Double-click `START.vbs` (chạy ngầm, mở cửa sổ ứng dụng) hoặc chạy trực tiếp:
 
 ```powershell
 python main.py
