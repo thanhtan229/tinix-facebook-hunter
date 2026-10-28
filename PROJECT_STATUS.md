@@ -5,32 +5,34 @@
 ## 0. Status Metadata
 
 **Project:** Tinix FB Studio (Tinix-Facebook-Hunter)
-**Overall Status:** Stable — đã duyệt bàn giao nội bộ
-**Current Phase:** Release nội bộ v1.21.47 đã duyệt; chưa có remote/publish
+**Overall Status:** Stable — đã duyệt bàn giao nội bộ v1.21.47; đã có remote GitHub
+**Current Phase:** Vận hành nội bộ; chờ quyết định về các mục còn mở
 **Last Updated:** 2026-10-28
 
 ## 1. Current Objective
 
-Giữ bản v1.21.47 ổn định và sẵn sàng sử dụng; quyết định nơi lưu trữ/phát hành từ xa (GitHub) khi Product Owner xác nhận.
+Giữ ứng dụng ổn định trên nhánh `master` và đồng bộ với GitHub; xử lý các mục còn mở ở mục 9.
 
 ## 2. Current State Summary
 
-- Version sau commit này: **v1.21.48** (hook bump từ 1.21.47). Gói artifact v1.21.47 tương ứng commit `b1873f2a`. SQLite schema **14**.
-- Các fix F1–F6 và checklist kỹ thuật v1.21.44 nằm trong commit `924994ed`. Commit `7598ae41` ghi người chịu trách nhiệm rollback. Commit `b1873f2a` ghi giới hạn đã chấp nhận.
-- Quality gate (candidate v1.21.44, trước khi hook bump version): 235 passed, 10 subtests, coverage 81%, exit 0.
-- Health `/api/system/health` sau khi khởi động lại: `ready=true`, version 1.21.47, schema 14, mọi check đều true.
-- Repo **chưa có remote** (`git remote -v` rỗng). URL GitHub được cung cấp là `https://github.com/thanhtan229/tinix-facebook-hunter` nhưng chưa được cấu hình hay push.
+- Nhánh `master` đã được đẩy lên `origin` (`https://github.com/thanhtan229/tinix-facebook-hunter`). Remote và HEAD đồng bộ.
+- Version code hiện tại: **v1.21.49** (commit `f29a6299`). Hook pre-commit tự bump version mỗi lần commit, nên commit trạng thái này sẽ là **v1.21.50**.
+- SQLite schema **14**.
+- Gói artifact `v1.21.47` (SHA256 `3d775951…58`) tương ứng commit `b1873f2a`. Không tạo lại gói trừ khi có yêu cầu.
+- Health `/api/system/health`: `ready=true`, schema 14, mọi check đều true.
 
 ## 3. Completed
 
-- [x] Audit production và fix F1–F6 (`FINAL_REVIEW.md`).
-- [x] Quality gate pass (235 passed + 10 subtests, coverage 81%).
+- [x] Audit production và fix F1–F6 (`FINAL_REVIEW.md`), commit `924994ed`.
+- [x] Quality gate: 235 passed + 10 subtests, coverage 81% (trên candidate v1.21.44).
 - [x] Backup DB verify: schema14, integrity ok (`exports/releases/`, ngoài Git).
-- [x] Owner rollback: **Tinix** (2026-10-27).
-- [x] Kiểm tra reboot máy (2026-10-28): DB `quick_check` ok, không có tác vụ bị kẹt, app cần khởi động thủ công.
-- [x] Chấp nhận giới hạn khối lượng lớn trên tài khoản Facebook thật (2026-10-28).
-- [x] Gói source v1.21.47: `exports/releases/Tinix-Facebook-Hunter-v1.21.47-source.zip`, SHA256 `3d775951…58` (xem `SHA256SUMS-v1.21.47.txt`).
-- [x] Ghi nhận duyệt bàn giao: `exports/releases/RELEASE_APPROVAL_v1.21.47.md`.
+- [x] Owner rollback: **Tinix** (2026-10-27), commit `7598ae41`.
+- [x] Kiểm tra reboot máy (2026-10-28): DB `quick_check` ok, không tác vụ bị kẹt.
+- [x] Chấp nhận giới hạn khối lượng lớn trên tài khoản Facebook thật (2026-10-28), commit `b1873f2a`.
+- [x] Gói source v1.21.47 và biên bản duyệt bàn giao (`exports/releases/RELEASE_APPROVAL_v1.21.47.md`).
+- [x] Thêm remote GitHub và push `master` (2026-10-28), commit `f33aaa46`.
+- [x] Commit 6 docs chuẩn (ARCHITECTURE, UX_UI, PLAN, RESEARCH, RESEARCH_COMPARISON, DEVELOPMENT_WORKFLOW), commit `f29a6299`, đã push.
+- [x] Kiểm tra launcher STOP → START: 4/4 lần đạt (1 lần đầu + 3 lần lặp). Cổng đóng sau 1 giây, server `ready` sau 2–4 giây. Không tái hiện được lỗi đã gặp trước đó.
 
 ## 4. In Progress
 
@@ -39,6 +41,10 @@ Không có tác vụ đang chạy.
 ## 5. Blockers / Known Issues
 
 Không có blocker kỹ thuật đã biết.
+
+### Đã ghi nhận nhưng chưa xác định nguyên nhân
+
+- Trước đó có vài lần `START.vbs` không bật server (2026-10-28). Sau đó không tái hiện được trong 4 lần thử liên tiếp. Nghi ngờ lỗi phụ thuộc thời điểm, khi có tác vụ nền khác đang chạy. Chưa có bằng chứng xác nhận; chưa sửa launcher. Nếu tái diễn, cần log của đúng lần đó.
 
 ### Known limitations (đã chấp nhận, không phải finding mới)
 
@@ -54,8 +60,8 @@ Không có blocker kỹ thuật đã biết.
 
 - Người chịu trách nhiệm rollback: Tinix.
 - Chấp nhận release nội bộ với giới hạn khối lượng lớn đã nêu ở mục 5 (2026-10-28).
-- Không push, upload hay tạo tag khi chưa có chỉ định rõ ràng.
-- Hook pre-commit của repo tự bump version khi commit; gói artifact không được tạo lại sau commit docs để tránh lệch version.
+- Push lên GitHub được thực hiện theo yêu cầu rõ ràng của Product Owner; push thường, không force.
+- Hook pre-commit tự bump version khi commit. Không tạo lại gói artifact sau commit docs để tránh lệch version.
 
 ## 7. Verification State
 
@@ -64,8 +70,9 @@ Targeted tests: pass (test_production_recovery, test_chrome_handoff, test_p0_har
 Full tests: 235 passed, 10 subtests passed (scripts/quality.ps1, 2026-10-27, candidate v1.21.44)
 Typecheck: mypy pass (6 source files)
 Lint: ruff pass; pip check pass
-Build: Build.bat chạy qua pre-commit hook khi commit (v1.21.45 → v1.21.47)
-Runtime: v1.21.47 chạy qua START.vbs, health ready=true (2026-10-28)
+Build: Build.bat chạy qua pre-commit hook khi commit (hiện v1.21.49)
+Runtime: v1.21.49 chạy qua START.vbs, health ready=true (2026-10-28)
+Launcher: STOP → START đạt 4/4 lần (2026-10-28)
 Reboot: đã kiểm tra 2026-10-28 (DB ok, không tác vụ kẹt)
 Known pre-existing failures: không có
 ```
@@ -73,18 +80,18 @@ Known pre-existing failures: không có
 ## 8. Runtime / Environment State
 
 ```text
-Frontend/Backend: Flask/pythonw chạy qua START.vbs, cổng 7866 (localhost)
-Database: tinix_scraper.db, schema 14, quick_check ok; không chỉnh sửa trong các lượt kiểm tra
+Frontend/Backend: main.py chạy qua START.vbs, cổng 7866 (localhost)
+Database: tinix_scraper.db, schema 14, quick_check ok
 Current development mode: standalone App Mode
 Lưu ý: sau reboot cần chạy START.vbs thủ công
+Chrome: cửa sổ App Mode của dự án có thể còn mở sau khi dừng app; các cửa sổ của dự án khác không liên quan
 ```
 
 ## 9. Next Actions
 
-1. Product Owner xác nhận có cấu hình remote GitHub (`https://github.com/thanhtan229/tinix-facebook-hunter`) và có push hay không. Hiện chưa push.
-2. Quyết định xử lý file sidecar `tinix_scraper.db.backup-20261003_085213_115026.sqlite-shm/-wal` (chưa commit, chưa xóa).
-3. Quyết định đưa các docs chuẩn chưa theo dõi (ARCHITECTURE, UX_UI, PLAN, RESEARCH, RESEARCH_COMPARISON, DEVELOPMENT_WORKFLOW) vào Git hay không.
-4. Chuyển profile sang máy khác: chưa nghiệm thu, chỉ làm khi có yêu cầu.
+1. Quyết định xử lý file sidecar `tinix_scraper.db.backup-20261003_085213_115026.sqlite-shm/-wal` (chưa commit, chưa xóa).
+2. Chuyển profile sang máy khác: chưa nghiệm thu, chỉ làm khi có yêu cầu.
+3. Nếu lỗi launcher tái diễn: ghi lại thời điểm, đọc `logs/server_startup.log` và log của đúng lần đó.
 
 ## 10. Resume Context
 
@@ -96,17 +103,18 @@ Read first:
 - docs/RELEASE_CHECKLIST.md, docs/OPERATIONS.md, FINAL_REVIEW.md.
 
 Current implementation checkpoint:
-- Commit đã push lên origin/master (sau commit docs này). Xem git log.
+- origin/master đồng bộ với HEAD. Xem git log.
 
 Do not redo:
 - F1–F6 đã fix và có test; không chạy lại tải/quét Facebook thật nếu không được yêu cầu.
 - Không tạo lại gói artifact trừ khi có commit code mới và được yêu cầu.
+- Không sửa launcher khi chưa tái hiện được lỗi.
 
 Next expected action:
-- Product Owner quyết định về remote GitHub.
+- Quyết định về file sidecar backup (mục 9.1).
 
 Important caveat:
-- Mỗi commit kích hoạt hook bump version; kiểm tra version trước khi ghi tài liệu về version cụ thể.
+- Mỗi commit kích hoạt hook bump version. Kiểm tra version thực tế trước khi ghi version cụ thể vào tài liệu.
 ```
 
 ## 11. Relevant Documents
