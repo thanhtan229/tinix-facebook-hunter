@@ -15,12 +15,19 @@ echo ========================================================
 echo   TINIX - FACEBOOK HUNTER - SETUP
 echo ========================================================
 
-REM --- 0. Locate Python 3.10 or 3.11 (project target: 3.11) ---
+REM --- 0. Locate Python 3.11, then 3.10 (project target: 3.11) ---
 set "PY="
 where py >nul 2>nul
 if not errorlevel 1 (
     py -3.11 -c "import sys" >nul 2>nul
     if not errorlevel 1 set "PY=py -3.11"
+)
+if not defined PY (
+    where py >nul 2>nul
+    if not errorlevel 1 (
+        py -3.10 -c "import sys" >nul 2>nul
+        if not errorlevel 1 set "PY=py -3.10"
+    )
 )
 if not defined PY (
     where python >nul 2>nul
@@ -34,29 +41,47 @@ echo [0] Python found: %PY%
 
 REM --- 1. Virtual environment (.venv is what START.bat uses) ---
 if exist ".venv\Scripts\python.exe" (
-    echo [1/4] Virtual environment .venv already exists - reusing it.
+    ".venv\Scripts\python.exe" -c "import sys; raise SystemExit(0 if sys.version_info[:2] in ((3, 10), (3, 11)) else 1)" >nul 2>nul
+    if errorlevel 1 goto :bad_venv
+    echo [1/4] Virtual environment .venv already exists with a supported Python - reusing it.
 ) else (
     echo [1/4] Creating virtual environment .venv ...
     %PY% -m venv .venv
-    if errorlevel 1 goto :fail
+    if errorlevel 1 (
+        echo [ERROR] Could not create the .venv folder.
+        goto :fail
+    )
 )
 
 REM --- 2. Python packages ---
 echo [2/4] Installing Python packages from requirements.txt ...
 ".venv\Scripts\python.exe" -m pip install --disable-pip-version-check -r requirements.txt
-if errorlevel 1 goto :fail
+if errorlevel 1 (
+    echo [ERROR] pip install failed - see the messages above.
+    echo         If they mention .venv or a broken environment, delete the .venv folder and run install.bat again.
+    goto :fail
+)
 
 REM --- 3. Browser engine for Playwright (one-time download) ---
 echo [3/4] Installing Chromium for Playwright (one-time download) ...
 ".venv\Scripts\python.exe" -m playwright install chromium
-if errorlevel 1 goto :fail
+if errorlevel 1 (
+    echo [ERROR] Playwright could not download Chromium - check the internet connection or proxy, then run install.bat again.
+    goto :fail
+)
 
 REM --- 4. Verify ---
 echo [4/4] Verifying installation ...
 ".venv\Scripts\python.exe" -m pip check
-if errorlevel 1 goto :fail
+if errorlevel 1 (
+    echo [ERROR] pip check reported a dependency conflict - see the messages above.
+    goto :fail
+)
 ".venv\Scripts\python.exe" -c "import fastapi, uvicorn, websockets, pydantic, playwright, yt_dlp, PIL, openpyxl, pyotp, pandas, piexif, psutil, httpx, bs4, lxml"
-if errorlevel 1 goto :fail
+if errorlevel 1 (
+    echo [ERROR] A required package failed to import - see the messages above.
+    goto :fail
+)
 
 REM --- Browser needed for App Mode (warning only) ---
 set "BROWSER_FOUND="
@@ -83,6 +108,11 @@ exit /b 0
 echo [ERROR] Python 3.10 or 3.11 was not found.
 echo         Install it from https://www.python.org/downloads/ and tick "Add python.exe to PATH",
 echo         then run install.bat again.
+goto :fail
+
+:bad_venv
+echo [ERROR] The existing .venv folder uses a Python version other than 3.10 or 3.11.
+echo         Delete the .venv folder in this project and run install.bat again.
 goto :fail
 
 :fail
