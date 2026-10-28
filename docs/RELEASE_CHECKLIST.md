@@ -56,6 +56,11 @@
       Người chịu trách nhiệm rollback: **Tinix** (do Product Owner chỉ định, 2026-10-27).
       Backup đã verify: `exports/releases/tinix_scraper.db.backup-20261003_085213_115026.sqlite` (schema14, integrity ok, 2026-10-03).
 
+## Giới hạn đã chấp nhận — 2026-10-28
+
+- Chưa nghiệm thu khối lượng lớn trên tài khoản Facebook thật (nhiều Page, nhiều bài, chạy lâu). Được chấp nhận làm giới hạn đã biết khi phát hành, theo quyết định của Product Owner.
+- Reboot máy đã kiểm tra: DB và tác vụ không bị kẹt; app không tự khởi động, cần chạy `START.vbs` thủ công.
+
 ## Bằng chứng đóng checklist — 2026-10-03
 
 Bản local v1.21.44. Dấu [x] có nghĩa đã kiểm tra trong phạm vi ghi dưới đây,

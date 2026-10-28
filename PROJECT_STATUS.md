@@ -50,7 +50,7 @@ Còn lại trước khi tuyên bố release: không có blocker kỹ thuật đ�
 ## 6. Important Recent Decisions
 
 - Người chịu trách nhiệm rollback: Tinix.
-- Reboot máy và workload lớn trên tài khoản Facebook thật chưa thực hiện: cần phạm vi cụ thể (tài khoản, số lượng, khung giờ) vì có rủi ro tài khoản và dữ liệu thật.
+- Chấp nhận release với giới hạn đã biết (2026-10-28): chưa thử khối lượng lớn trên tài khoản Facebook thật (nhiều Page, nhiều bài, chạy lâu). Đã thử 1 bài và 1 Page trên 1 tài khoản; reboot máy đã kiểm tra, app cần khởi động thủ công sau reboot.
 
 ## 7. Verification State
 
