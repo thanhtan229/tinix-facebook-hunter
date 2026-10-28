@@ -89,9 +89,10 @@ Chrome: cửa sổ App Mode của dự án có thể còn mở sau khi dừng ap
 
 ## 9. Next Actions
 
-1. Quyết định xử lý file sidecar `tinix_scraper.db.backup-20261003_085213_115026.sqlite-shm/-wal` (chưa commit, chưa xóa).
-2. Chuyển profile sang máy khác: chưa nghiệm thu, chỉ làm khi có yêu cầu.
-3. Nếu lỗi launcher tái diễn: ghi lại thời điểm, đọc `logs/server_startup.log` và log của đúng lần đó.
+1. Chuyển profile sang máy khác: chưa nghiệm thu, chỉ làm khi có yêu cầu.
+2. Nếu lỗi launcher tái diễn: ghi lại thời điểm, đọc `logs/server_startup.log` và log của đúng lần đó.
+
+Đã xử lý (2026-10-28): hai file sidecar `tinix_scraper.db.backup-20261003_085213_115026.sqlite-shm/-wal` được chuyển vào `exports/releases/backup-sidecars/` (ngoài Git, không xóa). File backup chính vẫn ở gốc dự án.
 
 ## 10. Resume Context
 
@@ -111,7 +112,7 @@ Do not redo:
 - Không sửa launcher khi chưa tái hiện được lỗi.
 
 Next expected action:
-- Quyết định về file sidecar backup (mục 9.1).
+- Chuyển profile sang máy khác khi có yêu cầu; theo dõi launcher nếu lỗi tái diễn (mục 9).
 
 Important caveat:
 - Mỗi commit kích hoạt hook bump version. Kiểm tra version thực tế trước khi ghi version cụ thể vào tài liệu.
