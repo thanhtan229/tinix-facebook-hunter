@@ -86,7 +86,7 @@ class WebUiSmokeTest(unittest.TestCase):
                         page.goto(f"http://127.0.0.1:{port}/", wait_until="domcontentloaded")
                         page.locator("#app-version-badge").wait_for(timeout=10000)
                         page.wait_for_function(
-                            "document.querySelector('#ws-badge')?.textContent.includes('Realtime Connected')",
+                            "() => document.querySelector('#ws-badge')?.textContent.includes('Realtime Connected')",
                             timeout=10000,
                         )
                         page.locator("#scrape-auto-download").wait_for(state="attached", timeout=10000)
@@ -130,13 +130,13 @@ class WebUiSmokeTest(unittest.TestCase):
                         page.locator("#dl-urls").fill("https://www.facebook.com/123456789012345")
                         page.locator("#dl-use-accounts").check()
                         page.locator("#btn-start-dl").click()
-                        page.wait_for_function("document.querySelector('#tab-accounts').classList.contains('active')")
+                        page.wait_for_function("() => document.querySelector('#tab-accounts').classList.contains('active')")
                         page.unroute("**/api/accounts/")
                         page.evaluate("loadAccounts()")
                         page.locator('[data-tab="tab-accounts"]').click()
                         self.assertTrue(page.locator("#tab-accounts").evaluate("node => node.classList.contains('active')"))
                         page.wait_for_function(
-                            "document.querySelector('#detail-input-label')?.value === 'Smoke Account'",
+                            "() => document.querySelector('#detail-input-label')?.value === 'Smoke Account'",
                             timeout=10000,
                         )
                         for field_id, button_id in (
@@ -189,7 +189,7 @@ class WebUiSmokeTest(unittest.TestCase):
                         page.evaluate("fetch('/api/system/stats', { credentials: 'omit' })")
                         page.wait_for_timeout(700)
                         page.wait_for_function(
-                            "document.querySelector('#ws-badge')?.textContent.includes('Realtime Connected')",
+                            "() => document.querySelector('#ws-badge')?.textContent.includes('Realtime Connected')",
                             timeout=10000,
                         )
                         self.assertTrue(

@@ -215,6 +215,8 @@ class AccountSaveRequest(ApiRequest):
 
 class AccountDeleteRequest(ApiRequest):
     account_id: int = Field(gt=0)
+    # Off by default: the Chrome profile holds login cookies, so removing it is an explicit choice.
+    delete_profile: bool = False
 
 class LaunchProfileRequest(ApiRequest):
     account_id: int = Field(gt=0)
@@ -453,9 +455,70 @@ def delete_account_endpoint(req: AccountDeleteRequest):
     if scrape_is_running() or download_has_active_or_pending_work():
         raise HTTPException(status_code=409, detail="Hãy dừng tác vụ quét và tải trước khi xóa account")
     db_p = get_db_path(config.get("scraper_db_path", ""))
-    delete_account(db_p, req.account_id)
-    log_to_web(f"Đã xóa tài khoản ID #{req.account_id}.", "WARNING")
-    return {"status": "success", "message": "Đã xóa tài khoản"}
+    if not req.delete_profile:
+        if not delete_account(db_p, req.account_id):
+            raise HTTPException(status_code=500, detail="Không xóa được tài khoản.")
+        log_to_web(f"Đã xóa tài khoản ID #{req.account_id}.", "WARNING")
+        return {"status": "success", "message": "Đã xóa tài khoản", "profile_deleted": False}
+
+    account = get_account(db_p, req.account_id)
+    if account is None:
+        raise HTTPException(status_code=404, detail="Không tìm thấy tài khoản")
+    profile_path = _owned_profile_dir(str(account.get("profile_dir") or ""), req.account_id)
+    if _profile_shared_with_other_account(db_p, profile_path, req.account_id):
+        raise HTTPException(status_code=409, detail="Profile này đang được tài khoản khác dùng chung; không xóa.")
+    _release_stale_managed_profile_lease(req.account_id)
+    owner = f"delete-account-{req.account_id}"
+    try:
+        lease_keys = acquire_profile_leases(owner, [account])
+    except ProfileLeaseConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    try:
+        # Delete the DB row first and touch the folder only after it succeeded.
+        if not delete_account(db_p, req.account_id):
+            raise HTTPException(status_code=500, detail="Không xóa được tài khoản; thư mục profile được giữ nguyên.")
+        profile_error = ""
+        if profile_path.is_dir():
+            try:
+                shutil.rmtree(profile_path)
+            except OSError as exc:
+                profile_error = str(exc)
+    finally:
+        release_profile_leases(owner, lease_keys)
+    if profile_error:
+        log_to_web(f"Đã xóa tài khoản ID #{req.account_id} nhưng không xóa được thư mục profile.", "ERROR")
+        return {
+            "status": "partial",
+            "message": "Đã xóa tài khoản nhưng chưa xóa được thư mục profile. Đóng Chrome đang dùng profile rồi thử lại việc xóa thư mục.",
+            "profile_deleted": False,
+            "profile_error": profile_error,
+        }
+    log_to_web(f"Đã xóa tài khoản ID #{req.account_id} và Chrome profile.", "WARNING")
+    return {"status": "success", "message": "Đã xóa tài khoản và Chrome profile", "profile_deleted": True}
+
+
+def _profile_shared_with_other_account(db_p: str, profile_path: Path, account_id: int) -> bool:
+    """True when another account resolves to the same profile folder."""
+    root = chrome_profiles_root().resolve()
+    for other in get_all_accounts(db_p):
+        other_id = int(other["id"])
+        if other_id == account_id:
+            continue
+        value = str(other.get("profile_dir") or "").strip()
+        other_path = (Path(value).expanduser().resolve() if value else (root / f"scraper_{other_id}").resolve())
+        if other_path == profile_path:
+            return True
+    return False
+
+
+def _owned_profile_dir(profile_value: str, account_id: int) -> Path | None:
+    """Return the profile folder only when it lies inside the app-managed profiles root."""
+    root = chrome_profiles_root().resolve()
+    candidate = (Path(profile_value).expanduser().resolve() if profile_value
+                 else (root / f"scraper_{account_id}").resolve())
+    if candidate == root or root not in candidate.parents:
+        raise HTTPException(status_code=409, detail="Thư mục profile nằm ngoài vùng app quản lý; không xóa.")
+    return candidate
 
 @router.post("/launch")
 def launch_chrome_profile(req: LaunchProfileRequest):

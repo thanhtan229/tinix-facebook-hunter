@@ -92,6 +92,7 @@ Typecheck command: python -m mypy web/models.py web/security.py web/ws_manager.p
 Lint command: python -m ruff check web core/database_maintenance.py core/data_cleanup.py core/storage_migration.py manage_database.py utils/process_cleanup.py utils/secure_store.py tests
 Build command: Build.bat (bumps patch version, syntax check, updates desktop shortcut, starts app)
 Full test command: powershell -ExecutionPolicy Bypass -File scripts/quality.ps1 (pip check, ruff, mypy, pytest with coverage on 5 modules, node --check app.js)
+Coverage note: the gate (75%) measures only core.database_maintenance, core.data_cleanup, core.storage_migration, web.models and web.security. Measured over all of core, web and utils, coverage is about 54% (2026-10-30), so the 82% gate result does not describe the whole codebase.
 
 Health-check command / endpoint: GET http://127.0.0.1:7866/api/system/health (expects "ready": true)
 

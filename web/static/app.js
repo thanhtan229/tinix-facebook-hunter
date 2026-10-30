@@ -3659,19 +3659,37 @@ async function submitProfilesZipImport() {
 async function deleteAccount(accId) {
   const displayId = getAccountDisplayId(accId);
   if (!confirm(`Bạn có chắc muốn xóa tài khoản #${displayId}?`)) return;
+  // Chrome profile keeps login cookies on disk; removing it is a separate, explicit choice (default: keep).
+  const deleteProfile = confirm(
+    `Xóa luôn Chrome profile của tài khoản #${displayId} trên máy này?\n\n` +
+    "Profile chứa cookie đăng nhập Facebook. Chọn Cancel để giữ profile."
+  );
   try {
-    await fetch("/api/accounts/delete", {
+    const res = await fetch("/api/accounts/delete", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ account_id: accId })
+      body: JSON.stringify({ account_id: accId, delete_profile: deleteProfile })
     });
+    const json = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      // Do not report success when the account was not deleted (e.g. profile busy, outside managed root).
+      showToast(json.detail || "Không xóa được tài khoản", "error");
+      return;
+    }
     if (Number(state.selectedAccountId) === Number(accId)) {
       state.selectedAccountId = null;
     }
     await loadAccounts();
     fetchStats();
-    showToast("Đã xóa tài khoản", "info");
-  } catch (e) {}
+    if (json.status === "partial") {
+      // The account row is gone but its profile folder remains: warn, do not report a clean success.
+      showToast(json.message || "Đã xóa tài khoản nhưng còn thư mục profile", "warning");
+      return;
+    }
+    showToast(json.profile_deleted ? "Đã xóa tài khoản và Chrome profile" : "Đã xóa tài khoản", "info");
+  } catch (e) {
+    showToast("Lỗi kết nối khi xóa tài khoản", "error");
+  }
 }
 
 function getAccountDisplayId(accId) {
