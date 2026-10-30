@@ -8,10 +8,18 @@ import shutil
 import tempfile
 from pathlib import Path
 
+import pytest
+
 
 _ORIGINAL_LOG_DIR = os.environ.get("TINIX_LOG_DIR")
 _TEST_LOG_DIR = Path(tempfile.mkdtemp(prefix="tinix-facebook-hunter-pytest-"))
 os.environ["TINIX_LOG_DIR"] = str(_TEST_LOG_DIR)
+
+
+@pytest.fixture(autouse=True)
+def _restore_tests_do_not_depend_on_a_running_app(monkeypatch):
+    """A developer's running WebUI must not make restore tests fail; the guard has its own test."""
+    monkeypatch.setattr("core.database_maintenance._app_is_running", lambda: False)
 
 
 def pytest_sessionfinish(session, exitstatus):

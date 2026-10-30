@@ -96,8 +96,19 @@ def _restore_corrupt_database(database: Path, backup: Path) -> str:
         staged.unlink(missing_ok=True)
 
 
+def _app_is_running() -> bool:
+    """The WebUI owns the database while it listens on its local port."""
+    from utils.process_cleanup import DEFAULT_PORT, is_port_in_use
+
+    return is_port_in_use(port=DEFAULT_PORT)
+
+
 def restore_database(path: str | Path, backup: str | Path) -> str:
     """Restore a verified backup and return the automatic pre-restore backup path."""
+    if _app_is_running():
+        raise RuntimeError(
+            "Ứng dụng đang chạy và đang giữ database. Đóng ứng dụng (STOP.vbs) rồi khôi phục lại."
+        )
     database = Path(path).expanduser().resolve()
     backup_path = Path(backup).expanduser().resolve()
     details = inspect_database(backup_path)

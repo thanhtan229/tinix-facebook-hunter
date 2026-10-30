@@ -189,6 +189,44 @@ class ProfileBundleTests(unittest.TestCase):
             self.assertEqual(imported["platform"], "facebook")
             self.assertTrue(Path(imported["profile_path"]).is_dir())
 
+    def test_failed_import_never_deletes_a_preexisting_profile_folder(self) -> None:
+        # Regression: rollback used to rmtree the destination even when it existed before the import.
+        from fastapi import HTTPException
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            db_path = str(root / "tinix.db")
+            initialize_database(db_path)
+            legacy_id = add_account(db_path, label="Giữ profile", username="demo", password="pw")
+            source = make_profile(root / "profiles" / "fb_source")
+            add_social_account(
+                db_path, platform="facebook", label="Giữ profile", username="demo",
+                profile_dir=str(source), legacy_fb_id=legacy_id, is_active=1,
+            )
+            exported = None
+
+            def config_value(key, default=None):
+                return db_path if key == "scraper_db_path" else default
+
+            with (
+                patch("web.routes.accounts.config.get", side_effect=config_value),
+                patch("web.routes.accounts.project_root", return_value=root),
+                patch("web.routes.accounts.chrome_profiles_root", return_value=root / "imported-profiles"),
+            ):
+                exported = export_account_profile(ProfileExportRequest(account_id=legacy_id))
+                # The next social account id on a fresh DB is 2 here: pre-create that destination.
+                existing = root / "imported-profiles" / "fb_2"
+                existing.mkdir(parents=True)
+                marker = existing / "keep.txt"
+                marker.write_text("do not delete", encoding="utf-8")
+                # Remove the source social row so the next add gets id 2 deterministically.
+                with self.assertRaises(HTTPException):
+                    with patch("web.routes.accounts.add_social_account", return_value=2):
+                        import_account_profile(ProfileImportRequest(bundle_path=exported["bundle_path"]))
+
+            self.assertTrue(marker.is_file(), "pre-existing profile content must survive a failed import")
+            self.assertEqual(marker.read_text(encoding="utf-8"), "do not delete")
+
     def test_accounts_routes_export_and_import_all_profiles_once(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

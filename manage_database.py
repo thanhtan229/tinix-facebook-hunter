@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import sys
 
 from core.database_maintenance import create_database_backup, inspect_database, restore_database
 from core.db_storage import get_db_path
@@ -25,7 +26,13 @@ def main() -> int:
         return 0
     if not args.file or not args.confirm:
         parser.error("restore requires --file BACKUP and --confirm")
-    safety_backup = restore_database(database, args.file)
+    try:
+        safety_backup = restore_database(database, args.file)
+    except RuntimeError as exc:
+        # Refused (e.g. the WebUI is running) or failed verification; show the reason, not a traceback.
+        # A pre-restore safety backup is created before any overwrite, so the data stays recoverable.
+        print(f"[KHÔNG KHÔI PHỤC] {exc}", file=sys.stderr)
+        return 2
     print(json.dumps({"restored": database, "pre_restore_backup": safety_backup}, ensure_ascii=False, indent=2))
     return 0
 

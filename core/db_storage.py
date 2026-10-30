@@ -17,7 +17,22 @@ from typing import Dict, List, Optional, Any
 from core.page_scraper import is_valid_facebook_page_name
 from core.url_handler import get_original_url, is_story_permalink_for_id, is_video_url_for_story_id, normalize_video_post_url
 from utils import logger
-from utils.secure_store import is_protected, protect_secret, reveal_secret
+from utils.secure_store import (
+    SecretProtectionError,
+    is_protected,
+    protect_secret,
+    reveal_secret,
+    unprotect_secret,
+)
+
+
+def _reveal_tracked(value: Any, field_name: str, unreadable: List[str]) -> str:
+    """Decrypt a stored secret; record the field name when it cannot be decrypted."""
+    try:
+        return unprotect_secret(value)
+    except SecretProtectionError:
+        unreadable.append(field_name)
+        return ""
 
 
 ACCOUNT_SECRET_FIELDS = {"password", "secret_2fa", "email_pass", "cookie", "recovery_codes"}
@@ -3067,22 +3082,30 @@ def get_all_accounts(db_path: str) -> List[dict]:
             ORDER BY a.id
         """).fetchall()
         conn.close()
-        return [
-            {
-                "id": r[0], "label": r[1], "username": r[2], "password": reveal_secret(r[3]),
-                "secret_2fa": reveal_secret(r[4]), "email": r[5], "email_pass": reveal_secret(r[6]),
-                "cookie": reveal_secret(r[7]), "is_active": r[8],
+        accounts: List[dict] = []
+        for r in rows:
+            unreadable: List[str] = []
+            accounts.append({
+                "id": r[0], "label": r[1], "username": r[2],
+                "password": _reveal_tracked(r[3], "password", unreadable),
+                "secret_2fa": _reveal_tracked(r[4], "secret_2fa", unreadable),
+                "email": r[5],
+                "email_pass": _reveal_tracked(r[6], "email_pass", unreadable),
+                "cookie": _reveal_tracked(r[7], "cookie", unreadable),
+                "is_active": r[8],
                 "last_login": r[9], "created_at": r[10], "business_id": r[11] or "",
                 "preflight_status": r[12] or "",
                 "preflight_message": r[13] or "",
                 "preflight_checked_at": r[14] or "",
                 "profile_dir": r[15] or "",
                 "notes": r[16] or "",
-                "recovery_codes": reveal_secret(r[17]) if r[17] else "",
+                "recovery_codes": _reveal_tracked(r[17], "recovery_codes", unreadable) if r[17] else "",
                 "recovery_email": r[18] or "",
-            }
-            for r in rows
-        ]
+                # Fields that exist but cannot be decrypted on this Windows user/PC (DPAPI).
+                # They read as "" above, so callers must check this list before using them.
+                "secrets_unreadable": unreadable,
+            })
+        return accounts
     except Exception as e:
         logger.error(f"Lỗi đọc accounts: {str(e)[:100]}")
         return []

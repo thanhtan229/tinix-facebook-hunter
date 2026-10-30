@@ -68,43 +68,35 @@ Every non-trivial project SHOULD complete this section.
 Do not invent commands. Use the commands and runtime model that actually exist in the repository.
 
 ```text
-Product name: TBD
+Product name: Tinix FB Studio (Tinix-Facebook-Hunter)
 
 Project type:
-- Desktop app
-- Web app
-- SaaS
-- Mobile app
-- API / backend service
-- CLI
-- Worker / background service
-- Hybrid
-- Other: TBD
+- Desktop app (local WebUI in a Chrome/Edge App Mode window, Windows only)
 
-Primary platform: TBD
+Primary platform: Windows 10/11
 
-Frontend runtime: TBD
-Backend runtime: TBD
-Desktop/native runtime: TBD
-Database/runtime dependency: TBD
+Frontend runtime: static HTML/JS served by the backend (web/static), no separate build
+Backend runtime: Python 3.11 (FastAPI + uvicorn), entry point main.py
+Desktop/native runtime: Chrome or Microsoft Edge for App Mode; Playwright Chromium for automation
+Database/runtime dependency: SQLite (tinix_scraper.db), schema v14
 
-Development start command: TBD
-Development stop command: TBD
-Development restart command: TBD
+Development start command: START.vbs (silent) or START.bat; manual: python main.py
+Development stop command: STOP.vbs (or STOP.bat); stops only verified project processes
+Development restart command: STOP.vbs, wait for port 7866 to free, then START.vbs
 
-Frontend dev command: TBD
-Backend dev command: TBD
+Frontend dev command: none (edit web/static and reload the App Mode window)
+Backend dev command: python main.py
 
-Targeted test command: TBD
-Typecheck command: TBD
-Lint command: TBD
-Build command: TBD
-Full test command: TBD
+Targeted test command: python -m pytest tests/<file>.py -q
+Typecheck command: python -m mypy web/models.py web/security.py web/ws_manager.py core/database_maintenance.py core/data_cleanup.py core/storage_migration.py
+Lint command: python -m ruff check web core/database_maintenance.py core/data_cleanup.py core/storage_migration.py manage_database.py utils/process_cleanup.py utils/secure_store.py tests
+Build command: Build.bat (bumps patch version, syntax check, updates desktop shortcut, starts app)
+Full test command: powershell -ExecutionPolicy Bypass -File scripts/quality.ps1 (pip check, ruff, mypy, pytest with coverage on 5 modules, node --check app.js)
 
-Health-check command / endpoint: TBD
+Health-check command / endpoint: GET http://127.0.0.1:7866/api/system/health (expects "ready": true)
 
-Package command: TBD
-Release command: TBD
+Package command: none (no packaging pipeline; install.bat is the setup path for a new PC)
+Release command: none automated; follow docs/RELEASE_CHECKLIST.md manually
 
 HMR / live reload:
 - Supported

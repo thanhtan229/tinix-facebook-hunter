@@ -1,609 +1,169 @@
 # ARCHITECTURE.md
 
-> **Current Technical Architecture**
->
-> This document describes the durable technical structure of this project: major components, boundaries, data flow, runtime model, storage, integrations, and architectural constraints.
->
-> It should reflect the system **as it currently exists or has been explicitly decided**, not speculative future architecture.
+> Kiến trúc kỹ thuật hiện tại của Tinix FB Studio (Tinix-Facebook-Hunter). Mô tả hệ thống như đang chạy trong code, không phải kiến trúc tương lai.
 
----
+## 0. Metadata
 
-## 0. Architecture Metadata
+**Project:** Tinix FB Studio (Tinix-Facebook-Hunter)
+**Architecture Version:** 1.1
+**Status:** Active
+**Last Updated:** 2026-10-30
 
-**Project:** TBD  
-**Architecture Version:** 1.0  
-**Status:** Draft | Active  
-**Last Updated:** YYYY-MM-DD  
+## 1. Tổng quan
 
----
-
-## 1. System Overview
-
-Describe the system at a high level.
-
-Include:
-
-- what the application does technically;
-- major runtime components;
-- where core responsibilities live;
-- major external dependencies.
-
-Example shape:
+Ứng dụng desktop cục bộ cho Windows. Backend FastAPI (uvicorn) chỉ lắng nghe `127.0.0.1:7866`. Giao diện là HTML/JS tĩnh do backend phục vụ, mở trong cửa sổ Chrome/Edge App Mode. Tác vụ tải media và quét fanpage dùng Chrome thật (điều khiển qua Playwright CDP) với profile riêng cho từng tài khoản. Dữ liệu lưu trong SQLite và thư mục media trên đĩa.
 
 ```text
-User Interface
+Trình duyệt App Mode (web/static)
+      ↓ HTTP /api/* + WebSocket /ws (cookie phiên, host/origin localhost)
+web/app.py (FastAPI, middleware bảo mật, lifespan khôi phục)
       ↓
-Application Layer
+web/routes/* (accounts, downloader, scraper, spy, system)
       ↓
-Domain / Services
+core/* (download orchestrator, scanner, preflight, lease profile, DB)
       ↓
-Storage / External Providers
+SQLite (tinix_scraper.db) · thư mục media · Chrome profiles · Chrome/Playwright CDP · Facebook
 ```
 
-Replace this with the actual project architecture.
+## 2. Mục tiêu kiến trúc
 
----
+- Chạy cục bộ, không mở ra mạng.
+- Dữ liệu nhạy cảm (mật khẩu, 2FA, cookie) được mã hóa khi lưu.
+- Tác vụ dài bền vững: hàng đợi và trạng thái lưu trong SQLite, khôi phục được sau khi tắt đột ngột.
+- Thay đổi file đích dùng ghi tạm rồi thay thế nguyên tử (`.part`, `os.replace`).
 
-## 2. Architecture Goals
+## 3. Ranh giới tin cậy
 
-List the main architectural priorities.
+- **Người dùng cục bộ:** mọi API `/api/*` (trừ `/api/system/health`) cần cookie phiên được tạo ngẫu nhiên mỗi lần khởi động.
+- **Trình duyệt khác trên cùng máy:** request phải có `Host` là localhost và `Origin` (nếu có) là localhost cùng cổng.
+- **Facebook và Chrome:** nguồn dữ liệu bên ngoài; mọi phản hồi được coi là không tin cậy và kiểm tra trước khi ghi.
+- **Máy/tài khoản Windows:** secret được mã hóa DPAPI theo tài khoản Windows, chỉ giải mã trên đúng máy và user đó.
 
-Examples:
+## 4. Thành phần chạy
 
-- simplicity;
-- maintainability;
-- local-first behavior;
-- offline support;
-- modularity;
-- low operational complexity;
-- performance;
-- portability;
-- reliability.
+### Launcher
+- `START.vbs` → `START.bat`: chọn Python (`.venv` nếu có), kiểm tra cổng, dọn tiến trình cũ của dự án, khởi động `main.py` bằng `pythonw`, mở App Mode.
+- `STOP.vbs` / `STOP.bat`: dừng tiến trình đã xác minh thuộc dự án, không dừng tiến trình ngoài.
+- `install.bat`: cài đặt một lần cho máy mới (tạo `.venv`, cài `requirements.txt`, tải Chromium).
 
-Project-specific goals:
+### Backend (`main.py`, `web/app.py`)
+- Khởi động uvicorn; ghi log khởi động vào `logs/server_startup.log`.
+- `lifespan`: đánh dấu tác vụ đang chạy từ phiên trước là `interrupted`, đưa download dở về trạng thái cần xử lý, rồi tự chạy lại hàng đợi đã lưu (xem mục 7).
+- Middleware kiểm tra host, origin và cookie phiên. WebSocket `/ws` kiểm tra cùng điều kiện.
 
-- TBD
-- TBD
-- TBD
+### Routes (`web/routes/`)
+- `accounts.py`: CRUD tài khoản, preflight, mở Chrome profile, export/import profile (`.tinix-profile`, `.tinix-profiles.zip`).
+- `downloader.py`: hàng đợi và worker tải media, retry có backoff khi profile bị khóa.
+- `scraper.py`, `spy.py`: quét fanpage và tìm fanpage.
+- `system.py`: cấu hình, thống kê, task runs, health.
 
----
+### Core (`core/`)
+- `db_storage.py`: toàn bộ truy cập SQLite, schema, migration, mã hóa secret khi ghi.
+- `downloader.py`, `media_downloader.py`: tải media (ảnh trực tiếp, video qua yt-dlp), ghi `.part` rồi thay thế.
+- `page_scraper.py`, `facebook_parser.py`: điều khiển Chrome CDP, quét Page, `BrowserManager`.
+- `account_preflight.py`: kiểm tra phiên Facebook của tài khoản trước khi tải.
+- `profile_lease.py`: khóa profile để một tác vụ dùng một profile tại một thời điểm.
+- `database_maintenance.py`: backup, verify, restore (từ chối khi app đang chạy).
+- `data_cleanup.py`, `storage_migration.py`: dọn dữ liệu và chuyển cấu trúc lưu trữ.
 
-## 3. System Context
+### Utils (`utils/`)
+- `secure_store.py`: DPAPI `protect_secret` / `unprotect_secret`.
+- `profile_bundle.py`: đóng gói và giải nén profile; chống zip-slip và symlink.
+- `process_cleanup.py`: xác định và dừng tiến trình thuộc dự án; giải phóng cổng.
+- `config.py`: `config.json` và `.env`.
 
-Describe the system boundary.
+## 5. Ranh giới module
 
-### Users / Clients
+- `web/` có thể gọi `core/` và `utils/`. `core/` không import `web/` (ngoại lệ: `core/database_maintenance.py` gọi `utils.process_cleanup` để kiểm tra cổng).
+- Chỉ `core/db_storage.py` được ghi vào SQLite. Route không tự viết SQL.
+- Mọi ghi file đích đi qua đường ghi tạm rồi thay thế.
 
-- TBD
-
-### External Systems
-
-- TBD
-
-### External Providers / APIs
-
-- TBD
-
-### Trust Boundaries
-
-- TBD
-
----
-
-## 4. Runtime Components
-
-Document each major runtime component.
-
-### Component: TBD
-
-**Responsibility:** TBD  
-**Runtime:** TBD  
-**Entry point:** TBD  
-**Owns:** TBD  
-**Depends on:** TBD  
-**Communicates with:** TBD  
-
-Repeat for major components only.
-
-Examples may include:
-
-- frontend;
-- desktop shell;
-- backend/API;
-- worker;
-- scheduler;
-- database;
-- local service;
-- media processor.
-
----
-
-## 5. Module Boundaries
-
-Describe important code/module boundaries.
-
-Example:
+## 6. Cấu trúc thư mục quan trọng
 
 ```text
-UI
-↓
-Application Services
-↓
-Domain Logic
-↓
-Infrastructure
+main.py, web/app.py          khởi động và API
+web/routes/                  endpoint theo chức năng
+web/static/                  giao diện (HTML/JS/CSS)
+core/                        logic nghiệp vụ, DB, tải, quét
+utils/                       bảo mật, bundle, tiến trình, cấu hình
+tests/                       pytest; conftest.py tắt kiểm tra cổng khi restore
+scripts/quality.ps1          quality gate
+exports/                     backup, gói release, bundle (ngoài Git)
+logs/                        log (ngoài Git)
 ```
 
-For each important module:
+## 7. Luồng dữ liệu chính
 
-### Module: TBD
-
-**Purpose:** TBD  
-**May depend on:** TBD  
-**Must not depend on:** TBD  
-
-Avoid documenting every folder.
-
-Focus on boundaries agents must preserve.
-
----
-
-## 6. Repository Structure
-
-Document only important directories.
-
+### Quét fanpage và tự tải media
 ```text
-/
-├── TBD/        # responsibility
-├── TBD/        # responsibility
-├── TBD/        # responsibility
-└── TBD/        # responsibility
+Người dùng bấm quét → route scraper → PageScraper (Chrome CDP, profile của tài khoản)
+→ lưu bài vào SQLite (transaction; lỗi ghi thì không đẩy cursor)
+→ tạo batch trong download_queue (SQLite) → downloader lấy batch khi rảnh
+→ tải media vào .part → thay thế nguyên tử → cập nhật trạng thái bài
 ```
+Lỗi ở bước nào thì trạng thái đã ghi vẫn nhất quán: batch chưa xong ở trạng thái `queued`/`interrupted`, không mất hàng đợi.
 
-Do not mirror the entire repository tree.
-
----
-
-## 7. Main Data Flow
-
-Describe the important end-to-end data paths.
-
-### Flow 1 — TBD
-
+### Khởi động lại sau khi tắt đột ngột
 ```text
-Input
-→ Component
-→ Service
-→ Storage / Provider
-→ Result
+lifespan → recover_interrupted_task_runs (task running → interrupted)
+        → recover_interrupted_downloads (download dở → cần xử lý lại)
+        → start_pending_downloads_after_startup (chạy lại batch đã queued, một batch tại một thời điểm)
 ```
 
-Explain:
+### Export / import profile
+```text
+Export: lấy account (đã giải mã secret) → manifest.json + thư mục Chrome session → .tinix-profile / .tinix-profiles.zip
+Import: kiểm tra đường dẫn an toàn → giải nén vào thư mục tạm → thay thế vào profile đích → ghi DB; lỗi thì rollback
+```
+Định dạng này được chia sẻ với Tinix-Social-Hub. Xem `docs/TINIX_PROFILE_BUNDLE.md`.
 
-- source;
-- transformations;
-- persistence;
-- output;
-- failure boundary.
+## 8. Quyền sở hữu state
 
-Add additional flows only when architecturally meaningful.
-
----
-
-## 8. State Ownership
-
-Document where important state lives.
-
-| State | Owner | Persistence | Notes |
+| State | Chủ sở hữu | Lưu ở | Ghi chú |
 |---|---|---|---|
-| TBD | TBD | TBD | TBD |
+| Tài khoản Facebook, secret | `core/db_storage.py` | SQLite `fb_accounts` | Secret mã hóa DPAPI khi ghi |
+| Tài khoản social và liên kết profile | `core/db_storage.py` | SQLite `social_accounts` | `AUTOINCREMENT` |
+| Hàng đợi tải | `web/routes/downloader.py` + `core/db_storage.py` | SQLite `download_queue*` | Khôi phục khi khởi động |
+| Lịch sử tác vụ | `core/db_storage.py` | SQLite `task_runs` | Tác vụ dở → `interrupted` |
+| Khóa profile | `core/profile_lease.py` | Bộ nhớ tiến trình | Mất khi app tắt |
+| Session WebUI | `web/security.py` | Bộ nhớ tiến trình | Tạo mới mỗi lần khởi động |
+| Cấu hình | `utils/config.py` | `config.json`, `.env` | Secret trong config mã hóa DPAPI |
+| Media | `core/downloader.py` | Thư mục `_DOWNLOAD/` (cấu hình được) | Ghi qua `.part` |
 
-Clarify when relevant:
+## 9. Lưu trữ dữ liệu
 
-- frontend state;
-- server state;
-- database state;
-- filesystem state;
-- cache;
-- job state;
-- session state.
+- **SQLite:** `tinix_scraper.db`, schema v14, WAL. Backup/restore qua `manage_database.py` (đóng app trước khi restore).
+- **Thư mục media:** ảnh/video theo bài, có tên ổn định; migration cấu trúc phẳng có backup trước.
+- **Chrome profiles:** thư mục riêng cho từng tài khoản; chứa cookie phiên (không mã hóa ngoài DPAPI của Chrome).
+- **Không lưu trong Git:** `.env`, `config.json`, `*.db`, `logs/`, `exports/`, `_DOWNLOAD/`, `chrome_profile*/`.
 
-Avoid duplicated ownership.
+## 10. Giao tiếp
 
----
+- HTTP JSON `/api/*` (cần cookie phiên trừ health).
+- WebSocket `/ws` đẩy log và trạng thái cho giao diện.
+- Chrome qua CDP cổng cục bộ theo tài khoản (`127.0.0.1`).
 
-## 9. Data Storage
+## 11. Tác vụ nền
 
-### Primary Storage
+- **Download orchestrator:** một batch tại một thời điểm. Khi profile bị khóa, batch quay về `queued` và được thử lại với backoff lũy thừa tối đa 5 phút; khi thành công, backoff được reset.
+- **Quét:** worker theo tài khoản, dùng profile lease.
+- **Khôi phục:** chạy một lần khi khởi động.
 
-**Technology:** TBD  
-**Purpose:** TBD  
+## 12. Tích hợp bên ngoài
 
-### Filesystem / Object Storage
+- **Facebook:** web (không qua API chính thức cho việc quét/tải). Preflight kiểm tra phiên; đăng nhập tự động dùng `core/fb_login.py`.
+- **Facebook Graph/OAuth:** tùy chọn, cấu hình trong `.env` (xem `.env.template`).
+- **yt-dlp:** tải video.
+- **Chrome/Edge:** mở App Mode và điều khiển profile.
 
-- TBD
+## 13. Xác thực và phân quyền
 
-### Cache
+- Không có tài khoản người dùng cho WebUI. Bảo vệ dựa trên localhost, host/origin và cookie phiên mỗi lần khởi động.
+- Không có cơ chế phân quyền nhiều người dùng.
 
-- TBD
+## 14. Giới hạn kiến trúc đã biết
 
-### Local Storage
-
-- TBD
-
-### Data Ownership Rules
-
-- TBD
-
-If a storage type is not used, mark it `N/A`.
-
----
-
-## 10. API / IPC / Communication Boundaries
-
-Document how components communicate.
-
-Examples:
-
-- HTTP/REST;
-- GraphQL;
-- WebSocket;
-- IPC;
-- message queue;
-- filesystem;
-- direct in-process calls.
-
-### Boundary: TBD
-
-**Producer / Caller:** TBD  
-**Consumer:** TBD  
-**Protocol / Mechanism:** TBD  
-**Contract:** TBD  
-**Error behavior:** TBD  
-
-Public or durable contracts should be clearly distinguished from internal implementation details.
-
----
-
-## 11. Background Jobs and Async Processing
-
-If none:
-
-`Not applicable.`
-
-Otherwise document:
-
-- worker model;
-- queue;
-- scheduler;
-- retries;
-- idempotency;
-- cancellation;
-- progress state;
-- failure handling.
-
-### Job: TBD
-
-**Trigger:** TBD  
-**Executor:** TBD  
-**State storage:** TBD  
-**Retry policy:** TBD  
-**Completion behavior:** TBD  
-
----
-
-## 12. External Integrations
-
-### Integration: TBD
-
-**Purpose:** TBD  
-**Direction:** Inbound | Outbound | Bidirectional  
-**Authentication:** TBD  
-**Failure behavior:** TBD  
-**Rate/usage constraints:** TBD  
-**Ownership boundary:** TBD  
-
-Do not include secrets.
-
----
-
-## 13. Authentication and Authorization
-
-If not applicable:
-
-`Not applicable.`
-
-Otherwise document:
-
-- authentication model;
-- authorization model;
-- session/token ownership;
-- trust boundaries;
-- privileged operations.
-
-Do not store credentials or secret values in this file.
-
----
-
-## 14. Configuration and Environment
-
-Document configuration categories, not secret values.
-
-Examples:
-
-```text
-Runtime configuration: TBD
-Environment variables: TBD
-Feature flags: TBD
-Local development configuration: TBD
-Production configuration source: TBD
-```
-
-Clarify which settings are:
-
-- startup-only;
-- runtime-reloadable;
-- environment-specific.
-
----
-
-## 15. Error Handling Strategy
-
-Describe architectural error behavior.
-
-Consider:
-
-- where errors are caught;
-- where errors are translated;
-- user-facing vs internal errors;
-- retry boundaries;
-- logging responsibilities;
-- failure isolation.
-
-Rules:
-
-- do not silently swallow errors;
-- avoid duplicated error translation across layers;
-- preserve actionable diagnostic context.
-
----
-
-## 16. Logging and Observability
-
-Document:
-
-- logging owner;
-- log locations;
-- log levels;
-- health endpoints;
-- metrics;
-- traces;
-- crash reporting;
-- audit logs;
-
-when applicable.
-
-```text
-Application logs: TBD
-Backend logs: TBD
-Health check: TBD
-Metrics: TBD
-Tracing: TBD
-Crash reporting: TBD
-```
-
----
-
-## 17. Security Boundaries
-
-Document durable security assumptions.
-
-Consider:
-
-- secrets;
-- local vs remote trust;
-- file access;
-- user input validation;
-- external APIs;
-- privileged actions;
-- sandboxing;
-- data exposure boundaries.
-
-Do not include sensitive values.
-
----
-
-## 18. Performance-Critical Areas
-
-If none are currently known:
-
-`None identified.`
-
-Otherwise:
-
-### Area: TBD
-
-**Why critical:** TBD  
-**Current strategy:** TBD  
-**Constraints:** TBD  
-
-Do not add speculative optimization plans here.
-
----
-
-## 19. Platform-Specific Architecture
-
-If the project has platform-specific behavior, document it here.
-
-Examples:
-
-### Desktop
-
-- main process;
-- renderer;
-- IPC;
-- local backend;
-- updater.
-
-### Web
-
-- browser runtime;
-- server rendering;
-- API backend;
-- CDN.
-
-### Mobile
-
-- native shell;
-- platform services;
-- local persistence.
-
-### Hybrid
-
-- TBD
-
-If not applicable:
-
-`N/A.`
-
----
-
-## 20. Deployment / Distribution Model
-
-Describe how the system is run outside development.
-
-Examples:
-
-- hosted web;
-- desktop package;
-- mobile store package;
-- container;
-- on-premise service;
-- local-only tool.
-
-```text
-Deployment model: TBD
-Distribution artifact: TBD
-Runtime dependencies: TBD
-Upgrade/update model: TBD
-```
-
-Detailed build/restart behavior belongs in `DEVELOPMENT_WORKFLOW.md`.
-
----
-
-## 21. Architectural Constraints
-
-List constraints coding agents must preserve.
-
-Examples:
-
-- module A must not import module B;
-- frontend must not access database directly;
-- provider-specific logic stays behind an adapter;
-- shared domain logic must remain platform-independent;
-- writes must go through service X.
-
-Project constraints:
-
-- TBD
-- TBD
-- TBD
-
-This is one of the most important sections for preventing accidental architecture drift.
-
----
-
-## 22. Durable Architectural Decisions
-
-Record only important decisions that affect future implementation.
-
-### Decision: TBD
-
-**Status:** Accepted  
-**Context:** TBD  
-**Decision:** TBD  
-**Reason:** TBD  
-**Consequences:** TBD  
-
-For complex or controversial decisions, use a separate ADR if the project adopts ADRs.
-
-Do not turn this section into a change log.
-
----
-
-## 23. Known Architectural Limitations
-
-List known structural limitations that materially affect future work.
-
-- TBD
-
-If none:
-
-`None currently documented.`
-
-Distinguish architectural limitations from temporary bugs.
-
----
-
-## 24. Architecture Change Rules
-
-Update this file when a task introduces or changes a **durable architectural decision**, for example:
-
-- adding/removing a major runtime component;
-- changing module boundaries;
-- changing primary storage;
-- adding a major external provider;
-- changing authentication architecture;
-- introducing a queue/worker;
-- changing core data flow;
-- changing deployment/runtime model;
-- introducing an important shared abstraction.
-
-Do **not** update this file merely because:
-
-- a bug was fixed;
-- UI changed;
-- a button was added;
-- CSS changed;
-- a local handler changed;
-- tests changed;
-- a project phase completed.
-
-`ARCHITECTURE.md` is a current technical map, not a progress log.
-
----
-
-## 25. Source of Truth
-
-When implementation and this document disagree:
-
-1. verify whether the implementation changed intentionally;
-2. verify the latest explicit project decision;
-3. update whichever is stale.
-
-Do not knowingly leave `ARCHITECTURE.md` describing an architecture that no longer exists.
-
----
-
-## 26. Relationship to Other Documents
-
-```text
-AGENTS.md
-→ How should coding agents work?
-
-DEVELOPMENT_WORKFLOW.md
-→ How is code validated, run, reloaded, restarted, and packaged?
-
-UX_UI.md
-→ How should the product look and behave for users?
-
-ARCHITECTURE.md
-→ How is the technical system structured?
-
-PLAN.md
-→ What are we planning to implement?
-
-PROJECT_STATUS.md
-→ Where are we currently in execution?
-```
+- Chỉ chạy trên Windows (DPAPI, wscript, Chrome/Edge).
+- Chỉ một tiến trình WebUI tại một thời điểm (dựa vào cổng 7866).
+- Không auto-update, không cài đặt dạng installer.
+- Lệnh `restore` không kiểm tra lock SQLite ngoài cổng app; dựa vào việc người dùng đóng app.

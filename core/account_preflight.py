@@ -52,6 +52,9 @@ def check_facebook_account(account: Dict[str, Any]) -> AccountPreflightResult:
             "Account đang tắt nên không được dùng để tải.",
         )
 
+    # Preflight only consumes the cookie and the Chrome profile. An unreadable password or
+    # 2FA secret must not block an account whose profile session is still valid.
+    cookie_unreadable = "cookie" in (account.get("secrets_unreadable") or [])
     cookies = parse_cookie_string(str(account.get("cookie") or ""))
     browser = BrowserManager(
         profile_dir=profile_dir,
@@ -63,6 +66,12 @@ def check_facebook_account(account: Dict[str, Any]) -> AccountPreflightResult:
             return AccountPreflightResult(
                 account_id, label, profile_dir, True, "READY",
                 "Phiên Facebook hợp lệ; sẵn sàng nhận bài tải.",
+            )
+        if cookie_unreadable:
+            return AccountPreflightResult(
+                account_id, label, profile_dir, False, "SECRET_UNREADABLE",
+                "Không đọc được cookie đã lưu trên máy này và phiên trong profile không hợp lệ. "
+                "Mã hóa chỉ giải mã được trên đúng tài khoản Windows và máy đã lưu; hãy nhập lại cookie.",
             )
         return AccountPreflightResult(
             account_id, label, profile_dir, False,

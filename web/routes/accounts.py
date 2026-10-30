@@ -74,6 +74,8 @@ def _public_account(account: Dict[str, Any]) -> Dict[str, Any]:
     public["has_2fa"] = bool(account.get("secret_2fa"))
     public["has_cookie"] = bool(account.get("cookie"))
     public["has_recovery_codes"] = bool(account.get("recovery_codes"))
+    # Lets the UI show "credential không đọc được" instead of a silent "chưa có mật khẩu".
+    public["secrets_unreadable"] = list(account.get("secrets_unreadable") or [])
     account_id = int(account.get("id") or 0)
     port = _chrome_debug_port(account_id) if account_id else 0
     with _CHROME_PROCESS_LOCK:
@@ -749,6 +751,8 @@ def _create_account_from_profile(db_p: str, metadata: dict[str, Any], source_pro
         delete_account(db_p, legacy_id)
         raise ProfileBundleError(f"Không thể tạo liên kết Chrome profile cho “{name}”.")
     destination = (chrome_profiles_root() / f"fb_{social_id}").resolve()
+    # Only remove a folder that this import created; never delete a pre-existing profile.
+    destination_preexisted = destination.exists()
     try:
         result = import_profile_from_directory(source_profile, destination)
         if not update_social_account(db_p, social_id, profile_dir=str(destination)):
@@ -756,7 +760,7 @@ def _create_account_from_profile(db_p: str, metadata: dict[str, Any], source_pro
     except Exception:
         delete_social_account(db_p, social_id)
         delete_account(db_p, legacy_id)
-        if destination.exists():
+        if destination.exists() and not destination_preexisted:
             shutil.rmtree(destination)
         raise
     return {
@@ -853,6 +857,8 @@ def import_account_profile(req: ProfileImportRequest):
         raise HTTPException(status_code=409, detail="Không thể tạo liên kết Chrome profile cho account.")
 
     destination = (chrome_profiles_root() / f"fb_{social_id}").resolve()
+    # Only remove a folder that this import created; never delete a pre-existing profile.
+    destination_preexisted = destination.exists()
     try:
         imported_manifest, result = import_bundle_profile(req.bundle_path, destination)
         if not update_social_account(db_p, social_id, profile_dir=str(destination)):
@@ -860,7 +866,7 @@ def import_account_profile(req: ProfileImportRequest):
     except Exception as exc:
         delete_social_account(db_p, social_id)
         delete_account(db_p, legacy_id)
-        if destination.exists():
+        if destination.exists() and not destination_preexisted:
             shutil.rmtree(destination)
         if isinstance(exc, ProfileBundleError):
             raise HTTPException(status_code=409, detail=str(exc)) from exc

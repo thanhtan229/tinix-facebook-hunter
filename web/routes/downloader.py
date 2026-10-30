@@ -262,13 +262,29 @@ def _start_claimed_auto_batch(batch: dict) -> bool:
 
 def _start_pending_auto_download() -> None:
     """Claim and start at most one persisted batch once the downloader is idle."""
+    global _pending_auto_download_retry_attempts
     if orchestrator.is_running or _stop_all_requested or _shutdown_requested:
         return
     batch = claim_next_download_queue_batch(_db_path())
     if batch is None:
+        _pending_auto_download_retry_attempts = 0
         return
     if _start_claimed_auto_batch(batch):
+        _pending_auto_download_retry_attempts = 0
         log_to_web(f"⬇ Auto Download bắt đầu {batch['item_count']} bài đang chờ.", "OK")
+
+
+_PENDING_RETRY_BASE_S = 5.0
+_PENDING_RETRY_MAX_S = 300.0
+_pending_auto_download_retry_attempts = 0
+
+
+def _next_pending_retry_delay() -> float:
+    """Exponential backoff capped at 5 minutes: work is kept in SQLite, polling is bounded."""
+    global _pending_auto_download_retry_attempts
+    delay = min(_PENDING_RETRY_BASE_S * (2 ** _pending_auto_download_retry_attempts), _PENDING_RETRY_MAX_S)
+    _pending_auto_download_retry_attempts = min(_pending_auto_download_retry_attempts + 1, 16)
+    return delay
 
 
 def _schedule_pending_auto_download_retry() -> None:
@@ -278,7 +294,7 @@ def _schedule_pending_auto_download_retry() -> None:
         return
     if _pending_auto_download_retry and _pending_auto_download_retry.is_alive():
         return
-    timer = threading.Timer(5.0, _retry_pending_auto_download)
+    timer = threading.Timer(_next_pending_retry_delay(), _retry_pending_auto_download)
     timer.daemon = True
     _pending_auto_download_retry = timer
     timer.start()
