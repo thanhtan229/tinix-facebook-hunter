@@ -15,10 +15,12 @@ Giữ ứng dụng ổn định trên `master` đồng bộ với GitHub; hoàn 
 
 ## 2. Current State Summary
 
-- Nhánh `master` đã đẩy lên `origin` (`https://github.com/thanhtan229/tinix-facebook-hunter`). Remote và HEAD đồng bộ tại `42acf470`.
-- Version hiện tại: **v1.21.64**. SQLite schema **14**.
+- Nhánh `master` đã đẩy lên `origin` (`https://github.com/thanhtan229/tinix-facebook-hunter`). Remote và HEAD đồng bộ tại `aa56944d`.
+- Version hiện tại: **v1.21.67**. SQLite schema **14**.
 - Health `/api/system/health`: `ready=true`, schema 14, mọi check đều true (kiểm tra sau khi khởi động lại bằng launcher).
-- Quality gate `scripts/quality.ps1`: **260 passed**, 10 subtests, exit 0 (trên các commit cuối).
+- Quality gate `scripts/quality.ps1`: **261 passed**, 10 subtests, exit 0 (trên commit cuối).
+- Database: tài khoản 6 đã xóa hoàn toàn (hàng tài khoản, hàng social liên kết, token, và thư mục profile `fb_9`). Còn 4 tài khoản: 3, 9, 19, 20.
+- Bản sao lưu DB trước khi dọn token: `exports/backups/` (ngoài Git, `integrity ok`, schema 14).
 - Gói artifact `v1.21.47` (SHA256 `3d775951…58`) tương ứng commit `b1873f2a`. Không tạo lại gói trừ khi có yêu cầu.
 
 ## 3. Completed
@@ -34,7 +36,8 @@ Giữ ứng dụng ổn định trên `master` đồng bộ với GitHub; hoàn 
 - [x] Đọc DB lỗi không còn trả danh sách rỗng; batch tải quay về hàng đợi; giao diện nhận 503 rõ ràng (`c722ca31`).
 - [x] Launcher `STOP.vbs` / `START.vbs`: không chờ hộp thoại khi chạy có tham số `silent` (`4aacd29a`).
 - [x] Tài liệu: `DEVELOPMENT_WORKFLOW.md`, `ARCHITECTURE.md`, `PLAN.md`, `RESEARCH*.md` thay template bằng nội dung thật (`121305f9`, `d6cd147b`).
-- [x] Thử đăng nhập có kiểm soát trên Facebook thật, mỗi tài khoản đúng một lần: tài khoản 3, 9, 20 đăng nhập được (phiên còn sống hoặc trang "Tiếp tục"); tài khoản 6 bị từ chối mật khẩu.
+- [x] Thử đăng nhập có kiểm soát trên Facebook thật, mỗi tài khoản đúng một lần: tài khoản 3, 9, 20 đăng nhập được (phiên còn sống hoặc trang "Tiếp tục"); tài khoản 6 bị từ chối mật khẩu rồi bị checkpoint và đã được xóa.
+- [x] Xóa tài khoản cascade đầy đủ: social liên kết, targets, managed pages, token (`46809ed6`, `aa56944d`).
 
 ## 4. In Progress
 
