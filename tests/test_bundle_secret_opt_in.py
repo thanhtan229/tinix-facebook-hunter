@@ -8,7 +8,14 @@ from unittest.mock import patch
 
 from core.db_storage import add_account, add_social_account, initialize_database
 from utils.profile_bundle import export_bundle
-from web.routes.accounts import ProfileExportRequest, export_account_profile
+from web.routes.accounts import (
+    ProfileExportRequest,
+    ProfileImportRequest,
+    _bundle_secret_fields,
+    export_account_profile,
+    get_all_accounts,
+    import_account_profile,
+)
 
 from tests.test_profile_bundle import make_profile
 
@@ -76,6 +83,46 @@ class BundleSecretOptInTests(unittest.TestCase):
             manifest = _manifest_of_bundle(Path(bundle["bundle_path"]))
 
             self.assertFalse(manifest["contains_account_secrets"])
+
+
+    def test_secret_field_helper_blanks_by_default_and_keeps_only_when_opted_in(self) -> None:
+        account = {"password": "pw", "secret_2fa": "SEED", "email_pass": "mail", "cookie": "ck"}
+
+        blanked = _bundle_secret_fields(account, include_secrets=False)
+        kept = _bundle_secret_fields(account, include_secrets=True)
+
+        self.assertEqual(set(blanked.values()), {""})
+        self.assertEqual(kept, {"password": "pw", "secret_2fa": "SEED", "email_pass": "mail", "cookie": "ck"})
+
+    def test_import_of_bundle_without_credentials_creates_account_with_empty_secrets(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            db_path = str(root / "tinix.db")
+            from core.db_storage import initialize_database, add_account, add_social_account
+            initialize_database(db_path)
+            legacy_id = add_account(db_path, label="Không mật khẩu", username="demo", password="pw", cookie="ck")
+            source = make_profile(root / "profiles" / "fb_source", session="session-cookie")
+            add_social_account(
+                db_path, platform="facebook", label="Không mật khẩu", username="demo",
+                profile_dir=str(source), legacy_fb_id=legacy_id, is_active=1,
+            )
+
+            def config_value(key, default=None):
+                return db_path if key == "scraper_db_path" else default
+
+            with (
+                patch("web.routes.accounts.config.get", side_effect=config_value),
+                patch("web.routes.accounts.project_root", return_value=root),
+                patch("web.routes.accounts.chrome_profiles_root", return_value=root / "imported-profiles"),
+                patch("web.routes.accounts.log_to_web"),
+            ):
+                exported = export_account_profile(ProfileExportRequest(account_id=legacy_id))
+                imported = import_account_profile(ProfileImportRequest(bundle_path=exported["bundle_path"]))
+
+            created = next(item for item in get_all_accounts(db_path) if item["id"] == imported["account_id"])
+            self.assertEqual(created["password"], "")
+            self.assertEqual(created["cookie"], "")
+            self.assertTrue(Path(imported["profile_path"]).is_dir(), "session profile must still be restored")
 
 
 if __name__ == "__main__":
