@@ -1,397 +1,53 @@
 # PLAN.md
 
-> **Project / Feature Implementation Plan**
->
-> This document defines what will be built, why it is needed, how it will be implemented, how it will be verified, and what completion means.
->
-> Use this file for substantial, multi-step, high-risk, or multi-system work. Small scoped tasks normally do not require a separate plan file.
+> Kế hoạch triển khai cho công việc lớn, nhiều bước. Không dùng làm nhật ký tiến độ.
 
----
+## 0. Metadata
 
-## 0. Plan Metadata
+**Project / Feature:** Tinix FB Studio — kế hoạch hardening sau Final Production Review (2026-10-29)
+**Plan Version:** 1.0
+**Status:** In Progress
+**Owner / Primary Agent:** Boss (Claude) theo yêu cầu Product Owner
+**Created:** 2026-10-30
+**Last Updated:** 2026-10-30
 
-**Project / Feature:** TBD  
-**Plan Version:** 1.0  
-**Status:** Draft | Ready | In Progress | Blocked | Completed  
-**Owner / Primary Agent:** TBD  
-**Created:** YYYY-MM-DD  
-**Last Updated:** YYYY-MM-DD  
+## 1. Mục tiêu
 
----
+Xử lý các finding của Final Production Review trước khi dùng thực tế.
 
-## 1. Objective
+## 2. Phạm vi
 
-Describe the intended outcome in a few sentences.
+### Trong phạm vi
+- Mất dấu tiếng Việt trong log/selector đăng nhập (`core/fb_login.py`, `core/fanpage_scanner.py`, `core/page_scraper.py`).
+- Coverage gate phản ánh đúng phạm vi đo.
+- Xóa Chrome profile khi xóa tài khoản (tùy chọn, mặc định tắt).
 
-Focus on:
+### Ngoài phạm vi
+- Mã hóa bundle export/import (đang chờ quyết định vì ảnh hưởng định dạng chia sẻ với Tinix-Social-Hub và cần thêm dependency).
+- Chạy tải/quét trên tài khoản Facebook thật khi chưa có phạm vi được duyệt.
 
-- what problem is being solved;
-- what user or system outcome is expected;
-- what success looks like.
+## 3. Trạng thái các finding
 
-Avoid implementation detail here unless it is essential to understanding the goal.
-
----
-
-## 2. Scope
-
-### In Scope
-
-- TBD
-- TBD
-- TBD
-
-### Out of Scope
-
-- TBD
-- TBD
-- TBD
-
-Clearly separating scope prevents feature creep and unrelated refactoring.
-
----
-
-## 3. Background / Current State
-
-Summarize only the context needed to understand why this plan exists.
-
-Include when relevant:
-
-- current behavior;
-- current limitations;
-- existing implementation;
-- known constraints;
-- relevant previous decisions.
-
-Do not duplicate `ARCHITECTURE.md`.
-
----
-
-## 4. Requirements
-
-### Functional Requirements
-
-1. TBD
-2. TBD
-3. TBD
-
-### Non-Functional Requirements
-
-Consider when relevant:
-
-- performance;
-- reliability;
-- security;
-- accessibility;
-- maintainability;
-- compatibility;
-- observability;
-- scalability.
-
-### Constraints
-
-- TBD
-- TBD
-
----
-
-## 5. Acceptance Criteria
-
-The work is complete when all applicable criteria are satisfied.
-
-- [ ] TBD
-- [ ] TBD
-- [ ] TBD
-
-Acceptance criteria should describe observable outcomes, not vague implementation intent.
-
----
-
-## 6. Proposed Solution
-
-Describe the intended implementation approach.
-
-Include:
-
-- main components/modules involved;
-- data flow;
-- major logic changes;
-- UI/workflow changes;
-- integration points;
-- important tradeoffs.
-
-Keep this section implementation-focused but concise.
-
----
-
-## 7. Affected Areas
-
-List the expected areas of the repository that may change.
-
-```text
-Frontend:
-- TBD
-
-Backend:
-- TBD
-
-Database / Storage:
-- TBD
-
-Shared code:
-- TBD
-
-Configuration:
-- TBD
-
-Tests:
-- TBD
-
-Documentation:
-- TBD
-```
-
-Do not treat this as permission to modify unrelated files.
-
----
-
-## 8. Data / API / Contract Changes
-
-If none:
-
-`None.`
-
-Otherwise document:
-
-### Data Model Changes
-
-- TBD
-
-### API Changes
-
-- TBD
-
-### Public Contract Changes
-
-- TBD
-
-### Backward Compatibility
-
-- TBD
-
-### Migration Requirements
-
-- TBD
-
-Any durable architectural effect should also be reflected in `ARCHITECTURE.md`.
-
----
-
-## 9. UI / UX Changes
-
-If the task affects UI, describe:
-
-- screens/components affected;
-- user workflow;
-- loading/error/empty states;
-- accessibility considerations;
-- responsive/platform behavior.
-
-Implementation must follow `UX_UI.md`.
-
-If no UI changes:
-
-`None.`
-
----
-
-## 10. Implementation Phases
-
-Break substantial work into independently understandable phases.
-
-### Phase 1 — TBD
-
-**Goal:** TBD
-
-Tasks:
-
-- [ ] TBD
-- [ ] TBD
-
-Verification:
-
-- [ ] TBD
-
-### Phase 2 — TBD
-
-**Goal:** TBD
-
-Tasks:
-
-- [ ] TBD
-- [ ] TBD
-
-Verification:
-
-- [ ] TBD
-
-### Phase 3 — TBD
-
-**Goal:** TBD
-
-Tasks:
-
-- [ ] TBD
-- [ ] TBD
-
-Verification:
-
-- [ ] TBD
-
-Add or remove phases as needed.
-
-Do not create artificial phases for trivial work.
-
----
-
-## 11. Testing Strategy
-
-Define the minimum meaningful verification.
-
-Consider:
-
-### Targeted Tests
-
-- TBD
-
-### Unit Tests
-
-- TBD
-
-### Integration Tests
-
-- TBD
-
-### UI / Runtime Verification
-
-- TBD
-
-### Regression Tests
-
-- TBD
-
-### Build / Typecheck / Lint
-
-- TBD
-
-Follow `DEVELOPMENT_WORKFLOW.md` for build, reload, restart, and health-check behavior.
-
----
-
-## 12. Migration / Compatibility Plan
-
-If not applicable:
-
-`Not applicable.`
-
-Otherwise document:
-
-- migration steps;
-- compatibility requirements;
-- rollback expectations;
-- data preservation;
-- version considerations;
-- deployment sequencing.
-
----
-
-## 13. Risks and Mitigations
-
-| Risk | Impact | Mitigation |
+| # | Finding | Trạng thái |
 |---|---|---|
-| TBD | TBD | TBD |
-| TBD | TBD | TBD |
+| 1 | Secret plaintext trong bundle export | Chờ quyết định (xem mục 4) |
+| 2 | Lỗi giải mã bị che | Đã sửa, có test, reviewer LGTM |
+| 3 | Restore khi app đang chạy | Đã sửa, có test |
+| 4 | Retry vô hạn | Đã sửa (backoff tối đa 5 phút), có test |
+| 5 | Xóa account để lại profile | Chưa làm |
+| 6 | Rollback import xóa nhầm thư mục | Đã sửa, có test hồi quy |
+| 7 | Coverage gate đo ít module | Chờ quyết định (xem mục 4) |
+| 8 | Mất dấu tiếng Việt | Chưa làm; ảnh hưởng bộ chọn đăng nhập, cần kiểm chứng trên giao diện thật |
+| 9 | Tài liệu còn template | Đã làm cho DEVELOPMENT_WORKFLOW, ARCHITECTURE, PLAN |
+| 10 | Hàng đợi tự chạy khi khởi động | Chờ xác nhận hành vi |
 
-Focus on realistic implementation or product risks.
+## 4. Quyết định còn lại
 
-Do not create speculative risk lists without value.
+1. Bundle: (a) mã hóa bằng mật khẩu người dùng, cần sửa Tinix-Social-Hub và thêm dependency; (b) mặc định không đưa secret vào bundle, chỉ đưa khi bật tùy chọn có cảnh báo; (c) PO chấp nhận rủi ro bằng văn bản.
+2. Coverage: giữ ngưỡng 75% trên 5 module hiện tại, hoặc mở rộng phạm vi đo (đo thực tế toàn bộ `core`, `web`, `utils` là 54%).
 
----
+## 5. Kiểm chứng
 
-## 14. Dependencies
-
-### Internal Dependencies
-
-- TBD
-
-### External Dependencies
-
-- TBD
-
-### Blocking Decisions
-
-- TBD
-
-If none:
-
-`None.`
-
----
-
-## 15. Rollback / Recovery
-
-For risky changes, describe how to recover if implementation fails.
-
-Examples:
-
-- feature flag;
-- configuration rollback;
-- schema rollback strategy;
-- previous implementation retained temporarily;
-- reversible migration.
-
-If rollback is trivial or unnecessary:
-
-`No special rollback procedure required.`
-
----
-
-## 16. Completion Checklist
-
-Before marking this plan complete:
-
-- [ ] Scope implemented.
-- [ ] Acceptance criteria satisfied.
-- [ ] Relevant tests/checks passed.
-- [ ] Runtime verification completed where applicable.
-- [ ] No unrelated behavior intentionally changed.
-- [ ] `ARCHITECTURE.md` updated if durable architecture changed.
-- [ ] `PROJECT_STATUS.md` updated if the project uses it and a durable checkpoint changed.
-- [ ] Known limitations documented.
-- [ ] Plan status changed to `Completed`.
-
----
-
-## 17. Notes / Decisions
-
-Use only for plan-specific decisions that do not belong in `ARCHITECTURE.md`.
-
-- TBD
-
-Keep this section short.
-
----
-
-## 18. Plan Maintenance Rule
-
-This file is a plan, not a development diary.
-
-Update it when:
-
-- scope changes;
-- implementation strategy changes;
-- phases change;
-- acceptance criteria change;
-- a major blocker changes execution order.
-
-Do not update it for every small code edit.
+- Mỗi thay đổi có test hồi quy và được reviewer độc lập đánh giá.
+- Quality gate: `scripts/quality.ps1`.
+- Không kiểm chứng trên tài khoản Facebook thật trong kế hoạch này.
