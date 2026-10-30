@@ -3058,6 +3058,7 @@ def delete_account(db_path: str, account_id: int) -> bool:
         )
         conn.execute("DELETE FROM social_accounts WHERE platform = 'facebook' AND legacy_fb_id = ?", (account_id,))
         conn.execute("DELETE FROM managed_pages WHERE account_id = ?", (account_id,))
+        conn.execute("DELETE FROM facebook_tokens WHERE account_id = ?", (account_id,))
         conn.execute("DELETE FROM fb_accounts WHERE id = ?", (account_id,))
         conn.commit()
         return True
