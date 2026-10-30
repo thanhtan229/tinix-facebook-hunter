@@ -175,7 +175,7 @@ class ProfileBundleTests(unittest.TestCase):
                 patch("web.routes.accounts.project_root", return_value=root),
                 patch("web.routes.accounts.chrome_profiles_root", return_value=root / "imported-profiles"),
             ):
-                exported = export_account_profile(ProfileExportRequest(account_id=legacy_id))
+                exported = export_account_profile(ProfileExportRequest(account_id=legacy_id, include_secrets=True))
                 imported = import_account_profile(ProfileImportRequest(bundle_path=exported["bundle_path"]))
 
             accounts = get_all_accounts(db_path)

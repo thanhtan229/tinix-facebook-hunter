@@ -273,6 +273,14 @@ def read_bundle(bundle_path: str) -> tuple[Path, dict[str, Any], Path]:
     return bundle, manifest, profile
 
 
+SECRET_METADATA_KEYS = ("password", "secret_2fa", "email_pass", "cookie")
+
+
+def _contains_secrets(metadata: dict[str, Any]) -> bool:
+    """True when a bundle entry carries any credential, so the manifest flag tells the truth."""
+    return any(str(metadata.get(key) or "") for key in SECRET_METADATA_KEYS)
+
+
 def export_bundle(source: Path, export_root: Path, manifest: dict[str, Any]) -> dict[str, Any]:
     source = source.resolve()
     validate_chrome_profile(source)
@@ -292,7 +300,7 @@ def export_bundle(source: Path, export_root: Path, manifest: dict[str, Any]) -> 
             **manifest,
             "exported_at": datetime.now(timezone.utc).isoformat(),
             "profile_content": "session-only-v1",
-            "contains_account_secrets": True,
+            "contains_account_secrets": _contains_secrets(manifest),
         }
         (staging / "manifest.json").write_text(
             json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -369,7 +377,7 @@ def export_profiles_archive(
             "source_app": source_app,
             "source_app_version": source_app_version,
             "profile_content": "session-only-v1",
-            "contains_account_secrets": True,
+            "contains_account_secrets": any(_contains_secrets(item) for item in accounts),
             "exported_at": datetime.now(timezone.utc).isoformat(),
             "accounts": accounts,
         }

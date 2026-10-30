@@ -3514,11 +3514,16 @@ async function exportAccountProfile(accId) {
   const account = state.accounts.find(item => Number(item.id) === Number(accId));
   const name = account?.label || account?.username || `Account #${accId}`;
   if (!confirm(`Export account “${name}” cùng Chrome profile? Hãy đóng Chrome của account trước.`)) return;
+  // Credentials stay out of the file unless the user explicitly opts in. The Chrome session is always included.
+  const includeSecrets = confirm(
+    "Đưa mật khẩu, mã 2FA, email pass và cookie vào file?\n\n" +
+    "OK = có (file chứa dữ liệu đăng nhập đầy đủ).\nCancel = không (file vẫn chứa phiên Chrome)."
+  );
   try {
     const res = await fetch("/api/accounts/profile/export", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ account_id: accId })
+      body: JSON.stringify({ account_id: accId, include_secrets: includeSecrets })
     });
     const json = await res.json();
     showToast(res.ok ? `Đã Export: ${json.bundle_path}` : (json.detail || "Không thể Export profile"), res.ok ? "success" : "error");
@@ -3538,9 +3543,13 @@ async function exportAllAccountProfiles() {
     button.disabled = true;
     button.textContent = "⏳ Đang sao chép và nén...";
   }
-  showToast("Đang Export thông tin account và phiên Chrome. File ZIP chứa dữ liệu đăng nhập, hãy bảo quản cẩn thận...", "info");
+  const includeSecrets = confirm(
+    "Đưa mật khẩu, mã 2FA, email pass và cookie của TẤT CẢ account vào file ZIP?\n\n" +
+    "OK = có.\nCancel = không (ZIP vẫn chứa phiên Chrome)."
+  );
+  showToast("Đang Export thông tin account và phiên Chrome. File ZIP chứa phiên đăng nhập, hãy bảo quản cẩn thận...", "info");
   try {
-    const res = await fetch("/api/accounts/profile/export-all", {method: "POST"});
+    const res = await fetch(`/api/accounts/profile/export-all?include_secrets=${includeSecrets ? "true" : "false"}`, {method: "POST"});
     const json = await res.json();
     showToast(res.ok ? `Đã Export ${json.accounts_exported} profile: ${json.archive_path}` : (json.detail || "Không thể Export profiles"), res.ok ? "success" : "error");
   } catch (e) {

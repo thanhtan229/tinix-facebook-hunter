@@ -8,7 +8,7 @@ import shutil
 import uuid
 import psutil
 from pathlib import Path
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from pydantic import Field, HttpUrl
 from typing import Literal, Optional, Dict, Any
 from core.db_storage import (
@@ -229,6 +229,16 @@ class CloseProfileRequest(ApiRequest):
 
 class ProfileExportRequest(ApiRequest):
     account_id: int = Field(gt=0)
+    # Credentials are left out of the bundle unless the user explicitly opts in.
+    include_secrets: bool = False
+
+
+def _bundle_secret_fields(account: dict, include_secrets: bool) -> dict:
+    """Return credential fields for a bundle only when the user opted in; blank them otherwise."""
+    keys = ("password", "secret_2fa", "email_pass", "cookie")
+    if include_secrets:
+        return {key: str(account.get(key) or "") for key in keys}
+    return {key: "" for key in keys}
 
 
 class ProfileImportRequest(ApiRequest):
@@ -688,10 +698,7 @@ def export_account_profile(req: ProfileExportRequest):
                 "platform": "facebook",
                 "username": str(account.get("username") or ""),
                 "email": str(account.get("email") or ""),
-                "password": str(account.get("password") or ""),
-                "secret_2fa": str(account.get("secret_2fa") or ""),
-                "email_pass": str(account.get("email_pass") or ""),
-                "cookie": str(account.get("cookie") or ""),
+                **_bundle_secret_fields(account, req.include_secrets),
                 "source_app": "Tinix-Facebook-Hunter",
                 "source_app_version": APP_VERSION,
                 "source_account_id": str(req.account_id),
@@ -704,7 +711,7 @@ def export_account_profile(req: ProfileExportRequest):
 
 
 @router.post("/profile/export-all")
-def export_all_account_profiles():
+def export_all_account_profiles(include_secrets: bool = Query(default=False)):
     """Export every Facebook account/profile into one cross-app ZIP archive."""
     db_p = get_db_path(config.get("scraper_db_path", ""))
     profiles: list[tuple[Path, dict[str, Any]]] = []
@@ -720,10 +727,7 @@ def export_all_account_profiles():
             "platform": "facebook",
             "username": str(account.get("username") or ""),
             "email": str(account.get("email") or ""),
-            "password": str(account.get("password") or ""),
-            "secret_2fa": str(account.get("secret_2fa") or ""),
-            "email_pass": str(account.get("email_pass") or ""),
-            "cookie": str(account.get("cookie") or ""),
+            **_bundle_secret_fields(account, include_secrets),
             "source_account_id": str(account_id),
         }))
     log_to_web(f"Bắt đầu Export {len(profiles)} account/profile. Quá trình sao chép và nén có thể mất vài phút.", "INFO")

@@ -50,29 +50,29 @@ class FacebookLogin:
 
     def ensure_logged_in(self) -> bool:
         """Check session -> login if needed -> return True if authenticated."""
-        logger.info(f"?? Ki?m tra ??ng nh?p: {self._account.get('username', '?')}")
+        logger.info(f"Kiểm tra đăng nhập: {self._account.get('username', '?')}")
 
         if self.check_session():
-            logger.info("? ?? ??ng nh?p Facebook")
+            logger.info("✅ Đã đăng nhập Facebook")
             return True
 
         if self._handle_continue_page():
             if self.check_session():
-                logger.info("? ?? ??ng nh?p Facebook (x?c nh?n)")
+                logger.info("✅ Đã đăng nhập Facebook (xác nhận)")
                 return True
 
         username = self._account.get("username", "").strip()
         password = self._account.get("password", "").strip()
 
         if not username or not password:
-            logger.warning("? Thi?u username ho?c password")
+            logger.warning("⚠ Thiếu username hoặc password")
             return False
 
         if self._do_login(username, password):
-            logger.info("? ??ng nh?p Facebook th?nh c?ng!")
+            logger.info("✅ Đăng nhập Facebook thành công!")
             return True
 
-        logger.error("? ??ng nh?p th?t b?i")
+        logger.error("❌ Đăng nhập thất bại")
         return False
 
     def check_session(self) -> bool:
@@ -141,21 +141,21 @@ class FacebookLogin:
             return False
 
     def _handle_continue_page(self) -> bool:
-        """Detect and click 'Ti?p t?c' / 'Continue' button."""
+        """Detect and click 'Tiếp tục' / 'Continue' button."""
         try:
             page = self._refresh_page()
             body_text = page.evaluate("() => document.body.innerText.slice(0, 300)")
 
-            if "Ti?p t?c" not in body_text and "Continue" not in body_text:
+            if "Tiếp tục" not in body_text and "Continue" not in body_text:
                 return False
 
-            logger.info("?? Trang x?c nh?n 'Ti?p t?c'...")
+            logger.info("Trang xác nhận 'Tiếp tục'...")
 
             clicked = page.evaluate("""() => {
                 const spans = document.querySelectorAll('span');
                 for (const s of spans) {
                     const text = s.textContent.trim();
-                    if (text === 'Ti?p t?c' || text === 'Continue') {
+                    if (text === 'Tiếp tục' || text === 'Continue') {
                         const btn = s.closest('[role="button"]') || s.parentElement;
                         if (btn) { btn.click(); return true; }
                     }
@@ -186,10 +186,10 @@ class FacebookLogin:
             if has_pw:
                 password = self._account.get("password", "").strip()
                 if not password:
-                    logger.info("Session c?n x?c nh?n password nh?ng kh?ng c? password trong DB")
+                    logger.info("Session cần xác nhận password nhưng không có password trong DB")
                     return False
 
-                logger.info("?? Nh?p l?i m?t kh?u x?c nh?n tr?n trang 'Ti?p t?c'...")
+                logger.info("Nhập lại mật khẩu xác nhận trên trang 'Tiếp tục'...")
                 try:
                     page = self._refresh_page()
                     pw_input = page.locator('input[type="password"]').first
@@ -202,7 +202,7 @@ class FacebookLogin:
                         );
                         for (const btn of buttons) {
                             const text = (btn.textContent || btn.value || '').trim().toLowerCase();
-                            if (['ti?p t?c', 'continue', '??ng nh?p', 'log in', 'submit'].some(
+                            if (['tiếp tục', 'continue', 'đăng nhập', 'log in', 'submit'].some(
                                 k => text.includes(k)
                             )) {
                                 btn.click();
@@ -216,17 +216,17 @@ class FacebookLogin:
 
                     time.sleep(5)
                     if not self.check_session():
-                        logger.warning("? X?c nh?n password xong nh?ng session ch?a live")
+                        logger.warning("Xác nhận password xong nhưng session chưa live")
                         return False
 
-                    logger.info("? ?? x?c nh?n m?t kh?u tr?n trang 'Ti?p t?c'")
+                    logger.info("Đã xác nhận mật khẩu trên trang 'Tiếp tục'")
                     return True
                 except Exception as e:
                     time.sleep(3)
                     if self.check_session():
-                        logger.info("? Session ?? live sau khi x?c nh?n trang Continue")
+                        logger.info("Session đã live sau khi xác nhận trang Continue")
                         return True
-                    logger.warning(f"? Nh?p password x?c nh?n th?t b?i: {str(e)[:80]}")
+                    logger.warning(f"Nhập password xác nhận thất bại: {str(e)[:80]}")
                     return False
 
             return self.check_session()
@@ -254,18 +254,18 @@ class FacebookLogin:
             time.sleep(0.5)
 
             if not self._click_login_button():
-                logger.warning("Kh?ng click ???c n?t login, th? nh?n Enter")
+                logger.warning("Không click được nút login, thử nhấn Enter")
                 pass_input.press("Enter")
             time.sleep(5)
 
             current_url = page.url
 
             if self._is_2fa_page():
-                logger.info("?? Trang 2FA detected ? nh?p m?...")
+                logger.info("Trang 2FA được phát hiện, đang nhập mã...")
                 return self._handle_2fa()
 
             if "checkpoint" in current_url:
-                logger.warning("? Facebook checkpoint ? ki?m tra t?i kho?n")
+                logger.warning("⚠ Facebook checkpoint — kiểm tra tài khoản")
                 return self._handle_checkpoint()
 
             error_text = page.evaluate("""() => {
@@ -274,14 +274,14 @@ class FacebookLogin:
                 errors.forEach(e => text += e.textContent);
                 return text.slice(0, 200);
             }""")
-            if error_text and ("password" in error_text.lower() or "m?t kh?u" in error_text.lower()):
-                logger.error(f"? Sai m?t kh?u: {error_text[:100]}")
+            if error_text and ("password" in error_text.lower() or "mật khẩu" in error_text.lower()):
+                logger.error(f"❌ Sai mật khẩu: {error_text[:100]}")
                 return False
 
             time.sleep(3)
             return self._check_session()
         except Exception as e:
-            logger.error(f"L?i ??ng nh?p: {str(e)[:150]}")
+            logger.error(f"Lỗi đăng nhập: {str(e)[:150]}")
             return False
 
     def _click_login_button(self) -> bool:
@@ -292,10 +292,10 @@ class FacebookLogin:
             'input[name="login"]',
             'input[type="submit"]',
             'div[role="button"]:has-text("Log in")',
-            'div[role="button"]:has-text("??ng nh?p")',
+            'div[role="button"]:has-text("Đăng nhập")',
             'button:has-text("Log in")',
-            'button:has-text("??ng nh?p")',
-            'text=/^(Log in|??ng nh?p)$/i',
+            'button:has-text("Đăng nhập")',
+            'text=/^(Log in|Đăng nhập)$/i',
         ]
         for selector in selectors:
             try:
@@ -308,7 +308,7 @@ class FacebookLogin:
 
         try:
             return bool(self._page.evaluate("""() => {
-                const labels = /^(log in|login|??ng nh?p|dang nhap)$/i;
+                const labels = /^(log in|login|đăng nhập|dang nhap)$/i;
                 const candidates = Array.from(document.querySelectorAll(
                     'button,input[type="submit"],div[role="button"],a[role="button"]'
                 ));
@@ -335,8 +335,8 @@ class FacebookLogin:
         try:
             result = self._page.evaluate("""() => {
                 const body = document.body.innerText.slice(0, 500).toLowerCase();
-                const has2fa = body.includes('x?c th?c') || body.includes('authentication') ||
-                               body.includes('security code') || body.includes('m? ??ng nh?p') ||
+                const has2fa = body.includes('xác thực') || body.includes('authentication') ||
+                               body.includes('security code') || body.includes('mã đăng nhập') ||
                                body.includes('two-factor') || body.includes('approval code');
                 const hasCodeInput = !!document.querySelector(
                     'input[name="approvals_code"], input[id="approvals_code"], ' +
@@ -354,18 +354,18 @@ class FacebookLogin:
         secret = self._account.get("secret_2fa", "").strip()
 
         if not secret:
-            logger.warning("? Kh?ng c? 2FA secret ? kh?ng th? t? nh?p m?")
-            logger.warning("Vui l?ng th?m 2FA secret trong Qu?n l? t?i kho?n")
+            logger.warning("⚠ Không có 2FA secret — không thể tự nhập mã")
+            logger.warning("Vui lòng thêm 2FA secret trong Quản lý tài khoản")
             return False
 
         if pyotp is None:
-            logger.error("? Th? vi?n pyotp ch?a c?i ? pip install pyotp")
+            logger.error("❌ Thư viện pyotp chưa cài — pip install pyotp")
             return False
 
         try:
             totp = pyotp.TOTP(secret)
             code = totp.now()
-            logger.info(f"?? M? 2FA: {code}")
+            logger.info("Đã tạo mã 2FA cho bước xác thực")
 
             code_input = self._page.locator(
                 'input[name="approvals_code"], input[id="approvals_code"], ' +
@@ -376,18 +376,18 @@ class FacebookLogin:
             time.sleep(1)
 
             submit_btn = self._page.locator(
-                'button[type="submit"], button:has-text("Ti?p t?c"), ' +
+                'button[type="submit"], button:has-text("Tiếp tục"), ' +
                 'button:has-text("Continue"), button:has-text("Submit")'
             ).first
             submit_btn.click()
             time.sleep(5)
 
             body_text = self._page.evaluate("() => document.body.innerText.slice(0, 300)")
-            if "tr?nh duy?t" in body_text.lower() or "browser" in body_text.lower():
+            if "trình duyệt" in body_text.lower() or "browser" in body_text.lower():
                 try:
                     self._page.locator(
-                        'button:has-text("Ti?p t?c"), button:has-text("Continue"), ' +
-                        'button:has-text("L?u")'
+                        'button:has-text("Tiếp tục"), button:has-text("Continue"), ' +
+                        'button:has-text("Lưu")'
                     ).first.click(timeout=3000)
                     time.sleep(3)
                 except Exception:
@@ -396,18 +396,18 @@ class FacebookLogin:
             time.sleep(3)
             return self._check_session()
         except Exception as e:
-            logger.error(f"L?i 2FA: {str(e)[:150]}")
+            logger.error(f"Lỗi 2FA: {str(e)[:150]}")
             return False
 
     def _handle_checkpoint(self) -> bool:
         """Handle Facebook checkpoint or security verification."""
-        logger.warning("? Facebook y?u c?u x?c minh b?o m?t")
-        logger.warning("Vui l?ng ki?m tra email ho?c S?T ?? x?c minh")
+        logger.warning("⚠ Facebook yêu cầu xác minh bảo mật")
+        logger.warning("Vui lòng kiểm tra email hoặc SĐT để xác minh")
 
         for _ in range(30):
             time.sleep(2)
             if self._check_session():
-                logger.info("? Checkpoint ?? ???c gi?i quy?t")
+                logger.info("✅ Checkpoint đã được giải quyết")
                 return True
 
             if "checkpoint" not in self._page.url:

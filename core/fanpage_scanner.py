@@ -100,9 +100,9 @@ class FanpageScanner:
                 chrome_cmd.append(f"--user-agent={self.user_agent}")
             subprocess.Popen(chrome_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             self._started_chrome = True
-            self._status("?ang m? Chrome profile...")
+            self._status("Đang mở Chrome profile...")
             if not _wait_for_debug_port(self.cdp_port, timeout_s=12.0):
-                raise RuntimeError("Kh?ng k?t n?i ???c Chrome profile")
+                raise RuntimeError("Không kết nối được Chrome profile")
 
         from playwright.sync_api import sync_playwright
 
@@ -162,7 +162,7 @@ class FanpageScanner:
     def scan(self) -> List[Dict]:
         page = self._pick_scan_page()
         page.set_default_timeout(30000)
-        self._status("?ang v?o trang fanpage duy nh?t...")
+        self._status("Đang vào trang fanpage duy nhất...")
         page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=25000)
         try:
             page.wait_for_selector('[role="main"]', timeout=10000)
@@ -173,14 +173,14 @@ class FanpageScanner:
         landed = page.url or ""
         logger.info(f"[scan-page] landed at {landed[:120]}")
         if "login" in landed or "checkpoint" in landed:
-            raise RuntimeError("Facebook ?? chuy?n v? trang login/checkpoint")
+            raise RuntimeError("Facebook đã chuyển về trang login/checkpoint")
 
-        self._status("?ang t?i danh s?ch fanpage t? URL duy nh?t...")
+        self._status("Đang tải danh sách fanpage từ URL duy nhất...")
         for _ in range(6):
             page.keyboard.press("End")
             _random_delay(0.7, 1.1)
 
-        self._status("?ang ph?n t?ch danh s?ch fanpage t? URL duy nh?t...")
+        self._status("Đang phân tích danh sách fanpage từ URL duy nhất...")
         raw = page.evaluate(
             r"""
             () => {
@@ -354,5 +354,5 @@ class FanpageScanner:
                 }
             )
 
-        self._status(f"T?m th?y {len(results)} fanpage")
+        self._status(f"Tìm thấy {len(results)} fanpage")
         return results
