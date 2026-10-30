@@ -3046,14 +3046,28 @@ def save_business_id(db_path: str, account_id: int, business_id: str) -> bool:
 
 
 def delete_account(db_path: str, account_id: int) -> bool:
+    """Delete a Facebook account and every row linked to it, in one transaction."""
+    conn = None
     try:
         conn = _get_conn(db_path)
+        # Linked social rows keep a profile path; leaving them behind would point at a deleted account.
+        conn.execute(
+            "DELETE FROM social_targets WHERE account_id IN ("
+            "SELECT id FROM social_accounts WHERE platform = 'facebook' AND legacy_fb_id = ?)",
+            (account_id,),
+        )
+        conn.execute("DELETE FROM social_accounts WHERE platform = 'facebook' AND legacy_fb_id = ?", (account_id,))
+        conn.execute("DELETE FROM managed_pages WHERE account_id = ?", (account_id,))
         conn.execute("DELETE FROM fb_accounts WHERE id = ?", (account_id,))
         conn.commit()
-        conn.close()
         return True
     except Exception:
+        if conn is not None:
+            conn.rollback()
         return False
+    finally:
+        if conn is not None:
+            conn.close()
 
 
 class AccountStoreError(RuntimeError):
