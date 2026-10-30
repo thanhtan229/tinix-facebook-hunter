@@ -5,7 +5,9 @@
 ' ========================================================
 Option Explicit
 
-Dim WshShell, FSO, currentDir, batPath, exitCode
+Dim WshShell, FSO, currentDir, batPath, exitCode, interactive
+
+interactive = (WScript.Arguments.Count = 0)
 
 Set WshShell = CreateObject("WScript.Shell")
 Set FSO = CreateObject("Scripting.FileSystemObject")
@@ -23,13 +25,22 @@ If FSO.FileExists(batPath) Then
     exitCode = WshShell.Run("cmd.exe /c """ & batPath & """ silent", 0, True)
     
     If exitCode <> 0 Then
-        MsgBox "Khoi dong Tinix-Facebook-Hunter that bai (Ma loi: " & exitCode & ")!" & vbCrLf & vbCrLf & _
+        Notify "Khoi dong Tinix-Facebook-Hunter that bai (Ma loi: " & exitCode & ")!" & vbCrLf & vbCrLf & _
                "Vui long kiem tra file log tai:" & vbCrLf & _
-               currentDir & "\logs\server_startup.log", vbCritical, "Tinix - Facebook Hunter"
+               currentDir & "\logs\server_startup.log", vbCritical, "Tinix - Facebook Hunter", True
     End If
 Else
-    MsgBox "Khong tim thay tap tin START.bat tai:" & vbCrLf & currentDir, vbCritical, "Tinix - Facebook Hunter"
+    Notify "Khong tim thay tap tin START.bat tai:" & vbCrLf & currentDir, vbCritical, "Tinix - Facebook Hunter", True
 End If
 
 Set WshShell = Nothing
 Set FSO = Nothing
+
+' Dialogs only for double-click use. Scripted calls pass "silent" and never block on a MsgBox.
+Sub Notify(message, icon, title, failed)
+    If interactive Then
+        MsgBox message, icon, title
+    ElseIf failed Then
+        WScript.Quit 1
+    End If
+End Sub
