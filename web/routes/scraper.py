@@ -427,7 +427,7 @@ def _start_auto_download(urls: List[object], accounts: Optional[List[dict]] = No
         log_to_web("Auto Download không thể khởi động; hãy kiểm tra Account hoặc cookie tải.", "WARNING")
         return False
     except Exception as exc:
-        logger.exception("Không thể khởi động Auto Download", exc)
+        logger.exception("Không thể khởi động Auto Download: %s", exc)
         log_to_web(f"Auto Download lỗi: {str(exc)[:160]}", "WARNING")
         return False
 
