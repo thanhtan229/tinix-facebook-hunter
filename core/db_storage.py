@@ -3056,6 +3056,10 @@ def delete_account(db_path: str, account_id: int) -> bool:
         return False
 
 
+class AccountStoreError(RuntimeError):
+    """Raised when the account table cannot be read; callers must surface it, not treat it as empty."""
+
+
 def get_all_accounts(db_path: str) -> List[dict]:
     """Get all Facebook accounts and their dedicated Chrome profile."""
     try:
@@ -3107,8 +3111,9 @@ def get_all_accounts(db_path: str) -> List[dict]:
             })
         return accounts
     except Exception as e:
+        # Never return an empty list on a read failure: callers would treat it as "no accounts".
         logger.error(f"Lỗi đọc accounts: {str(e)[:100]}")
-        return []
+        raise AccountStoreError(f"Không đọc được danh sách tài khoản: {str(e)[:120]}") from e
 
 
 def get_account(db_path: str, account_id: Any) -> Optional[dict]:

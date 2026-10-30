@@ -75,6 +75,19 @@ class DeleteAccountProfileTests(unittest.TestCase):
             self.assertTrue(any(item["id"] == legacy_id for item in get_all_accounts(db_path)),
                             "account must not be deleted when the profile step is refused")
 
+    def test_default_delete_reports_failure_instead_of_success_when_db_delete_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            profile = root / "profiles" / "fb_1"
+            db_path, legacy_id = self._setup(root, profile)
+
+            with patch("web.routes.accounts.delete_account", return_value=False):
+                with self.assertRaises(HTTPException) as ctx:
+                    self._delete(db_path, root, legacy_id, delete_profile=False)
+
+            self.assertEqual(ctx.exception.status_code, 500)
+            self.assertTrue((profile / "Cookies").is_file())
+
     def test_failed_db_delete_never_touches_the_profile_folder(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

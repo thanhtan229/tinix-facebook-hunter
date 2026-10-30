@@ -11,6 +11,7 @@ from pathlib import Path
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import Field, HttpUrl
 from typing import Literal, Optional, Dict, Any
+from core.db_storage import AccountStoreError
 from core.db_storage import (
     get_db_path,
     get_all_accounts,
@@ -660,7 +661,11 @@ def close_chrome_profile(req: CloseProfileRequest):
 def close_all_chrome_profiles(_req: ApiRequest):
     """Close every Chrome instance launched from the Accounts tab."""
     db_p = get_db_path(config.get("scraper_db_path", ""))
-    account_ids = {int(account["id"]) for account in get_all_accounts(db_p)}
+    try:
+        account_ids = {int(account["id"]) for account in get_all_accounts(db_p)}
+    except AccountStoreError:
+        # Still close the Chrome windows this process launched, even if the account table is unreadable.
+        account_ids = set()
     with _CHROME_PROCESS_LOCK:
         account_ids.update(_CHROME_PROCESSES)
     closed_count = sum(1 for account_id in sorted(account_ids) if _close_managed_chrome(account_id))

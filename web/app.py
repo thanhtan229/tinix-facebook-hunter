@@ -10,6 +10,7 @@ from fastapi.staticfiles import StaticFiles
 
 from web.ws_manager import manager, log_to_web
 from web.security import SESSION_COOKIE, SESSION_TOKEN, resolve_media_file, valid_session
+from core.db_storage import AccountStoreError
 from core.db_storage import (
     get_db_path,
     recover_download_queue_batches,
@@ -94,6 +95,15 @@ app = FastAPI(
 
 PUBLIC_API_PATHS = {"/api/system/health"}
 LOCAL_HOSTNAMES = frozenset({"127.0.0.1", "localhost", "::1"})
+
+
+@app.exception_handler(AccountStoreError)
+async def account_store_error_handler(_request: Request, _exc: AccountStoreError):
+    """Surface an unreadable account table as a clear 503 instead of an empty list or a bare 500."""
+    return JSONResponse(
+        status_code=503,
+        content={"detail": "Không đọc được dữ liệu tài khoản. Kiểm tra database rồi thử lại."},
+    )
 
 
 @app.exception_handler(RequestValidationError)

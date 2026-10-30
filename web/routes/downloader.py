@@ -9,6 +9,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import Field
 
 from core.cookie_handler import parse_cookie_string, validate_cookies
+from core.db_storage import AccountStoreError
 from core.db_storage import (
     cancel_pending_download_queue_batches,
     claim_next_download_queue_batch,
@@ -211,7 +212,13 @@ def _start_claimed_auto_batch(batch: dict) -> bool:
         set_download_queue_batch_status(_db_path(), int(batch["id"]), "failed", error_message="Batch không có URL hợp lệ", purge_payload=True)
         return False
     db_path = _db_path()
-    accounts = _active_accounts_for_ids(db_path, list(batch.get("account_ids") or []))
+    try:
+        accounts = _active_accounts_for_ids(db_path, list(batch.get("account_ids") or []))
+    except AccountStoreError as exc:
+        # The batch already left "queued"; put it back so it is retried, never stuck in "starting".
+        set_download_queue_batch_status(db_path, int(batch["id"]), "queued", error_message=str(exc)[:200])
+        _schedule_pending_auto_download_retry()
+        return False
     owner = f"auto-download-{uuid4().hex[:8]}"
     try:
         lease_keys = acquire_profile_leases(owner, accounts) if accounts else set()
