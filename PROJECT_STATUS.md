@@ -5,38 +5,36 @@
 ## 0. Status Metadata
 
 **Project:** Tinix FB Studio (Tinix-Facebook-Hunter)
-**Overall Status:** Stable — đã duyệt bàn giao nội bộ v1.21.47; đã có remote GitHub
-**Current Phase:** Vận hành nội bộ; đã có script cài đặt cho máy mới (chưa thử trên máy sạch thật)
-**Last Updated:** 2026-10-28
+**Overall Status:** Ổn định cho sử dụng nội bộ; các mục còn mở cần quyết định của Product Owner
+**Current Phase:** Hardening sau Final Production Review đã commit và push; chờ nghiệm thu luồng đăng nhập mật khẩu và cài đặt trên máy sạch
+**Last Updated:** 2026-10-30
 
 ## 1. Current Objective
 
-Giữ ứng dụng ổn định trên nhánh `master` và đồng bộ với GitHub; xử lý các mục còn mở ở mục 9.
+Giữ ứng dụng ổn định trên `master` đồng bộ với GitHub; hoàn tất các mục còn mở ở mục 9.
 
 ## 2. Current State Summary
 
-- Nhánh `master` đã được đẩy lên `origin` (`https://github.com/thanhtan229/tinix-facebook-hunter`). Remote và HEAD đồng bộ.
-- Version code hiện tại: **v1.21.54** (HEAD `16575855`). Hook pre-commit tự bump version mỗi lần commit; commit trạng thái này sẽ là **v1.21.55**.
-- SQLite schema **14**.
+- Nhánh `master` đã đẩy lên `origin` (`https://github.com/thanhtan229/tinix-facebook-hunter`). Remote và HEAD đồng bộ tại `42acf470`.
+- Version hiện tại: **v1.21.64**. SQLite schema **14**.
+- Health `/api/system/health`: `ready=true`, schema 14, mọi check đều true (kiểm tra sau khi khởi động lại bằng launcher).
+- Quality gate `scripts/quality.ps1`: **260 passed**, 10 subtests, exit 0 (trên các commit cuối).
 - Gói artifact `v1.21.47` (SHA256 `3d775951…58`) tương ứng commit `b1873f2a`. Không tạo lại gói trừ khi có yêu cầu.
-- Health `/api/system/health`: `ready=true`, schema 14, mọi check đều true.
-- Cài đặt máy mới: `install.bat` (tạo `.venv`, cài `requirements.txt`, tải Chromium, kiểm tra import). README đã trỏ đến script này.
 
 ## 3. Completed
 
-- [x] Audit production và fix F1–F6 (`FINAL_REVIEW.md`), commit `924994ed`.
-- [x] Quality gate: 235 passed + 10 subtests, coverage 81% (trên candidate v1.21.44).
-- [x] Backup DB verify: schema14, integrity ok (`exports/releases/`, ngoài Git).
-- [x] Owner rollback: **Tinix** (2026-10-27), commit `7598ae41`.
-- [x] Kiểm tra reboot máy (2026-10-28): DB `quick_check` ok, không tác vụ bị kẹt.
-- [x] Chấp nhận giới hạn khối lượng lớn trên tài khoản Facebook thật (2026-10-28), commit `b1873f2a`.
-- [x] Gói source v1.21.47 và biên bản duyệt bàn giao (`exports/releases/RELEASE_APPROVAL_v1.21.47.md`).
-- [x] Thêm remote GitHub và push `master` (2026-10-28), commit `f33aaa46`.
-- [x] Commit 6 docs chuẩn (ARCHITECTURE, UX_UI, PLAN, RESEARCH, RESEARCH_COMPARISON, DEVELOPMENT_WORKFLOW), commit `f29a6299`.
-- [x] Kiểm tra launcher STOP → START: 4/4 lần đạt. Cổng đóng sau 1 giây, server `ready` sau 2–4 giây.
-- [x] Thêm `install.bat` (commit `9edcabe3`), sửa theo review (commit `d4913d7a`): fallback `py -3.10`, kiểm tra version `.venv` cũ, thông báo lỗi theo từng bước. Reviewer LGTM cho bản đã commit.
-- [x] Thử `install.bat` trên bản sao tạm từ commit: cài mới, chạy lại với `.venv` hợp lệ, và `.venv` lỗi đều đúng kết quả. Nhánh `py -3.10` chưa thử được.
-- [x] Cập nhật README: mục Cài đặt và Chạy (commit `16575855`).
+- [x] Final Production Review và các finding đã duyệt (`FINAL_REVIEW.md` cho đợt trước; đợt 2026-10-29 ghi trong lịch sử commit).
+- [x] Hardening dữ liệu: import rollback chỉ xóa thư mục do chính lần import tạo ra (`d6cd147b`).
+- [x] Secret không giải mã được được báo rõ, không còn bị coi là rỗng; preflight báo `SECRET_UNREADABLE` khi cookie hỏng (`d6cd147b`).
+- [x] Retry hàng đợi tải có backoff tối đa 5 phút (`d6cd147b`).
+- [x] Restore DB bị chặn khi app đang giữ database (`d6cd147b`).
+- [x] Xóa tài khoản: giữ Chrome profile mặc định; tùy chọn xóa có kiểm tra vùng quản lý, dùng chung và lease (`9421edae`).
+- [x] Bundle export không chứa mật khẩu, 2FA, email pass, cookie mặc định; phiên Chrome vẫn có trong file và được ghi rõ (`6b4478a9`).
+- [x] Khôi phục dấu tiếng Việt cho chuỗi đăng nhập và scanner; bỏ ghi mã 2FA ra log (`6b4478a9`).
+- [x] Đọc DB lỗi không còn trả danh sách rỗng; batch tải quay về hàng đợi; giao diện nhận 503 rõ ràng (`c722ca31`).
+- [x] Launcher `STOP.vbs` / `START.vbs`: không chờ hộp thoại khi chạy có tham số `silent` (`4aacd29a`).
+- [x] Tài liệu: `DEVELOPMENT_WORKFLOW.md`, `ARCHITECTURE.md`, `PLAN.md`, `RESEARCH*.md` thay template bằng nội dung thật (`121305f9`, `d6cd147b`).
+- [x] Thử đăng nhập có kiểm soát trên Facebook thật, mỗi tài khoản đúng một lần: tài khoản 3, 9, 20 đăng nhập được (phiên còn sống hoặc trang "Tiếp tục"); tài khoản 6 bị từ chối mật khẩu.
 
 ## 4. In Progress
 
@@ -44,93 +42,84 @@ Không có tác vụ đang chạy.
 
 ## 5. Blockers / Known Issues
 
-Không có blocker kỹ thuật đã biết.
+### Chưa xác minh
 
-### Chưa kiểm chứng
+- **Luồng nhập mật khẩu** (`_do_login`) chưa được xác minh thành công trên Facebook. Tài khoản 6 bị từ chối mật khẩu đã lưu; các tài khoản khác không đi qua bước nhập mật khẩu. Nguyên nhân chưa rõ, khả năng cao mật khẩu đã lưu không còn đúng.
+- **Cài đặt `install.bat` trên máy Windows sạch** chưa thử. Đã thử trên bản sao cô lập của cùng máy (kể cả nhánh `py -3.10`).
 
-- `install.bat` chưa được thử trên máy Windows sạch thật (máy khác, hoặc tài khoản Windows mới chưa có Python/Chrome). Đã thử trên cùng máy, trong thư mục tạm.
-- Nhánh `py -3.10` của `install.bat` chưa thử (máy không có Python 3.10).
+### Known limitations (đã chấp nhận)
 
-### Đã ghi nhận nhưng chưa xác định nguyên nhân
-
-- Trước đó có vài lần `START.vbs` không bật server (2026-10-28). Sau đó không tái hiện được trong 4 lần thử liên tiếp. Nghi ngờ lỗi phụ thuộc thời điểm, khi có tác vụ nền khác đang chạy. Chưa có bằng chứng xác nhận; chưa sửa launcher. Nếu tái diễn, cần log của đúng lần đó.
-
-### Known limitations (đã chấp nhận, không phải finding mới)
-
-- Chưa nghiệm thu khối lượng lớn trên tài khoản Facebook thật (nhiều Page, nhiều bài, chạy lâu).
+- Chưa nghiệm thu tải/quét lâu với khối lượng lớn trên tài khoản Facebook thật.
 - Chưa nghiệm thu chuyển profile sang máy khác.
+- Bundle mặc định vẫn chứa phiên Chrome (cookie đăng nhập); file phải được bảo quản như dữ liệu đăng nhập và không mã hóa.
+- DPAPI gắn với Windows user/máy; app chỉ lắng nghe localhost; không có auto-update.
 - App không tự khởi động sau reboot; cần chạy `START.vbs`.
-- `install.bat` không cài Python, Chrome/Edge; không tạo dữ liệu, tài khoản, `.env`; không chuyển được secret DPAPI sang máy khác.
-- Gợi ý không chặn của reviewer chưa áp dụng: diễn đạt lại thông báo `.venv`, thêm nguyên nhân ổ đĩa/quyền vào thông báo Chromium, gom kiểm tra `where py`.
-- 3 DeprecationWarning escape sequence trong parser (đã tồn tại trước đó, không làm fail gate).
-- HTML title chưa có version (badge đúng version).
-- File media tải dở từ bản cũ có tên cuối không tự sửa/xóa.
-- DPAPI gắn Windows user/máy; profile ZIP và backup có thể chứa secret; ứng dụng chỉ localhost; không có auto-update.
+- Còn 3 DeprecationWarning escape sequence trong parser (cũ, không làm fail gate); HTML title chưa có version.
+- Quality gate chỉ đo 5 module (~82%); đo toàn bộ `core`, `web`, `utils` là khoảng 54%.
+- Log ứng dụng vẫn ghi email đăng nhập ở dạng rõ (hành vi có sẵn).
 
 ## 6. Important Recent Decisions
 
 - Người chịu trách nhiệm rollback: Tinix.
-- Chấp nhận release nội bộ với giới hạn khối lượng lớn đã nêu ở mục 5 (2026-10-28).
-- Push lên GitHub được thực hiện theo yêu cầu rõ ràng của Product Owner; push thường, không force.
-- Cài máy mới dùng `install.bat` (không dùng `.exe`). Chưa quyết định đóng gói `.exe`.
-- Hook pre-commit tự bump version khi commit. Không tạo lại gói artifact sau commit docs để tránh lệch version.
+- Push lên GitHub chỉ khi có chỉ định rõ; push thường, không force.
+- Bundle không chứa credential mặc định; người dùng phải chủ động bật tùy chọn.
+- Hook pre-commit tự bump version khi commit; sau mỗi commit cần kiểm tra version thực tế trước khi ghi vào tài liệu.
 
 ## 7. Verification State
 
 ```text
-Targeted tests: pass (test_production_recovery, test_chrome_handoff, test_p0_hardening trong quality gate)
-Full tests: 235 passed, 10 subtests passed (scripts/quality.ps1, 2026-10-27, candidate v1.21.44)
-Typecheck: mypy pass (6 source files)
-Lint: ruff pass; pip check pass
-Build: Build.bat chạy qua pre-commit hook khi commit (hiện v1.21.54)
-Runtime: v1.21.54 chạy qua START.vbs, health ready=true (2026-10-28)
-Launcher: STOP → START đạt 4/4 lần (2026-10-28)
-Install script: install.bat thử trên bản sao tạm (2026-10-28): cài mới và chạy lại đều đạt; reviewer LGTM
+Quality gate: 260 passed, 10 subtests passed, exit 0 (scripts/quality.ps1, 2026-10-30)
+Typecheck/Lint: mypy pass (6 source files); ruff pass; pip check pass
+Build: Build.bat / pre-commit hook bump version; syntax verification pass
+Runtime: v1.21.64 chạy qua START.vbs silent; health ready=true, schema 14
+Launcher: STOP/START silent đạt; STOP/START 4/4 lần trước đó (2026-10-28)
+Login: 3 tài khoản đăng nhập được (phiên sống / Tiếp tục); 1 tài khoản bị từ chối mật khẩu
+Installer: đã thử trên bản sao cô lập cùng máy; chưa thử máy sạch
 Reboot: đã kiểm tra 2026-10-28 (DB ok, không tác vụ kẹt)
-Known pre-existing failures: không có
+Known pre-existing failures: không có trong quality gate
 ```
 
 ## 8. Runtime / Environment State
 
 ```text
-Frontend/Backend: main.py chạy qua START.vbs, cổng 7866 (localhost)
+Backend: main.py chạy qua START.vbs, cổng 7866 (localhost)
 Database: tinix_scraper.db, schema 14, quick_check ok
-Current development mode: standalone App Mode
+Mode: standalone App Mode
 Lưu ý: sau reboot cần chạy START.vbs thủ công
-Chrome: cửa sổ App Mode của dự án có thể còn mở sau khi dừng app; các cửa sổ của dự án khác không liên quan
+Chrome: cửa sổ App Mode có thể còn mở sau khi dừng app; chỉ đóng cửa sổ do dự án mở
 ```
 
 ## 9. Next Actions
 
-1. Thử `install.bat` trên máy Windows sạch thật khi có máy hoặc tài khoản thử nghiệm. Đây là việc chưa kiểm chứng.
-2. Chuyển profile sang máy khác: chưa nghiệm thu, chỉ làm khi có yêu cầu.
-3. Quyết định có làm bản `.exe` hay không. Hiện khuyến nghị giữ `install.bat`.
-4. Nếu lỗi launcher tái diễn: ghi lại thời điểm, đọc `logs/server_startup.log` và log của đúng lần đó.
+1. Kiểm tra thủ công mật khẩu của tài khoản 6 trong trình duyệt thường. Nếu đúng, điều tra luồng nhập mật khẩu; nếu sai, cập nhật mật khẩu trong app và thử lại đúng một lần.
+2. Thử `install.bat` trên máy Windows sạch (Python 3.11, có internet) khi có máy thử.
+3. Chỉ nghiệm thu chuyển profile sang máy khác và tải/quét khối lượng lớn khi có yêu cầu và phạm vi cụ thể.
+4. Nếu lỗi launcher tái diễn: ghi thời điểm, giữ `logs/server_startup.log` và log của lần đó trước khi chẩn đoán.
 
-Đã xử lý (2026-10-28): hai file sidecar backup được chuyển vào `exports/releases/backup-sidecars/` (ngoài Git, không xóa). File backup chính vẫn ở gốc dự án.
+Đã xử lý (2026-10-28): hai file sidecar backup đã chuyển vào `exports/releases/backup-sidecars/` (ngoài Git, giữ nguyên). File backup chính vẫn ở thư mục gốc.
 
 ## 10. Resume Context
 
 ```text
-Start here:
-- PROJECT_STATUS.md, sau đó exports/releases/RELEASE_APPROVAL_v1.21.47.md.
+Bắt đầu từ:
+- PROJECT_STATUS.md, sau đó FINAL_REVIEW.md và docs/RELEASE_CHECKLIST.md.
 
-Read first:
-- docs/RELEASE_CHECKLIST.md, docs/OPERATIONS.md, FINAL_REVIEW.md, install.bat, README.md (mục Cài đặt).
+Đọc trước khi sửa code:
+- ARCHITECTURE.md, DEVELOPMENT_WORKFLOW.md (lệnh chạy/test/build thật).
 
-Current implementation checkpoint:
-- origin/master đồng bộ với HEAD (16575855, v1.21.54). Xem git log.
+Mốc hiện tại:
+- origin/master khớp HEAD 42acf470 (v1.21.64).
 
-Do not redo:
-- F1–F6 đã fix và có test; không chạy lại tải/quét Facebook thật nếu không được yêu cầu.
-- Không tạo lại gói artifact trừ khi có commit code mới và được yêu cầu.
-- Không sửa launcher khi chưa tái hiện được lỗi.
+Không làm lại:
+- F1–F6 và các hardening đã commit có test; không chạy tải/quét Facebook thật nếu không được yêu cầu.
+- Không thử đăng nhập mật khẩu lặp lại khi chưa có quyết định, vì có thể khóa tài khoản.
+- Không tạo lại gói artifact nếu chưa có yêu cầu.
 
-Next expected action:
-- Thử install.bat trên máy sạch khi có máy thử; quyết định về .exe (mục 9).
+Việc tiếp theo:
+- Mục 9.1 (mật khẩu tài khoản 6).
 
-Important caveat:
-- Mỗi commit kích hoạt hook bump version. Kiểm tra version thực tế trước khi ghi version cụ thể vào tài liệu.
+Lưu ý:
+- Mỗi commit kích hoạt hook bump version; kiểm tra version thực tế trước khi ghi version cụ thể.
 ```
 
 ## 11. Relevant Documents
@@ -138,12 +127,12 @@ Important caveat:
 ```text
 AGENTS.md
 DEVELOPMENT_WORKFLOW.md
-UX_UI.md
 ARCHITECTURE.md
 PLAN.md
 FINAL_REVIEW.md
 docs/RELEASE_CHECKLIST.md
 docs/OPERATIONS.md
+docs/TINIX_PROFILE_BUNDLE.md
 exports/releases/RELEASE_APPROVAL_v1.21.47.md
 install.bat
 README.md
